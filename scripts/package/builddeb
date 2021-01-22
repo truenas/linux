@@ -73,20 +73,8 @@ install_linux_image () {
 		mkdir -p "${pdir}${debhookdir}/${script}.d"
 
 		mkdir -p "${pdir}/DEBIAN"
-		cat <<-EOF > "${pdir}/DEBIAN/${script}"
-		#!/bin/sh
-
-		set -e
-
-		# Pass maintainer script parameters to hook scripts
-		export DEB_MAINT_PARAMS="\$*"
-
-		# Tell initramfs builder whether it's wanted
-		export INITRD=$(if_enabled_echo CONFIG_BLK_DEV_INITRD Yes No)
-
-		test -d ${debhookdir}/${script}.d && run-parts --arg="${KERNELRELEASE}" --arg="/${installed_image_path}" ${debhookdir}/${script}.d
-		exit 0
-		EOF
+		cp "scripts/package/truenas/$script" "${pdir}/DEBIAN/${script}"
+		sed -i "3i version=$KERNELRELEASE" "${pdir}/DEBIAN/${script}"
 		chmod 755 "${pdir}/DEBIAN/${script}"
 	done
 }
@@ -147,7 +135,7 @@ case "${package}" in
 	install_linux_image_dbg "${package}";;
 linux-image-*|user-mode-linux-*)
 	install_linux_image "${package}";;
-linux-libc-dev)
+linux-*-libc-dev)
 	install_libc_headers "${package}";;
 linux-headers-*)
 	install_kernel_headers "${package}";;

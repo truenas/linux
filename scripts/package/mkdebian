@@ -4,7 +4,14 @@
 #
 # Simple script to generate a debian/ directory for a Linux kernel.
 
-set -eu
+set -e
+
+KERNELRELEASE="${KERNELRELEASE:=$(cat include/config/kernel.release)}"
+KDEB_SOURCENAME="${KDEB_SOURCENAME:="linux-$KERNELRELEASE"}"
+UTS_MACHINE="${UTS_MACHINE:="x86_64"}"
+MAINTAINER="Debian Packages List <debian.packages@ixsystems.com>"
+MAKE="${MAKE:="/usr/bin/make"}"
+ARCH="${ARCH:="x86"}"
 
 is_enabled() {
 	grep -q "^$1=y" include/config/auto.conf
@@ -125,15 +132,7 @@ gen_source ()
 rm -rf debian
 mkdir debian
 
-user=${KBUILD_BUILD_USER:-$(id -nu)}
-name=${DEBFULLNAME:-${user}}
-if [ "${DEBEMAIL:+set}" ]; then
-	email=${DEBEMAIL}
-else
-	buildhost=${KBUILD_BUILD_HOST:-$(hostname -f 2>/dev/null || hostname)}
-	email="${user}@${buildhost}"
-fi
-maintainer="${name} <${email}>"
+maintainer=$MAINTAINER
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -149,17 +148,19 @@ done
 
 # Some variables and settings used throughout the script
 version=$KERNELRELEASE
+echo "XXX: Kernel_release: ${version}"
 if [ "${KDEB_PKGVERSION:+set}" ]; then
 	packageversion=$KDEB_PKGVERSION
 else
+	srctree=.
 	packageversion=$(${srctree}/scripts/setlocalversion --no-local ${srctree})-$($srctree/scripts/build-version)
 fi
-sourcename=${KDEB_SOURCENAME:-linux-upstream}
+sourcename=${KDEB_SOURCENAME:-linux-$KERNELRELEASE}
 
 if [ "$ARCH" = "um" ] ; then
 	packagename=user-mode-linux
 else
-	packagename=linux-image
+	packagename=linux-image-truenas-amd64
 fi
 
 debarch=
@@ -181,15 +182,6 @@ echo $debarch > debian/arch
 
 host_gnu=$(dpkg-architecture -a "${debarch}" -q DEB_HOST_GNU_TYPE | sed 's/_/-/g')
 
-# Generate a simple changelog template
-cat <<EOF > debian/changelog
-$sourcename ($packageversion) $distribution; urgency=low
-
-  * Custom built Linux kernel.
-
- -- $maintainer  $(date -R)
-EOF
-
 # Generate a control file
 cat <<EOF > debian/control
 Source: $sourcename
@@ -205,8 +197,10 @@ Build-Depends-Arch: bc, bison, cpio, flex,
  rsync
 Homepage: https://www.kernel.org/
 
-Package: $packagename-$version
+Package: $packagename
 Architecture: $debarch
+Provides: $packagename, linux-image-$KERNELRELEASE, linux-image-generic
+Depends: kmod, linux-base (>= 4.3~), initramfs-tools (>= 0.120+deb8u2) | linux-initramfs-tools
 Description: Linux kernel, version $version
  This package contains the Linux kernel, modules and corresponding other
  files, version: $version.
@@ -215,9 +209,10 @@ EOF
 if [ "${SRCARCH}" != um ]; then
 cat <<EOF >> debian/control
 
-Package: linux-libc-dev
+Package: linux-truenas-libc-dev
 Section: devel
-Provides: linux-kernel-headers
+Provides: linux-kernel-headers, linux-libc-dev
+Conflicts: linux-libc-dev
 Architecture: $debarch
 Description: Linux support headers for userspace development
  This package provides userspaces headers from the Linux kernel.  These headers
@@ -228,8 +223,9 @@ EOF
 if is_enabled CONFIG_MODULES; then
 cat <<EOF >> debian/control
 
-Package: linux-headers-$version
+Package: linux-headers-truenas-$debarch
 Architecture: $debarch
+Provides: linux-headers-$debarch
 Build-Profiles: <!pkg.${sourcename}.nokernelheaders>
 Description: Linux kernel headers for $version on $debarch
  This package provides kernel header files for $version on $debarch
@@ -242,7 +238,8 @@ fi
 if is_enabled CONFIG_DEBUG_INFO; then
 cat <<EOF >> debian/control
 
-Package: linux-image-$version-dbg
+Package: $packagename-dbg
+Provides: linux-image-$debarch-dbg
 Section: debug
 Architecture: $debarch
 Build-Profiles: <!pkg.${sourcename}.nokerneldbg>
@@ -257,7 +254,10 @@ ARCH := ${ARCH}
 KERNELRELEASE := ${KERNELRELEASE}
 EOF
 
-cp "${srctree}/scripts/package/debian/copyright" debian/
 cp "${srctree}/scripts/package/debian/rules" debian/
+mkdir -p debian/certs
+cp scripts/package/truenas/debian-uefi-certs.pem debian/certs
+cp scripts/package/truenas/changelog debian/changelog
+cp scripts/package/truenas/copyright debian/copyright
 
 exit 0
