@@ -1,0 +1,5 @@
+linux-5.10.18+truenas (5.10.10+truenas-1) sid; urgency=low
+
+  * Import upstream Linux 5.10 branch.
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Wed, 10 Feb 2021 07:58:44 -0500
