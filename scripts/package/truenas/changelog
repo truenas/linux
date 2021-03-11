@@ -1,4 +1,4 @@
-linux-5.10.18+truenas (5.10.10+truenas-1) sid; urgency=low
+linux-5.10.18+truenas (5.10.18+truenas-1) sid; urgency=low
 
   * Import upstream Linux 5.10 branch.
 
