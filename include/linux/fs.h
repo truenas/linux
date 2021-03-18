@@ -1366,6 +1366,12 @@ extern int send_sigurg(struct fown_struct *fown);
 #define SB_ACTIVE	(1<<30)
 #define SB_NOUSER	(1<<31)
 
+#ifdef CONFIG_TRUENAS
+/* Thes sb flags are related to TrueNAS-specific features */
+#define SB_NFSV4ACL	(1<<18)
+#define SB_LARGEXATTR	(1<<19)
+#endif
+
 /* These flags relate to encoding and casefolding */
 #define SB_ENC_STRICT_MODE_FL	(1 << 0)
 
@@ -2021,6 +2027,10 @@ static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags 
 #define IS_APPEND(inode)	((inode)->i_flags & S_APPEND)
 #define IS_IMMUTABLE(inode)	((inode)->i_flags & S_IMMUTABLE)
 #define IS_POSIXACL(inode)	__IS_FLG(inode, SB_POSIXACL)
+#ifdef CONFIG_TRUENAS
+#define IS_NFSV4ACL(inode)	__IS_FLG(inode, SB_NFSV4ACL)
+#define IS_LARGE_XATTR(inode)	__IS_FLG(inode, SB_LARGEXATTR)
+#endif
 
 #define IS_DEADDIR(inode)	((inode)->i_flags & S_DEAD)
 #define IS_NOCMTIME(inode)	((inode)->i_flags & S_NOCMTIME)
