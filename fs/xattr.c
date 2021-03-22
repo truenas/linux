@@ -558,8 +558,16 @@ setxattr(struct user_namespace *mnt_userns, struct dentry *d,
 		return error;
 
 	if (size) {
-		if (size > XATTR_SIZE_MAX)
+		if (size > XATTR_SIZE_MAX) {
+#ifdef CONFIG_TRUENAS
+			if ((size > XATTR_LARGE_SIZE_MAX) ||
+			    (IS_LARGE_XATTR(d->d_inode) == 0)) {
+				return -E2BIG;
+			}
+#else
 			return -E2BIG;
+#endif
+		}
 		kvalue = kvmalloc(size, GFP_KERNEL);
 		if (!kvalue)
 			return -ENOMEM;
@@ -656,8 +664,19 @@ getxattr(struct user_namespace *mnt_userns, struct dentry *d,
 		return error;
 
 	if (size) {
+#ifdef CONFIG_TRUENAS
+		if ((size > XATTR_LARGE_SIZE_MAX) &&
+		    IS_LARGE_XATTR(d->d_inode)) {
+			size = XATTR_LARGE_SIZE_MAX;
+		}
+		else if ((size > XATTR_SIZE_MAX) &&
+			 (IS_LARGE_XATTR(d->d_inode) == 0)) {
+			size = XATTR_SIZE_MAX;
+		}
+#else
 		if (size > XATTR_SIZE_MAX)
 			size = XATTR_SIZE_MAX;
+#endif
 		kvalue = kvzalloc(size, GFP_KERNEL);
 		if (!kvalue)
 			return -ENOMEM;
