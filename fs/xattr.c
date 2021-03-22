@@ -606,8 +606,10 @@ int setxattr_copy(const char __user *name, struct xattr_ctx *ctx)
 
 	error = 0;
 	if (ctx->size) {
+#ifndef CONFIG_TRUENAS
 		if (ctx->size > XATTR_SIZE_MAX)
 			return -E2BIG;
+#endif
 
 		ctx->kvalue = vmemdup_user(ctx->cvalue, ctx->size);
 		if (IS_ERR(ctx->kvalue)) {
@@ -653,6 +655,16 @@ retry:
 	error = user_path_at(AT_FDCWD, pathname, lookup_flags, &path);
 	if (error)
 		goto out;
+#ifdef CONFIG_TRUENAS
+	if (size) {
+		if (size > XATTR_SIZE_MAX) {
+			if ((size > XATTR_LARGE_SIZE_MAX) ||
+			    (IS_LARGE_XATTR(path.dentry->d_inode) == 0)) {
+				return -E2BIG;
+			}
+		}
+	}
+#endif
 	error = mnt_want_write(path.mnt);
 	if (!error) {
 		error = do_setxattr(mnt_idmap(path.mnt), path.dentry, &ctx);
@@ -726,8 +738,19 @@ do_getxattr(struct mnt_idmap *idmap, struct dentry *d,
 	char *kname = ctx->kname->name;
 
 	if (ctx->size) {
+#ifdef CONFIG_TRUENAS
+		if ((ctx->size > XATTR_LARGE_SIZE_MAX) &&
+		    IS_LARGE_XATTR(d->d_inode)) {
+			ctx->size = XATTR_LARGE_SIZE_MAX;
+		}
+		else if ((ctx->size > XATTR_SIZE_MAX) &&
+			 (IS_LARGE_XATTR(d->d_inode) == 0)) {
+			ctx->size = XATTR_SIZE_MAX;
+		}
+#else
 		if (ctx->size > XATTR_SIZE_MAX)
 			ctx->size = XATTR_SIZE_MAX;
+#endif
 		ctx->kvalue = kvzalloc(ctx->size, GFP_KERNEL);
 		if (!ctx->kvalue)
 			return -ENOMEM;
