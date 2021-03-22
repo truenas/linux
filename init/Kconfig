@@ -147,6 +147,12 @@ config LOCALVERSION
 	  object and source tree, in that order.  Your total string can
 	  be a maximum of 64 characters.
 
+config TRUENAS
+	bool "Enable TrueNAS-specific features"
+	default n
+	help
+	  Enables support for NFSv4 ACLs and large xattrs (up to 2 MiB).
+
 config LOCALVERSION_AUTO
 	bool "Automatically append version information to the version string"
 	default y
