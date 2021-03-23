@@ -102,6 +102,16 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 /* called from RCU mode, don't block */
 #define MAY_NOT_BLOCK		0x00000080
 
+#if CONFIG_TRUENAS
+#define MAY_DELETE_CHILD	0x00000400
+#define MAY_WRITE_ATTRS		0x00001000
+#define MAY_DELETE		0x00100000
+#define MAY_WRITE_ACL		0x00400000
+#define MAY_WRITE_OWNER		0x00800000
+#define EXTENDED_ENTRIES	(MAY_DELETE_CHILD|MAY_WRITE_ATTRS|MAY_DELETE|\
+				 MAY_WRITE_ACL|MAY_WRITE_OWNER)
+#endif
+
 /*
  * flags in file.f_mode.  Note that FMODE_READ and FMODE_WRITE must correspond
  * to O_WRONLY and O_RDWR via the strange trick in do_dentry_open()

@@ -28,6 +28,16 @@ static bool chown_ok(const struct inode *inode, kuid_t uid)
 	if (uid_eq(inode->i_uid, INVALID_UID) &&
 	    ns_capable(inode->i_sb->s_user_ns, CAP_CHOWN))
 		return true;
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Check for ACE4_WRITE_OWNER. RFC 5661 Section 6.2.1.3.1
+	 * On UNIX systems, this is the ability to execute chown() and
+	 * chgrp().
+	 */
+	if (IS_NFSV4ACL(inode) &&
+	    (inode_permission(inode, MAY_WRITE_OWNER) == 0))
+		return true;
+#endif
 	return false;
 }
 
@@ -41,6 +51,16 @@ static bool chgrp_ok(const struct inode *inode, kgid_t gid)
 	if (gid_eq(inode->i_gid, INVALID_GID) &&
 	    ns_capable(inode->i_sb->s_user_ns, CAP_CHOWN))
 		return true;
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Check for ACE4_WRITE_OWNER. RFC 5661 Section 6.2.1.3.1
+	 * On UNIX systems, this is the ability to execute chown() and
+	 * chgrp().
+	 */
+	if (IS_NFSV4ACL(inode) &&
+	    (inode_permission(inode, MAY_WRITE_OWNER) == 0))
+		return true;
+#endif
 	return false;
 }
 
@@ -87,8 +107,27 @@ int setattr_prepare(struct dentry *dentry, struct iattr *attr)
 
 	/* Make sure a caller can chmod. */
 	if (ia_valid & ATTR_MODE) {
+#if CONFIG_TRUENAS
+		/*
+		 * Check for ACE4_WRITE_ACL. RFC 5661 Section 6.2.1.3.1
+		 * Permission to write the acl or mode attributes.
+		 */
+		if (IS_NFSV4ACL(inode)) {
+			if (inode_permission(inode, MAY_WRITE_ACL) != 0) {
+				if (!inode_owner_or_capable(inode)) {
+					return -EPERM;
+				}
+			}
+		}
+		else {
+			if (!inode_owner_or_capable(inode))
+				return -EPERM;
+		}
+
+#else
 		if (!inode_owner_or_capable(inode))
 			return -EPERM;
+#endif
 		/* Also check the setgid bit! */
 		if (!in_group_p((ia_valid & ATTR_GID) ? attr->ia_gid :
 				inode->i_gid) &&
@@ -98,8 +137,27 @@ int setattr_prepare(struct dentry *dentry, struct iattr *attr)
 
 	/* Check for setting the inode time. */
 	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) {
+#if CONFIG_TRUENAS
+		/*
+		 * Check for ACE4_WRITE_ATTRIBUTES. RFC 5661 Section 6.2.1.3.1
+		 * Permission to change times associated with file or directory
+		 * to an arbitrary value.
+		 */
+		if (IS_NFSV4ACL(inode)) {
+			if (inode_permission(inode, MAY_WRITE_ATTRS) != 0) {
+				if (!inode_owner_or_capable(inode)) {
+					return -EPERM;
+				}
+			}
+		}
+		else {
+			if (!inode_owner_or_capable(inode))
+				return -EPERM;
+		}
+#else
 		if (!inode_owner_or_capable(inode))
 			return -EPERM;
+#endif
 	}
 
 kill_priv:

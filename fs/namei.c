@@ -2697,8 +2697,39 @@ static int may_delete(struct inode *dir, struct dentry *victim, bool isdir)
 		return -EOVERFLOW;
 
 	audit_inode_child(dir, victim, AUDIT_TYPE_CHILD_DELETE);
+#if CONFIG_TRUENAS
+	if (IS_NFSV4ACL(inode)) {
+		/*
+		 * See RFC 5661 Section 6.2.1.3.2
+		 * for implementation details of DELETE vs DELETE_CHILD.
+		 *
+		 * ZFS implementation detail: EACCES is returned
+		 * when permission explicitly denied. EPERM is
+		 * returned when the permission is not granted.
+		 */
+		int d_mode, i_mode;
+		error = inode_permission(inode, MAY_DELETE);
+		if (error == -EACCES) {
+			/* deletion is explicitly denied */
+			return -EPERM;
+		}
+		else if (error) {
+			error = inode_permission(dir, MAY_DELETE_CHILD);
+			if (error == -EACCES) {
+				/* deletion is explicitly denied */
+				return -EPERM;
+			}
+			if (error)
+				error = inode_permission(dir, MAY_WRITE|MAY_EXEC);
+		}
 
-	error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
+	}
+	else {
+		error = inode_permission(dir, MAY_WRITE|MAY_EXEC);
+	}
+#else
+	error = inode_permission(dir, MAY_WRITE|MAY_EXEC);
+#endif
 	if (error)
 		return error;
 	if (IS_APPEND(dir))
