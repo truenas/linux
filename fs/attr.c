@@ -88,7 +88,7 @@ int setattr_prepare(struct dentry *dentry, struct iattr *attr)
 		if (!IS_NFSV4ACL(inode)) {
 			return -EPERM;
 		}
-		else if (inode_permission(inode, MAY_WRITE_OWNER) != 0) {
+		else if (!inode_permission(inode, MAY_WRITE_OWNER)) {
 			return -EPERM;
 		}
 	}
@@ -103,7 +103,7 @@ int setattr_prepare(struct dentry *dentry, struct iattr *attr)
 		if (!IS_NFSV4ACL(inode)) {
 			return -EPERM;
 		}
-		else if (inode_permission(inode, MAY_WRITE_OWNER) != 0) {
+		else if (!inode_permission(inode, MAY_WRITE_OWNER)) {
 			return -EPERM;
 		}
 	}
@@ -120,7 +120,7 @@ int setattr_prepare(struct dentry *dentry, struct iattr *attr)
 		 * Permission to write the acl or mode attributes.
 		 */
 		if (IS_NFSV4ACL(inode)) {
-			if (inode_permission(inode, MAY_WRITE_ACL) != 0) {
+			if (!inode_permission(inode, MAY_WRITE_ACL) {
 				if (!inode_owner_or_capable(inode)) {
 					return -EPERM;
 				}
@@ -151,7 +151,7 @@ int setattr_prepare(struct dentry *dentry, struct iattr *attr)
 		 * to an arbitrary value.
 		 */
 		if (IS_NFSV4ACL(inode)) {
-			if (inode_permission(inode, MAY_WRITE_ATTRS) != 0) {
+			if (!inode_permission(inode, MAY_WRITE_ATTRS)) {
 				if (!inode_owner_or_capable(inode)) {
 					return -EPERM;
 				}

@@ -415,7 +415,15 @@ static inline int do_inode_permission(struct inode *inode, int mask)
  */
 static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
 {
+#if CONFIG_TRUENAS
+	/*
+	 * NFSv4 ACLs have more granular write permissions. Same logic
+	 * should apply here as with generic MAY_WRITE.
+	 */
+	if (unlikely(mask & (MAY_WRITE | NFS41_WRITE_ALL))) {
+#else
 	if (unlikely(mask & MAY_WRITE)) {
+#endif
 		umode_t mode = inode->i_mode;
 
 		/* Nobody gets write access to a read-only fs. */
@@ -444,7 +452,15 @@ int inode_permission(struct inode *inode, int mask)
 	if (retval)
 		return retval;
 
+#if CONFIG_TRUENAS
+	/*
+	 * NFSv4 ACLs have more granular write permissions. Same logic
+	 * should apply here as with generic MAY_WRITE.
+	 */
+	if (unlikely(mask & (MAY_WRITE | NFS41_WRITE_ALL))) {
+#else
 	if (unlikely(mask & MAY_WRITE)) {
+#endif
 		/*
 		 * Nobody gets write access to an immutable file.
 		 */
@@ -2707,7 +2723,6 @@ static int may_delete(struct inode *dir, struct dentry *victim, bool isdir)
 		 * when permission explicitly denied. EPERM is
 		 * returned when the permission is not granted.
 		 */
-		int d_mode, i_mode;
 		error = inode_permission(inode, MAY_DELETE);
 		if (error == -EACCES) {
 			/* deletion is explicitly denied */
@@ -2719,16 +2734,23 @@ static int may_delete(struct inode *dir, struct dentry *victim, bool isdir)
 				/* deletion is explicitly denied */
 				return -EPERM;
 			}
-			if (error)
-				error = inode_permission(dir, MAY_WRITE|MAY_EXEC);
+			if (error) {
+				/*
+				 * Fallback to allowing deletion if we have write
+				 * and exec perms. In case of ZFS there will be
+				 * another permission check (zfs_zaccess_delete())
+				 * during zpl_unlink().
+				 */
+				error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
+			}
 		}
 
 	}
 	else {
-		error = inode_permission(dir, MAY_WRITE|MAY_EXEC);
+		error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
 	}
 #else
-	error = inode_permission(dir, MAY_WRITE|MAY_EXEC);
+	error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
 #endif
 	if (error)
 		return error;
