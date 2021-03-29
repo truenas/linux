@@ -134,7 +134,7 @@ xattr_permission(struct inode *inode, const char *name, int mask)
 	if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN)) {
 		if (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
 #if CONFIG_TRUENAS
-			return (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS) ? -EPERM : -ENODATA;
+			return (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) ? -EPERM : -ENODATA;
 #else
 			return (mask & MAY_WRITE) ? -EPERM : -ENODATA;
 #endif
