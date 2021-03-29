@@ -109,13 +109,14 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
  * for permissions checks where NFSv4 ACL handling is
  * more nuanced than a simple POSIX permissions.
  */
+#define MAY_WRITE_NAMED_ATTRS	0x00000100
 #define MAY_DELETE_CHILD	0x00000400
 #define MAY_WRITE_ATTRS		0x00001000
 #define MAY_DELETE		0x00100000
 #define MAY_WRITE_ACL		0x00400000
 #define MAY_WRITE_OWNER		0x00800000
 #define NFS41ACL_WRITE_ALL	(MAY_DELETE_CHILD|MAY_WRITE_ATTRS|MAY_DELETE|\
-				 MAY_WRITE_ACL|MAY_WRITE_OWNER)
+				 MAY_WRITE_ACL|MAY_WRITE_OWNER|MAY_WRITE_NAMED_ATTRS)
 #endif
 
 /*

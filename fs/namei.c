@@ -420,7 +420,7 @@ static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
 	 * NFSv4 ACLs have more granular write permissions. Same logic
 	 * should apply here as with generic MAY_WRITE.
 	 */
-	if (unlikely(mask & (MAY_WRITE | NFS41_WRITE_ALL))) {
+	if (unlikely(mask & (MAY_WRITE | NFS41ACL_WRITE_ALL))) {
 #else
 	if (unlikely(mask & MAY_WRITE)) {
 #endif
@@ -457,7 +457,7 @@ int inode_permission(struct inode *inode, int mask)
 	 * NFSv4 ACLs have more granular write permissions. Same logic
 	 * should apply here as with generic MAY_WRITE.
 	 */
-	if (unlikely(mask & (MAY_WRITE | NFS41_WRITE_ALL))) {
+	if (unlikely(mask & (MAY_WRITE | NFS41ACL_WRITE_ALL))) {
 #else
 	if (unlikely(mask & MAY_WRITE)) {
 #endif
