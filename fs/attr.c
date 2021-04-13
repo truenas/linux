@@ -309,7 +309,16 @@ int notify_change(struct dentry * dentry, struct iattr * attr, struct inode **de
 			return -EPERM;
 
 		if (!inode_owner_or_capable(inode)) {
+#if CONFIG_TRUENAS
+			if (IS_NFSV4ACL(inode)) {
+				error = inode_permission(inode, MAY_WRITE_ATTRS);
+			}
+			else {
+				error = inode_permission(inode, MAY_WRITE);
+			}
+#else
 			error = inode_permission(inode, MAY_WRITE);
+#endif
 			if (error)
 				return error;
 		}
