@@ -2724,27 +2724,18 @@ static int may_delete(struct inode *dir, struct dentry *victim, bool isdir)
 		 * returned when the permission is not granted.
 		 */
 		error = inode_permission(inode, MAY_DELETE);
-		if (error == -EACCES) {
-			/* deletion is explicitly denied */
-			return -EPERM;
-		}
-		else if (error) {
+		if (error) {
 			error = inode_permission(dir, MAY_DELETE_CHILD);
-			if (error == -EACCES) {
-				/* deletion is explicitly denied */
-				return -EPERM;
-			}
-			if (error) {
-				/*
-				 * Fallback to allowing deletion if we have write
-				 * and exec perms. In case of ZFS there will be
-				 * another permission check (zfs_zaccess_delete())
-				 * during zpl_unlink().
-				 */
-				error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
-			}
 		}
-
+		if (error) {
+			/*
+			 * Fallback to allowing deletion if we have write
+			 * and exec perms. In case of ZFS there will be
+			 * another permission check (zfs_zaccess_delete())
+			 * during zpl_unlink().
+			 */
+			error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
+		}
 	}
 	else {
 		error = inode_permission(dir, MAY_WRITE | MAY_EXEC);
