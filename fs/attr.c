@@ -179,21 +179,69 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
 		goto kill_priv;
 
 	/* Make sure a caller can chown. */
+#if CONFIG_TRUENAS
+	/*
+	 * Check for ACE4_WRITE_OWNER. RFC 5661 Section 6.2.1.3.1
+	 * On UNIX systems, this is the ability to execute chown() and
+	 * chgrp().
+	 */
+	if ((ia_valid & ATTR_UID) &&
+	    !chown_ok(idmap, inode, attr->ia_vfsuid)) {
+		if (!IS_NFSV4ACL(inode)) {
+			return -EPERM;
+		}
+		else if (inode_permission(idmap, inode, MAY_WRITE_OWNER)) {
+			return -EPERM;
+		}
+	}
+#else
 	if ((ia_valid & ATTR_UID) &&
 	    !chown_ok(idmap, inode, attr->ia_vfsuid))
 		return -EPERM;
+#endif
 
 	/* Make sure caller can chgrp. */
+#if CONFIG_TRUENAS
+	if ((ia_valid & ATTR_GID) &&
+	    !chgrp_ok(idmap, inode, attr->ia_vfsgid)) {
+		if (!IS_NFSV4ACL(inode)) {
+			return -EPERM;
+		}
+		else if (inode_permission(idmap, inode, MAY_WRITE_OWNER)) {
+			return -EPERM;
+		}
+	}
+#else
 	if ((ia_valid & ATTR_GID) &&
 	    !chgrp_ok(idmap, inode, attr->ia_vfsgid))
 		return -EPERM;
+#endif
 
 	/* Make sure a caller can chmod. */
 	if (ia_valid & ATTR_MODE) {
 		vfsgid_t vfsgid;
 
+#if CONFIG_TRUENAS
+		/*
+		 * Check for ACE4_WRITE_ACL. RFC 5661 Section 6.2.1.3.1
+		 * Permission to write the acl or mode attributes.
+		 */
+		if (IS_NFSV4ACL(inode)) {
+			if (!inode_owner_or_capable(idmap, inode)) {
+				if (inode_permission(idmap, inode,
+						     MAY_WRITE_ACL)) {
+					return -EPERM;
+				}
+			}
+		}
+		else {
+			if (!inode_owner_or_capable(idmap, inode))
+				return -EPERM;
+		}
+#else
 		if (!inode_owner_or_capable(idmap, inode))
 			return -EPERM;
+#endif
 
 		if (ia_valid & ATTR_GID)
 			vfsgid = attr->ia_vfsgid;
@@ -207,6 +255,12 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	/* Check for setting the inode time. */
 	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) {
+		/*
+		 * Check for ACE4_WRITE_ATTRIBUTES. RFC 5661 Section 6.2.1.3.1
+		 * Users with ACE4_WRITE_ATTRIBUTES or ACE4_WRITE_DATA can
+		 * change the times associated with a file to the _current_
+		 * server time. This permissions check happens in notify_change().
+		 */
 		if (!inode_owner_or_capable(idmap, inode))
 			return -EPERM;
 	}
@@ -338,7 +392,22 @@ int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
 			return -EPERM;
 
 		if (!inode_owner_or_capable(idmap, inode)) {
+#if CONFIG_TRUENAS
+			if (IS_NFSV4ACL(inode)) {
+				error = inode_permission(idmap, inode,
+							 MAY_WRITE);
+				if (error) {
+					error = inode_permission(idmap,
+							inode, MAY_WRITE_ATTRS);
+				}
+			}
+			else {
+				error = inode_permission(idmap, inode,
+							 MAY_WRITE);
+			}
+#else
 			error = inode_permission(idmap, inode, MAY_WRITE);
+#endif
 			if (error)
 				return error;
 		}
