@@ -1,3 +1,9 @@
+linux-5.10.18+truenas (5.10.18+truenas-2) sid; urgency=low
+
+  * Implement NFS4 ACL support
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 27 Apr 2021 10:21:00 -0500
+
 linux-5.10.18+truenas (5.10.18+truenas-1) sid; urgency=low
 
   * Import upstream Linux 5.10 branch.
