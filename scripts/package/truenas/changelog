@@ -1,3 +1,9 @@
+linux-5.10.42+truenas (5.10.42+truenas-3) sid; urgency=low
+
+  * Merge upstream v5.10.42
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Mon, 14 Jun 2021 16:21:00 -0500
+
 linux-5.10.18+truenas (5.10.18+truenas-2) sid; urgency=low
 
   * Implement NFS4 ACL support
