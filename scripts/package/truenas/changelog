@@ -1,3 +1,9 @@
+linux-5.10.58+truenas (5.10.58+truenas-1) sid; urgency=low
+
+  * Merge upstream v5.10.58
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 17 Aug 2021 12:00:00 -0500
+
 linux-5.10.42+truenas (5.10.42+truenas-3) sid; urgency=low
 
   * Merge upstream v5.10.42
