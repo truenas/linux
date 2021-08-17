@@ -19,6 +19,7 @@
 #include <linux/compiler.h>
 
 #include <linux/rcupdate.h>	/* rcu_expedited and rcu_normal */
+#include <linux/device/driver.h>	/* wait_for_device_probe */
 
 #define KERNEL_ATTR_RO(_name) \
 static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
@@ -182,6 +183,22 @@ static ssize_t rcu_normal_store(struct kobject *kobj,
 KERNEL_ATTR_RW(rcu_normal);
 #endif /* #ifndef CONFIG_TINY_RCU */
 
+static ssize_t wait_for_device_probe_show(struct kobject *kobj,
+					  struct kobj_attribute *attr,
+					  char *buf)
+{
+	return sprintf(buf, "0\n");
+}
+static ssize_t wait_for_device_probe_store(struct kobject *kobj,
+					   struct kobj_attribute *attr,
+					   const char *buf, size_t count)
+{
+	wait_for_device_probe();
+
+	return count;
+}
+KERNEL_ATTR_RW(wait_for_device_probe);
+
 /*
  * Make /sys/kernel/notes give the raw contents of our kernel .notes section.
  */
@@ -229,6 +246,7 @@ static struct attribute * kernel_attrs[] = {
 	&rcu_expedited_attr.attr,
 	&rcu_normal_attr.attr,
 #endif
+	&wait_for_device_probe_attr.attr,
 	NULL
 };
 
