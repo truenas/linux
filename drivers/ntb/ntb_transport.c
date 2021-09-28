@@ -53,6 +53,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/idr.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -213,6 +214,11 @@ struct ntb_transport_mw {
 	dma_addr_t dma_addr;
 };
 
+struct ntb_transport_client_dev_name {
+	struct list_head entry;
+	char device_name[];
+};
+
 struct ntb_transport_client_dev {
 	struct list_head entry;
 	struct ntb_transport_ctx *nt;
@@ -224,6 +230,7 @@ struct ntb_transport_ctx {
 	struct list_head client_devs;
 
 	struct ntb_dev *ndev;
+	int unit;
 
 	struct ntb_transport_mw *mw_vec;
 	struct ntb_transport_qp *qp_vec;
@@ -321,11 +328,57 @@ static struct bus_type ntb_transport_bus = {
 	.remove = ntb_transport_bus_remove,
 };
 
+static void ntb_transport_client_release(struct device *dev)
+{
+	struct ntb_transport_client_dev *client_dev;
+
+	client_dev = dev_client_dev(dev);
+	kfree(client_dev);
+}
+
+int ntb_transport_add_dev(struct ntb_transport_ctx *nt, char *device_name)
+{
+	struct ntb_transport_client_dev *client_dev;
+	struct device *dev;
+	int node, rc;
+
+	node = dev_to_node(&nt->ndev->dev);
+	client_dev = kzalloc_node(sizeof(*client_dev), GFP_KERNEL, node);
+	if (!client_dev)
+		return -ENOMEM;
+
+	dev = &client_dev->dev;
+
+	/* setup and register client devices */
+	dev_set_name(dev, "%s%d", device_name, nt->unit);
+	dev->bus = &ntb_transport_bus;
+	dev->release = ntb_transport_client_release;
+	dev->parent = &nt->ndev->dev;
+
+	rc = device_register(dev);
+	if (rc) {
+		kfree(client_dev);
+		return rc;
+	}
+
+	list_add_tail(&client_dev->entry, &nt->client_devs);
+	return 0;
+}
+
 static LIST_HEAD(ntb_transport_list);
+static DEFINE_IDA(ntb_transport_unit_ida);
+static LIST_HEAD(ntb_transport_client_list);
 
 static int ntb_bus_init(struct ntb_transport_ctx *nt)
 {
+	struct ntb_transport_client_dev_name *n;
+
+	nt->unit = ida_alloc(&ntb_transport_unit_ida, GFP_KERNEL);
+	if (nt->unit < 0)
+		return nt->unit;
 	list_add_tail(&nt->entry, &ntb_transport_list);
+	list_for_each_entry(n, &ntb_transport_client_list, entry)
+		ntb_transport_add_dev(nt, n->device_name);
 	return 0;
 }
 
@@ -341,14 +394,7 @@ static void ntb_bus_remove(struct ntb_transport_ctx *nt)
 	}
 
 	list_del(&nt->entry);
-}
-
-static void ntb_transport_client_release(struct device *dev)
-{
-	struct ntb_transport_client_dev *client_dev;
-
-	client_dev = dev_client_dev(dev);
-	kfree(client_dev);
+	ida_free(&ntb_transport_unit_ida, nt->unit);
 }
 
 /**
@@ -359,6 +405,7 @@ static void ntb_transport_client_release(struct device *dev)
  */
 void ntb_transport_unregister_client_dev(char *device_name)
 {
+	struct ntb_transport_client_dev_name *n;
 	struct ntb_transport_client_dev *client, *cd;
 	struct ntb_transport_ctx *nt;
 
@@ -369,6 +416,13 @@ void ntb_transport_unregister_client_dev(char *device_name)
 				list_del(&client->entry);
 				device_unregister(&client->dev);
 			}
+	list_for_each_entry(n, &ntb_transport_client_list, entry) {
+		if (!strcmp(n->device_name, device_name)) {
+			list_del(&n->entry);
+			kfree(n);
+			break;
+		}
+	}
 }
 EXPORT_SYMBOL_GPL(ntb_transport_unregister_client_dev);
 
@@ -380,42 +434,20 @@ EXPORT_SYMBOL_GPL(ntb_transport_unregister_client_dev);
  */
 int ntb_transport_register_client_dev(char *device_name)
 {
-	struct ntb_transport_client_dev *client_dev;
+	struct ntb_transport_client_dev_name *n;
 	struct ntb_transport_ctx *nt;
-	int node;
-	int rc, i = 0;
+	int rc;
 
-	if (list_empty(&ntb_transport_list))
-		return -ENODEV;
+	n = kzalloc(sizeof(*n) + strlen(device_name) + 1, GFP_KERNEL);
+	if (!n)
+		return -ENOMEM;
+	strcpy(n->device_name, device_name);
+	list_add_tail(&n->entry, &ntb_transport_client_list);
 
 	list_for_each_entry(nt, &ntb_transport_list, entry) {
-		struct device *dev;
-
-		node = dev_to_node(&nt->ndev->dev);
-
-		client_dev = kzalloc_node(sizeof(*client_dev),
-					  GFP_KERNEL, node);
-		if (!client_dev) {
-			rc = -ENOMEM;
+		rc = ntb_transport_add_dev(nt, device_name);
+		if (rc < 0)
 			goto err;
-		}
-
-		dev = &client_dev->dev;
-
-		/* setup and register client devices */
-		dev_set_name(dev, "%s%d", device_name, i);
-		dev->bus = &ntb_transport_bus;
-		dev->release = ntb_transport_client_release;
-		dev->parent = &nt->ndev->dev;
-
-		rc = device_register(dev);
-		if (rc) {
-			kfree(client_dev);
-			goto err;
-		}
-
-		list_add_tail(&client_dev->entry, &nt->client_devs);
-		i++;
 	}
 
 	return 0;
@@ -438,10 +470,6 @@ EXPORT_SYMBOL_GPL(ntb_transport_register_client_dev);
 int ntb_transport_register_client(struct ntb_transport_client *drv)
 {
 	drv->driver.bus = &ntb_transport_bus;
-
-	if (list_empty(&ntb_transport_list))
-		return -ENODEV;
-
 	return driver_register(&drv->driver);
 }
 EXPORT_SYMBOL_GPL(ntb_transport_register_client);
