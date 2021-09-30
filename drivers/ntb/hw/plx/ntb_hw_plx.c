@@ -236,15 +236,13 @@ static u64 plx_ntb_link_is_up(struct ntb_dev *ntb, enum ntb_speed *speed, enum n
 	struct plx_ntb_dev *ndev = ntb_ndev(ntb);
 	u16 link;
 
-	if (!pcie_capability_read_word(ndev->ntb.pdev, PCI_EXP_LNKSTA, &link)) {
-		if (speed)
-			*speed = NTB_LNK_STA_SPEED(link);
-		if (width)
-			*width = NTB_LNK_STA_WIDTH(link);
-		return 1;
-	}
-
-	return 0;
+	if (pcie_capability_read_word(ndev->ntb.pdev, PCI_EXP_LNKSTA, &link))
+		return 0;
+	if (speed)
+		*speed = NTB_LNK_STA_SPEED(link);
+	if (width)
+		*width = NTB_LNK_STA_WIDTH(link);
+	return NTB_LNK_STA_WIDTH(link) != 0;
 }
 
 static int plx_ntb_link_enable(struct ntb_dev *ntb, enum ntb_speed max_speed,
@@ -1041,7 +1039,7 @@ static ssize_t ndev_debugfs_read(struct file *filp, char __user *ubuf, size_t co
 
 	off += scnprintf(buf + off, buf_size - off, "Peer SPAD Offset - \t%u\n", ndev->pspad_off1);
 
-	off += scnprintf(buf + off, buf_size - off, "Peer Xtra SPAD - \t\t%u\n", ndev->pspad_off2);
+	off += scnprintf(buf + off, buf_size - off, "Peer Xtra SPAD - \t%u\n", ndev->pspad_off2);
 
 	ret = simple_read_from_buffer(ubuf, count, offp, buf, off);
 	kfree(buf);
