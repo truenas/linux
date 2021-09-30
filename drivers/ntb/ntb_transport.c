@@ -278,7 +278,7 @@ enum {
 
 #define QP_TO_MW(nt, qp)	((qp) % nt->mw_count)
 #define NTB_QP_DEF_NUM_ENTRIES	100
-#define NTB_LINK_DOWN_TIMEOUT	10
+#define NTB_LINK_DOWN_TIMEOUT	100
 
 static void ntb_transport_rxc_db(unsigned long data);
 static const struct ntb_ctx_ops ntb_transport_ops;
@@ -1080,11 +1080,9 @@ static void ntb_transport_link_work(struct work_struct *work)
 		spad = MW0_SZ_LOW + (i * 2);
 		ntb_peer_spad_write(ndev, PIDX, spad, lower_32_bits(size));
 	}
-
 	ntb_peer_spad_write(ndev, PIDX, NUM_MWS, nt->mw_count);
-
 	ntb_peer_spad_write(ndev, PIDX, NUM_QPS, nt->qp_count);
-
+	ntb_peer_spad_write(ndev, PIDX, QP_LINKS, 0);
 	ntb_peer_spad_write(ndev, PIDX, VERSION, NTB_TRANSPORT_VERSION);
 
 	/* Query the remote side for its info */
@@ -1154,15 +1152,19 @@ static void ntb_qp_link_work(struct work_struct *work)
 						   link_work.work);
 	struct pci_dev *pdev = qp->ndev->pdev;
 	struct ntb_transport_ctx *nt = qp->transport;
-	int val;
+	int i, val;
 
 	WARN_ON(!nt->link_is_up);
 
-	val = ntb_spad_read(nt->ndev, QP_LINKS);
-
-	ntb_peer_spad_write(nt->ndev, PIDX, QP_LINKS, val | BIT(qp->qp_num));
+	/* Report queues that are up on our side */
+	for (i = 0, val = 0; i < nt->qp_count; i++) {
+		if (nt->qp_vec[i].client_ready)
+			val |= BIT(i);
+	}
+	ntb_peer_spad_write(nt->ndev, PIDX, QP_LINKS, val);
 
 	/* query remote spad for qp ready bits */
+	val = ntb_spad_read(nt->ndev, QP_LINKS);
 	dev_dbg_ratelimited(&pdev->dev, "Remote QP link status = %x\n", val);
 
 	/* See if the remote side is up */
@@ -1395,6 +1397,7 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 
 	INIT_DELAYED_WORK(&nt->link_work, ntb_transport_link_work);
 	INIT_WORK(&nt->link_cleanup, ntb_transport_link_cleanup_work);
+	nt->link_is_up = false;
 
 	rc = ntb_set_ctx(ndev, nt, &ntb_transport_ops);
 	if (rc)
@@ -1405,7 +1408,6 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 	if (rc)
 		goto err3;
 
-	nt->link_is_up = false;
 	ntb_link_enable(ndev, NTB_SPEED_AUTO, NTB_WIDTH_AUTO);
 	ntb_link_event(ndev);
 
@@ -2358,16 +2360,21 @@ EXPORT_SYMBOL_GPL(ntb_transport_link_up);
  */
 void ntb_transport_link_down(struct ntb_transport_qp *qp)
 {
-	int val;
+	struct ntb_transport_ctx *nt;
+	int i, val;
 
 	if (!qp)
 		return;
 
 	qp->client_ready = false;
 
-	val = ntb_spad_read(qp->ndev, QP_LINKS);
-
-	ntb_peer_spad_write(qp->ndev, PIDX, QP_LINKS, val & ~BIT(qp->qp_num));
+	/* Report queues that are up on our side */
+	nt = qp->transport;
+	for (i = 0, val = 0; i < nt->qp_count; i++) {
+		if (nt->qp_vec[i].client_ready)
+			val |= BIT(i);
+	}
+	ntb_peer_spad_write(nt->ndev, PIDX, QP_LINKS, val);
 
 	if (qp->link_is_up)
 		ntb_send_link_down(qp);
