@@ -1749,7 +1749,8 @@ static void ntb_transport_rxc_db(unsigned long data)
 		 */
 		if (qp->active)
 			tasklet_schedule(&qp->rxc_db_work);
-	}
+	} else if (qp->active)
+		ntb_db_clear_mask(qp->ndev, BIT_ULL(qp->qp_num));
 }
 
 static void ntb_tx_copy_callback(void *data,
@@ -2464,14 +2465,18 @@ static void ntb_transport_doorbell_callback(void *data, int vector)
 	u64 db_bits;
 	unsigned int qp_num;
 
-	if (ntb_db_read(nt->ndev) & nt->msi_db_mask) {
+	db_bits = ntb_db_read(nt->ndev);
+	if (db_bits & nt->msi_db_mask) {
 		ntb_transport_msi_peer_desc_changed(nt);
 		ntb_db_clear(nt->ndev, nt->msi_db_mask);
 	}
 
-	db_bits = (nt->qp_bitmap & ~nt->qp_bitmap_free &
+	db_bits &= (nt->qp_bitmap & ~nt->qp_bitmap_free &
 		   ntb_db_vector_mask(nt->ndev, vector));
-
+	if (db_bits) {
+		ntb_db_set_mask(nt->ndev, db_bits);
+		ntb_db_clear(nt->ndev, db_bits);
+	}
 	while (db_bits) {
 		qp_num = __ffs(db_bits);
 		qp = &nt->qp_vec[qp_num];
