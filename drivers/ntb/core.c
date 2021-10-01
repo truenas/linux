@@ -178,7 +178,8 @@ int ntb_register_device(struct ntb_dev *ntb)
 	init_completion(&ntb->released);
 
 	ntb->dev.bus = &ntb_bus;
-	ntb->dev.parent = &ntb->pdev->dev;
+	if (!ntb->dev.parent)
+		ntb->dev.parent = &ntb->pdev->dev;
 	ntb->dev.release = ntb_dev_release;
 	if (driver_override && driver_override[0] && !ntb->driver_override)
 		ntb->driver_override = kstrdup(driver_override, GFP_KERNEL);
