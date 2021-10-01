@@ -501,9 +501,6 @@ static int plx_ntb_mw_set_trans(struct ntb_dev *ntb, int pidx, int idx,
 	struct plx_ntb_mw_info *mw;
 	unsigned int sp;
 
-	if (pidx != NTB_DEF_PEER_IDX)
-		return -EINVAL;
-
 	idx = plx_ntb_user_mw_to_idx(ndev, idx, &sp);
 	if (idx >= ndev->mw_count)
 		return -EINVAL;
