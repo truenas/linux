@@ -635,7 +635,7 @@ static int plx_init_isr(struct plx_ntb_dev *ndev)
 	 */
 	pci_intx(pdev, 1);
 	rc = devm_request_irq(&pdev->dev, pdev->irq, ndev_irq_isr, IRQF_SHARED,
-			      "ndev_irq_isr", ndev);
+			      NTB_NAME, ndev);
 	if (rc)
 		return rc;
 
