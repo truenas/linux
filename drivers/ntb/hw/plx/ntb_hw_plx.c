@@ -702,12 +702,15 @@ static int plx_init_dev(struct ntb_dev *ntb)
 	/* Try to identify B2B mode, and check if B2B was disabled via module parameter */
 	if (ndev->link) {
 		dev_info(&pdev->dev, "NTB-to-Root Port mode (Link Interface)\n");
+		ndev->ntb.topo = NTB_TOPO_SEC;
 		ndev->b2b_mw = -1;
 	} else if (b2b_mode == 0) {
 		dev_info(&pdev->dev, "NTB-to-Root Port mode (Virtual Interface)\n");
+		ndev->ntb.topo = NTB_TOPO_PRI;
 		ndev->b2b_mw = -1;
 	} else {
 		dev_info(&pdev->dev, "NTB-to-NTB (back-to-back) mode\n");
+		ndev->ntb.topo = NTB_TOPO_CROSSLINK;
 
 		/* We need at least one memory window for B2B peer access */
 		if (ndev->mw_count == 0) {
