@@ -1,3 +1,9 @@
+linux-5.10.81+truenas (5.10.81+truenas-1) sid; urgency=low
+
+  * Merge upstream v5.10.81
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 30 Nov 2021 12:00:00 -0500
+
 linux-5.10.70+truenas (5.10.70+truenas-1) sid; urgency=low
 
   * Add PLX NTB driver
