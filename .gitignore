@@ -108,6 +108,7 @@ modules.order
 !.get_maintainer.ignore
 !.gitattributes
 !.gitignore
+!.github
 !.kunitconfig
 !.mailmap
 !.rustfmt.toml
