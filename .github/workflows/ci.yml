@@ -1,0 +1,56 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+
+  build_kernel:
+
+    runs-on: ubuntu-20.04
+
+    steps:
+
+      - name: Check out repository code
+        uses: actions/checkout@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential gawk flex bison openssl dkms \
+          libelf-dev libudev-dev libpci-dev libiberty-dev autoconf dwarves \
+          libncurses-dev libssl-dev
+
+      - name: Generate .config 
+        run: |
+          rm -rf .git .gitattributes .gitignore
+          make defconfig
+          make syncconfig
+          make archprepare
+          ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/tn.config
+          ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/debug.config
+          ./scripts/package/mkdebian
+
+      - name: Build Kernel
+        run: |
+          cp .config /tmp/
+          make distclean
+          mv /tmp/.config .config
+          make -j$(nproc) bindeb-pkg
+          
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          mv ../*.deb ./artifacts/
+          mv ../*.changes ./artifacts/
+          mv ../*.buildinfo ./artifacts/
+          cp .config ./artifacts/
+
+      - name: Export artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{github.sha}}
+          path: ./artifacts
+
+      - name: Status 
+        run: |
+          echo "Status: ${{job.status}}"
