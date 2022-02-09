@@ -2928,7 +2928,8 @@ nfsd4_encode_fattr(struct xdr_stream *xdr, struct svc_fh *fhp,
 
 		memcpy(supp, nfsd_suppattrs[minorversion], sizeof(supp));
 
-		if (!IS_POSIXACL(dentry->d_inode))
+		if (!IS_POSIXACL(dentry->d_inode) &&
+		    !IS_NFSV4ACL(dentry->d_inode))
 			supp[0] &= ~FATTR4_WORD0_ACL;
 		if (!contextsupport)
 			supp[2] &= ~FATTR4_WORD2_SECURITY_LABEL;
@@ -3076,7 +3077,7 @@ out_acl:
 		p = xdr_reserve_space(xdr, 4);
 		if (!p)
 			goto out_resource;
-		*p++ = cpu_to_be32(IS_POSIXACL(dentry->d_inode) ?
+		*p++ = cpu_to_be32(IS_POSIXACL(dentry->d_inode) || IS_NFSV4ACL(dentry->d_inode) ?
 			ACL4_SUPPORT_ALLOW_ACL|ACL4_SUPPORT_DENY_ACL : 0);
 	}
 	if (bmval0 & FATTR4_WORD0_CANSETTIME) {

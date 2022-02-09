@@ -37,11 +37,13 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/posix_acl.h>
+#include <linux/xattr.h>
 
 #include "nfsfh.h"
 #include "nfsd.h"
 #include "acl.h"
 #include "vfs.h"
+#include "nfs41acl_xdr.h"
 
 #define NFS4_ACL_TYPE_DEFAULT	0x01
 #define NFS4_ACL_DIR		0x02
@@ -125,8 +127,8 @@ static short ace2type(struct nfs4_ace *);
 static void _posix_to_nfsv4_one(struct posix_acl *, struct nfs4_acl *,
 				unsigned int);
 
-int
-nfsd4_get_nfs4_acl(struct svc_rqst *rqstp, struct dentry *dentry,
+static int
+get_nfs4_posix_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 		struct nfs4_acl **acl)
 {
 	struct inode *inode = d_inode(dentry);
@@ -174,6 +176,159 @@ out:
 rel_pacl:
 	posix_acl_release(pacl);
 	return error;
+}
+
+static int
+convert_to_nfs40_ace(u32 *xdrbuf, struct nfs4_ace *ace)
+{
+	int error = 0;
+	u32 iflag, id;
+
+	ace->type = ntohl(*(xdrbuf++));
+	if (ace->type > NFS4_ACE_ACCESS_DENIED_ACE_TYPE)
+		return -EINVAL;
+
+	ace->flag = ntohl(*(xdrbuf++));
+	iflag = ntohl(*(xdrbuf++));
+	ace->access_mask = ntohl(*(xdrbuf++)) & NFS4_ACE_MASK_ALL;
+	id = ntohl(*(xdrbuf++));
+
+	if (iflag & ACEI4_SPECIAL_WHO) {
+		switch(id) {
+		case ACE4_SPECIAL_OWNER:
+			ace->whotype = NFS4_ACL_WHO_OWNER;
+			break;
+		case ACE4_SPECIAL_GROUP:
+			ace->whotype = NFS4_ACL_WHO_GROUP;
+			break;
+		case ACE4_SPECIAL_EVERYONE:
+			ace->whotype = NFS4_ACL_WHO_EVERYONE;
+			break;
+		}
+	} else {
+		ace->whotype = NFS4_ACL_WHO_NAMED;
+		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
+			ace->who_gid = make_kgid(&init_user_ns, id);
+			if (!gid_valid(ace->who_gid)) {
+				error = -EINVAL;
+			}
+		} else {
+			ace->who_uid = make_kuid(&init_user_ns, id);
+			if (!uid_valid(ace->who_uid)) {
+				error = -EINVAL;
+			}
+		}
+	}
+
+	return error;
+}
+
+static int
+convert_nfs41xdr_to_nfs40_acl(u32 *xdrbuf, size_t remaining, struct nfs4_acl *acl)
+{
+	int error = 0;
+	int i;
+
+	for (i = 0; i < acl->naces; i++, xdrbuf += NACE41_LEN) {
+		if (remaining < (NACE41_LEN * sizeof(u32))) {
+			error = -EOVERFLOW;
+			break;
+		}
+
+		error = convert_to_nfs40_ace(xdrbuf, &acl->aces[i]);
+		if (error)
+			break;
+
+		remaining -= (NACE41_LEN * sizeof(u32));
+	}
+
+	BUG_ON(remaining != 0);
+	return error;
+}
+
+static int
+get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
+		struct nfs4_acl **pacl)
+{
+	int error = 0;
+	u32 ace_cnt;
+	u32 *xdr_buf = NULL, *p;
+	struct nfs4_acl *acl = NULL;
+	ssize_t len;
+	size_t xdr_buf_sz = ACES_TO_XDRSIZE(NFS41ACL_MAX_ENTRIES);
+
+	xdr_buf = kzalloc(xdr_buf_sz, GFP_KERNEL);
+	if (!xdr_buf)
+		return -ENOMEM;
+
+	len = vfs_getxattr(&init_user_ns, dentry, NA41_NAME, xdr_buf, xdr_buf_sz);
+	if (len == 0)
+		return -EOPNOTSUPP;
+
+	if (len < 0) {
+		switch (len) {
+		case -EOPNOTSUPP:
+			/* ZFS says NFSv4 ACLs not supported */
+			error = -EOPNOTSUPP;
+			goto out;
+		case -EINVAL:
+			/* ZFS unhappy with buffer size */
+			error = -EINVAL;
+			goto out;
+		case -ERANGE:
+			/* our buffer is too small. This is _very_ unexpected */
+			error = -EINVAL;
+			goto out;
+		case -EPERM:
+		case -EACCES:
+			error = -EPERM;
+			goto out;
+		default:
+			error = -ENOMEM;
+			goto out;
+		}
+	}
+
+	BUG_ON(!(XDRSIZE_IS_VALID(len)));
+
+	/*
+	 * skip first byte since it contains ACL flags that
+	 * aren't used in NFSv4.0 ACLs
+	 */
+	p = xdr_buf + 1;
+	ace_cnt = ntohl(*(p++));
+	if (ace_cnt > NFS41ACL_MAX_ENTRIES) {
+		error = -ERANGE;
+		goto out;
+	}
+
+	acl = kzalloc(nfs4_acl_bytes(ace_cnt), GFP_KERNEL);
+	if (!acl) {
+		error = -ENOMEM;
+		goto out;
+	}
+	acl->naces = ace_cnt;
+
+	error = convert_nfs41xdr_to_nfs40_acl(p++, len - (2 * sizeof(u32)), acl);
+	if (error)
+		kfree(acl);
+	else
+		*pacl = acl;
+out:
+	kfree(xdr_buf);
+	return (error);
+}
+
+int
+nfsd4_get_nfs4_acl(struct svc_rqst *rqstp, struct dentry *dentry,
+		struct nfs4_acl **acl)
+{
+	struct inode *inode = d_inode(dentry);
+
+	if (IS_NFSV4ACL(inode))
+		return get_nfs4_nfsv41xdr_acl(rqstp, dentry, acl);
+	else
+		return get_nfs4_posix_acl(rqstp, dentry, acl);
 }
 
 struct posix_acl_summary {
@@ -751,21 +906,14 @@ out_estate:
 	return ret;
 }
 
-__be32
-nfsd4_set_nfs4_acl(struct svc_rqst *rqstp, struct svc_fh *fhp,
-		struct nfs4_acl *acl)
+static int
+nfsv4_set_posix_acl(struct svc_fh *fhp, struct nfs4_acl *acl)
 {
-	__be32 error;
 	int host_error;
+	unsigned int flags = 0;
+	struct posix_acl *pacl = NULL, *dpacl = NULL;
 	struct dentry *dentry;
 	struct inode *inode;
-	struct posix_acl *pacl = NULL, *dpacl = NULL;
-	unsigned int flags = 0;
-
-	/* Get inode */
-	error = fh_verify(rqstp, fhp, 0, NFSD_MAY_SATTR);
-	if (error)
-		return error;
 
 	dentry = fhp->fh_dentry;
 	inode = d_inode(dentry);
@@ -775,27 +923,155 @@ nfsd4_set_nfs4_acl(struct svc_rqst *rqstp, struct svc_fh *fhp,
 
 	host_error = nfs4_acl_nfsv4_to_posix(acl, &pacl, &dpacl, flags);
 	if (host_error == -EINVAL)
-		return nfserr_attrnotsupp;
+		return (-EOPNOTSUPP);
 	if (host_error < 0)
-		goto out_nfserr;
+		return host_error;
 
 	fh_lock(fhp);
 
 	host_error = set_posix_acl(&init_user_ns, inode, ACL_TYPE_ACCESS, pacl);
 	if (host_error < 0)
-		goto out_drop_lock;
+		goto out;
 
 	if (S_ISDIR(inode->i_mode)) {
 		host_error = set_posix_acl(&init_user_ns, inode,
 					   ACL_TYPE_DEFAULT, dpacl);
 	}
 
-out_drop_lock:
+out:
 	fh_unlock(fhp);
-
 	posix_acl_release(pacl);
 	posix_acl_release(dpacl);
-out_nfserr:
+	return host_error;
+}
+
+static int
+convert_ace_to_nfs41(u32 *p, const struct nfs4_ace *ace)
+{
+	int error = 0;
+	nfsace4i nace;
+
+	nace = (nfsace4i) {
+		.type = (acetype4)ace->type,
+		.flag = (aceflag4)ace->flag & NFS41_FLAGS,
+		.access_mask = ace->access_mask & NFS4_ACE_MASK_ALL,
+		.who = -1,
+	};
+
+	/* Audit and Alarm are not currently supported */
+	if (nace.type > NFS4_ACE_ACCESS_DENIED_ACE_TYPE)
+		return -EINVAL;
+
+	switch (ace->whotype) {
+	case NFS4_ACL_WHO_OWNER:
+		nace.iflag = ACEI4_SPECIAL_WHO;
+		nace.who = ACE4_SPECIAL_OWNER;
+		break;
+	case NFS4_ACL_WHO_GROUP:
+		nace.iflag = ACEI4_SPECIAL_WHO;
+		nace.who = ACE4_SPECIAL_GROUP;
+		break;
+	case NFS4_ACL_WHO_EVERYONE:
+		nace.iflag = ACEI4_SPECIAL_WHO;
+		nace.who = ACE4_SPECIAL_EVERYONE;
+		break;
+	case NFS4_ACL_WHO_NAMED:
+		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP)
+			nace.who = (int)__kgid_val(ace->who_gid);
+		else
+			nace.who = (int)__kuid_val(ace->who_uid);
+
+		BUG_ON(nace.who == -1);
+		break;
+	default:
+		error = -EINVAL;
+		break;
+	}
+
+	*p++ = htonl(nace.type);
+	*p++ = htonl(nace.flag);
+	*p++ = htonl(nace.iflag);
+	*p++ = htonl(nace.access_mask);
+	*p++ = htonl(nace.who);
+
+	return error;
+}
+
+static int
+generate_nfs41acl_buf(u32 *xdrbuf, const struct nfs4_acl *acl)
+{
+	int error = 0;
+	int i;
+
+	/* first byte is NFS41 Flags. Skip since these are RFC3530 acls */
+	*xdrbuf++ = 0;
+	*xdrbuf++ = htonl(acl->naces);
+
+	for (i = 0; i < acl->naces; i++, xdrbuf += NACE41_LEN) {
+		error = convert_ace_to_nfs41(xdrbuf, &acl->aces[i]);
+		if (error)
+			break;
+	}
+
+	return error;
+}
+
+static int
+nfsv4_set_nfsv41xdr_acl(struct svc_fh *fhp, struct nfs4_acl *acl)
+{
+	int error;
+	struct dentry *dentry;
+	u32 *xdr_buf = NULL;
+	size_t len;
+
+	if (acl->naces > NFS41ACL_MAX_ENTRIES)
+		return -ERANGE;
+
+	else if (acl->naces == 0)
+		return -EINVAL;
+
+	dentry = fhp->fh_dentry;
+	len = ACES_TO_XDRSIZE(acl->naces);
+
+	xdr_buf = kzalloc(len, GFP_KERNEL);
+	if (!xdr_buf)
+		return -ENOMEM;
+
+	error = generate_nfs41acl_buf(xdr_buf, acl);
+	if (error) {
+		kfree(xdr_buf);
+		return error;
+	}
+
+	error = vfs_setxattr(&init_user_ns, dentry, NA41_NAME, xdr_buf,
+			     len, XATTR_REPLACE);
+	kfree(xdr_buf);
+	return error;
+}
+
+static inline int
+nfs4_acl_nfsv4_set_native(struct svc_fh *fhp, struct nfs4_acl *acl)
+{
+	struct inode *inode = d_inode(fhp->fh_dentry);
+
+	if (IS_NFSV4ACL(inode))
+		return nfsv4_set_nfsv41xdr_acl(fhp, acl);
+	else
+		return nfsv4_set_posix_acl(fhp, acl);
+}
+
+__be32
+nfsd4_set_nfs4_acl(struct svc_rqst *rqstp, struct svc_fh *fhp,
+		struct nfs4_acl *acl)
+{
+	__be32 error;
+	int host_error;
+
+	error = fh_verify(rqstp, fhp, 0, NFSD_MAY_SATTR);
+	if (error)
+		return error;
+
+	host_error = nfs4_acl_nfsv4_set_native(fhp, acl);
 	if (host_error == -EOPNOTSUPP)
 		return nfserr_attrnotsupp;
 	else

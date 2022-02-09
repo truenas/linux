@@ -1238,7 +1238,7 @@ nfsd_create_locked(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		iap->ia_mode = 0;
 	iap->ia_mode = (iap->ia_mode & S_IALLUGO) | type;
 
-	if (!IS_POSIXACL(dirp))
+	if (!IS_POSIXACL(dirp) && !IS_NFSV4ACL(dirp))
 		iap->ia_mode &= ~current_umask();
 
 	err = 0;
@@ -1474,7 +1474,7 @@ do_nfsd_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		goto out;
 	}
 
-	if (!IS_POSIXACL(dirp))
+	if (!IS_POSIXACL(dirp) && !IS_NFSV4ACL(dirp))
 		iap->ia_mode &= ~current_umask();
 
 	host_err = vfs_create(&init_user_ns, dirp, dchild, iap->ia_mode, true);
@@ -2403,6 +2403,20 @@ nfsd_permission(struct svc_rqst *rqstp, struct svc_export *exp,
 	/* This assumes  NFSD_MAY_{READ,WRITE,EXEC} == MAY_{READ,WRITE,EXEC} */
 	err = inode_permission(&init_user_ns, inode,
 			       acc & (MAY_READ | MAY_WRITE | MAY_EXEC));
+
+	/*
+	 * See RFC 5661 Section 6.2.1.3.2
+	 * Allow NFSv4 ACL to override normal delete permission
+	 * In this case REMOVE is granted if DELETE is granted on file
+	 * or DELETE_CHILD is granted on parent.
+	 */
+	if ((err == -EACCES) && IS_NFSV4ACL(inode) &&
+	    (acc == NFSD_MAY_REMOVE)) {
+		err = inode_permission(&init_user_ns, inode, MAY_DELETE);
+		if (err == -EACCES)
+			err = inode_permission(&init_user_ns, d_inode(dentry->d_parent),
+			    MAY_DELETE_CHILD);
+	}
 
 	/* Allow read access to binaries even when mode 111 */
 	if (err == -EACCES && S_ISREG(inode->i_mode) &&
