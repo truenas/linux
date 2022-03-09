@@ -288,6 +288,8 @@ struct sdebug_dev_info {
 	atomic_t stopped;	/* 1: by SSU, 2: device start */
 	bool used;
 
+	bool is_enclosure;
+
 	/* For ZBC devices */
 	enum blk_zoned_model zmodel;
 	unsigned int zsize;
@@ -491,8 +493,8 @@ static int resp_close_zone(struct scsi_cmnd *, struct sdebug_dev_info *);
 static int resp_finish_zone(struct scsi_cmnd *, struct sdebug_dev_info *);
 static int resp_rwp_zone(struct scsi_cmnd *, struct sdebug_dev_info *);
 
-static int sdebug_do_add_host(bool mk_new_store);
-static int sdebug_add_host_helper(int per_host_idx);
+static int sdebug_do_add_host(bool mk_new_store, bool is_enclosure);
+static int sdebug_add_host_helper(int per_host_idx, bool is_enclosure);
 static void sdebug_do_remove_host(bool the_end);
 static int sdebug_add_store(void);
 static void sdebug_erase_store(int idx, struct sdeb_store_info *sip);
@@ -728,6 +730,7 @@ static const struct opcode_info_t opcode_info_arr[SDEB_I_LAST_ELEM_P1 + 1] = {
 };
 
 static int sdebug_num_hosts;
+static int sdebug_num_enclosures;
 static int sdebug_add_host = DEF_NUM_HOST;  /* in sysfs this is relative */
 static int sdebug_ato = DEF_ATO;
 static int sdebug_cdb_len = DEF_CDB_LEN;
@@ -1573,7 +1576,9 @@ static int resp_inquiry(struct scsi_cmnd *scp, struct sdebug_dev_info *devip)
 	is_zbc = (devip->zmodel != BLK_ZONED_NONE);
 	is_disk_zbc = (is_disk || is_zbc);
 	have_wlun = scsi_is_wlun(scp->device->lun);
-	if (have_wlun)
+	if (devip->is_enclosure)
+		pq_pdt = TYPE_ENCLOSURE;
+	else if (have_wlun)
 		pq_pdt = TYPE_WLUN;	/* present, wlun */
 	else if (sdebug_no_lun_0 && (devip->lun == SDEBUG_LUN_0_VAL))
 		pq_pdt = 0x7f;	/* not present, PQ=3, PDT=0x1f */
@@ -1691,7 +1696,7 @@ static int resp_inquiry(struct scsi_cmnd *scp, struct sdebug_dev_info *devip)
 	arr[5] = (int)have_dif_prot;	/* PROTECT bit */
 	if (sdebug_vpd_use_hostno == 0)
 		arr[5] |= 0x10; /* claim: implicit TPGS */
-	arr[6] = 0x10; /* claim: MultiP */
+	arr[6] = devip->is_enclosure? 64 : 0x10; /* claim: MultiP */
 	/* arr[6] |= 0x40; ... claim: EncServ (enclosure services) */
 	arr[7] = 0xa; /* claim: LINKED + CMDQUE */
 	memcpy(&arr[8], sdebug_inq_vendor_id, 8);
@@ -6328,11 +6333,11 @@ static ssize_t add_host_store(struct device_driver *ddp, const char *buf,
 					break;
 				}
 				if (found)	/* re-use case */
-					sdebug_add_host_helper((int)idx);
+					sdebug_add_host_helper((int)idx, false);
 				else
-					sdebug_do_add_host(true);
+					sdebug_do_add_host(true, false);
 			} else {
-				sdebug_do_add_host(false);
+				sdebug_do_add_host(false, false);
 			}
 		} while (--delta_hosts);
 	} else if (delta_hosts < 0) {
@@ -6343,6 +6348,27 @@ static ssize_t add_host_store(struct device_driver *ddp, const char *buf,
 	return count;
 }
 static DRIVER_ATTR_RW(add_host);
+
+static ssize_t add_enclosure_show(struct device_driver *ddp, char *buf)
+{
+	/* absolute number of enclosures currently active is what is shown */
+	return scnprintf(buf, PAGE_SIZE, "%d\n", sdebug_num_enclosures);
+}
+
+static ssize_t add_enclosure_store(struct device_driver *ddp, const char *buf,
+			      size_t count)
+{
+	int delta_hosts;
+
+	if (sscanf(buf, "%d", &delta_hosts) != 1)
+		return -EINVAL;
+
+	if (delta_hosts == 1)
+		sdebug_do_add_host(true, true);
+
+	return count;
+}
+static DRIVER_ATTR_RW(add_enclosure);
 
 static ssize_t vpd_use_hostno_show(struct device_driver *ddp, char *buf)
 {
@@ -6607,6 +6633,7 @@ static struct attribute *sdebug_drv_attrs[] = {
 	&driver_attr_scsi_level.attr,
 	&driver_attr_virtual_gb.attr,
 	&driver_attr_add_host.attr,
+	&driver_attr_add_enclosure.attr,
 	&driver_attr_per_host_store.attr,
 	&driver_attr_vpd_use_hostno.attr,
 	&driver_attr_sector_size.attr,
@@ -6850,7 +6877,7 @@ static int __init scsi_debug_init(void)
 
 	for (k = 0; k < hosts_to_add; k++) {
 		if (want_store && k == 0) {
-			ret = sdebug_add_host_helper(idx);
+			ret = sdebug_add_host_helper(idx, false);
 			if (ret < 0) {
 				pr_err("add_host_helper k=%d, error=%d\n",
 				       k, -ret);
@@ -6858,7 +6885,7 @@ static int __init scsi_debug_init(void)
 			}
 		} else {
 			ret = sdebug_do_add_host(want_store &&
-						 sdebug_per_host_store);
+						 sdebug_per_host_store, false);
 			if (ret < 0) {
 				pr_err("add_host k=%d error=%d\n", k, -ret);
 				break;
@@ -7027,7 +7054,7 @@ err:
 	return res;
 }
 
-static int sdebug_add_host_helper(int per_host_idx)
+static int sdebug_add_host_helper(int per_host_idx, bool is_enclosure)
 {
 	int k, devs_per_host, idx;
 	int error = -ENOMEM;
@@ -7050,6 +7077,8 @@ static int sdebug_add_host_helper(int per_host_idx)
 		if (!sdbg_devinfo)
 			goto clean;
 	}
+
+	sdbg_devinfo->is_enclosure = is_enclosure;
 
 	spin_lock(&sdebug_host_list_lock);
 	list_add_tail(&sdbg_host->host_list, &sdebug_host_list);
@@ -7079,7 +7108,7 @@ clean:
 	return error;
 }
 
-static int sdebug_do_add_host(bool mk_new_store)
+static int sdebug_do_add_host(bool mk_new_store, bool is_enclosure)
 {
 	int ph_idx = sdeb_most_recent_idx;
 
@@ -7088,7 +7117,7 @@ static int sdebug_do_add_host(bool mk_new_store)
 		if (ph_idx < 0)
 			return ph_idx;
 	}
-	return sdebug_add_host_helper(ph_idx);
+	return sdebug_add_host_helper(ph_idx, is_enclosure);
 }
 
 static void sdebug_do_remove_host(bool the_end)
