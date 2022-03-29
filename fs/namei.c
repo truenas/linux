@@ -474,7 +474,16 @@ static inline int do_inode_permission(struct user_namespace *mnt_userns,
  */
 static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
 {
+#if CONFIG_TRUENAS
+	/*
+	 * NFSv4 ACLs have more granular write permissions. Same logic
+	 * should apply here as with generic MAY_WRITE. Specifically, protect
+	 * against changes to a readonly filesystem.
+	 */
+	if (unlikely(mask & (MAY_WRITE | NFS41ACL_WRITE_ALL))) {
+#else
 	if (unlikely(mask & MAY_WRITE)) {
+#endif
 		umode_t mode = inode->i_mode;
 
 		/* Nobody gets write access to a read-only fs. */
@@ -505,7 +514,15 @@ int inode_permission(struct user_namespace *mnt_userns,
 	if (retval)
 		return retval;
 
+#if CONFIG_TRUENAS
+	/*
+	 * NFSv4 ACLs have more granular write permissions. Same logic
+	 * should apply here as with generic MAY_WRITE.
+	 */
+	if (unlikely(mask & (MAY_WRITE | NFS41ACL_WRITE_ALL))) {
+#else
 	if (unlikely(mask & MAY_WRITE)) {
+#endif
 		/*
 		 * Nobody gets write access to an immutable file.
 		 */
@@ -2856,8 +2873,36 @@ static int may_delete(struct user_namespace *mnt_userns, struct inode *dir,
 		return -EOVERFLOW;
 
 	audit_inode_child(dir, victim, AUDIT_TYPE_CHILD_DELETE);
-
+#if CONFIG_TRUENAS
+	if (IS_NFSV4ACL(inode)) {
+		/*
+		 * See RFC 5661 Section 6.2.1.3.2
+		 * for implementation details of DELETE vs DELETE_CHILD.
+		 *
+		 * Since there may be a variety of ways to implement
+		 * allow in VFS if MAY_DELETE is permitted on viction,
+		 * MAY_DELETE_CHILD is permitted on directory, or MAY_WRITE
+		 * and MAY_EXEC are permitted on directory. This allows
+		 * filesystem to enforce stricter permissions if needed.
+		 *
+		 * MAY_WRITE|MAY_EXEC is checked first to give opportunity
+		 * to perform check via generic_permission() first.
+		 */
+		error = inode_permission(mnt_userns, dir, MAY_WRITE | MAY_EXEC);
+		if (error) {
+			error = inode_permission(mnt_userns, inode, MAY_DELETE);
+			if (error) {
+				error = inode_permission(mnt_userns, dir,
+							 MAY_DELETE_CHILD);
+			}
+		}
+	}
+	else {
+		error = inode_permission(mnt_userns, dir, MAY_WRITE | MAY_EXEC);
+	}
+#else
 	error = inode_permission(mnt_userns, dir, MAY_WRITE | MAY_EXEC);
+#endif
 	if (error)
 		return error;
 	if (IS_APPEND(dir))

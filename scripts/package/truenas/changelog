@@ -1,0 +1,41 @@
+linux-5.15.32+truenas (5.15.32+truenas-1) sid; urgency=low
+
+  * Rebase local commits onto upstream v5.15.32
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Mon, 28 Mar 2022 12:00:00 -0500
+
+linux-5.15.26+truenas (5.15.26+truenas-1) sid; urgency=low
+
+  * Rebase local commits onto upstream v5.15.26
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 8 Mar 2022 12:00:00 -0500
+
+linux-5.14.8+truenas (5.14.8+truenas-1) sid; urgency=low
+
+  * Rebase local commits onto upstream v5.14.8
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 6 Aug 2021 12:00:00 -0500
+
+linux-5.10.58+truenas (5.10.58+truenas-1) sid; urgency=low
+
+  * Merge upstream v5.10.58
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 17 Aug 2021 12:00:00 -0500
+
+linux-5.10.42+truenas (5.10.42+truenas-3) sid; urgency=low
+
+  * Merge upstream v5.10.42
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Mon, 14 Jun 2021 16:21:00 -0500
+
+linux-5.10.18+truenas (5.10.18+truenas-2) sid; urgency=low
+
+  * Implement NFS4 ACL support
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 27 Apr 2021 10:21:00 -0500
+
+linux-5.10.18+truenas (5.10.18+truenas-1) sid; urgency=low
+
+  * Import upstream Linux 5.10 branch.
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Wed, 10 Feb 2021 07:58:44 -0500

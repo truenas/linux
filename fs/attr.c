@@ -114,17 +114,66 @@ int setattr_prepare(struct user_namespace *mnt_userns, struct dentry *dentry,
 		goto kill_priv;
 
 	/* Make sure a caller can chown. */
+#if CONFIG_TRUENAS
+	/*
+	 * Check for ACE4_WRITE_OWNER. RFC 5661 Section 6.2.1.3.1
+	 * On UNIX systems, this is the ability to execute chown() and
+	 * chgrp().
+	 */
+	if ((ia_valid & ATTR_UID) &&
+	    !chown_ok(mnt_userns, inode, attr->ia_uid)) {
+		if (!IS_NFSV4ACL(inode)) {
+			return -EPERM;
+		}
+		else if (inode_permission(mnt_userns, inode, MAY_WRITE_OWNER)) {
+			return -EPERM;
+		}
+	}
+#else
 	if ((ia_valid & ATTR_UID) && !chown_ok(mnt_userns, inode, attr->ia_uid))
 		return -EPERM;
+#endif
 
 	/* Make sure caller can chgrp. */
+#if CONFIG_TRUENAS
+	if ((ia_valid & ATTR_GID) &&
+	    !chgrp_ok(mnt_userns, inode, attr->ia_gid)) {
+		if (!IS_NFSV4ACL(inode)) {
+			return -EPERM;
+		}
+		else if (inode_permission(mnt_userns, inode, MAY_WRITE_OWNER)) {
+			return -EPERM;
+		}
+	}
+#else
 	if ((ia_valid & ATTR_GID) && !chgrp_ok(mnt_userns, inode, attr->ia_gid))
 		return -EPERM;
+#endif
 
 	/* Make sure a caller can chmod. */
 	if (ia_valid & ATTR_MODE) {
+#if CONFIG_TRUENAS
+		/*
+		 * Check for ACE4_WRITE_ACL. RFC 5661 Section 6.2.1.3.1
+		 * Permission to write the acl or mode attributes.
+		 */
+		if (IS_NFSV4ACL(inode)) {
+			if (!inode_owner_or_capable(mnt_userns, inode)) {
+				if (inode_permission(mnt_userns, inode,
+						     MAY_WRITE_ACL)) {
+					return -EPERM;
+				}
+			}
+		}
+		else {
+			if (!inode_owner_or_capable(mnt_userns, inode))
+				return -EPERM;
+		}
+
+#else
 		if (!inode_owner_or_capable(mnt_userns, inode))
 			return -EPERM;
+#endif
 		/* Also check the setgid bit! */
                if (!in_group_p((ia_valid & ATTR_GID) ? attr->ia_gid :
                                 i_gid_into_mnt(mnt_userns, inode)) &&
@@ -134,6 +183,12 @@ int setattr_prepare(struct user_namespace *mnt_userns, struct dentry *dentry,
 
 	/* Check for setting the inode time. */
 	if (ia_valid & (ATTR_MTIME_SET | ATTR_ATIME_SET | ATTR_TIMES_SET)) {
+		/*
+		 * Check for ACE4_WRITE_ATTRIBUTES. RFC 5661 Section 6.2.1.3.1
+		 * Users with ACE4_WRITE_ATTRIBUTES or ACE4_WRITE_DATA can
+		 * change the times associated with a file to the _current_
+		 * server time. This permissions check happens in notify_change().
+		 */
 		if (!inode_owner_or_capable(mnt_userns, inode))
 			return -EPERM;
 	}
@@ -268,7 +323,22 @@ int may_setattr(struct user_namespace *mnt_userns, struct inode *inode,
 			return -EPERM;
 
 		if (!inode_owner_or_capable(mnt_userns, inode)) {
+#if CONFIG_TRUENAS
+			if (IS_NFSV4ACL(inode)) {
+				error = inode_permission(mnt_userns, inode,
+							 MAY_WRITE);
+				if (error) {
+					error = inode_permission(mnt_userns,
+							inode, MAY_WRITE_ATTRS);
+				}
+			}
+			else {
+				error = inode_permission(mnt_userns, inode,
+							 MAY_WRITE);
+			}
+#else
 			error = inode_permission(mnt_userns, inode, MAY_WRITE);
+#endif
 			if (error)
 				return error;
 		}

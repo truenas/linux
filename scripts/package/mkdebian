@@ -6,6 +6,12 @@
 
 set -e
 
+KERNELRELEASE="${KERNELRELEASE:=$(cat include/config/kernel.release)}"
+KDEB_SOURCENAME="${KDEB_SOURCENAME:="linux-$KERNELRELEASE"}"
+MAINTAINER="Andrew Walker <awalker@ixsystems.com>"
+MAKE="${MAKE:="/usr/bin/make"}"
+ARCH="${ARCH:="x86"}"
+
 is_enabled() {
 	grep -q "^$1=y" include/config/auto.conf
 }
@@ -106,19 +112,7 @@ set_debarch
 
 email=${DEBEMAIL-$EMAIL}
 
-# use email string directly if it contains <email>
-if echo $email | grep -q '<.*>'; then
-	maintainer=$email
-else
-	# or construct the maintainer string
-	user=${KBUILD_BUILD_USER-$(id -nu)}
-	name=${DEBFULLNAME-$user}
-	if [ -z "$email" ]; then
-		buildhost=${KBUILD_BUILD_HOST-$(hostname -f 2>/dev/null || hostname)}
-		email="$user@$buildhost"
-	fi
-	maintainer="$name <$email>"
-fi
+maintainer=$MAINTAINER
 
 # Try to determine distribution
 if [ -n "$KDEB_CHANGELOG_DIST" ]; then
@@ -139,54 +133,29 @@ echo $debarch > debian/arch
 extra_build_depends=", $(if_enabled_echo CONFIG_UNWINDER_ORC libelf-dev:native)"
 extra_build_depends="$extra_build_depends, $(if_enabled_echo CONFIG_SYSTEM_TRUSTED_KEYRING libssl-dev:native)"
 
-# Generate a simple changelog template
-cat <<EOF > debian/changelog
-$sourcename ($packageversion) $distribution; urgency=low
-
-  * Custom built Linux kernel.
-
- -- $maintainer  $(date -R)
-EOF
-
-# Generate copyright file
-cat <<EOF > debian/copyright
-This is a packacked upstream version of the Linux kernel.
-
-The sources may be found at most Linux archive sites, including:
-https://www.kernel.org/pub/linux/kernel
-
-Copyright: 1991 - 2018 Linus Torvalds and others.
-
-The git repository for mainline kernel development is at:
-git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; version 2 dated June, 1991.
-
-On Debian GNU/Linux systems, the complete text of the GNU General Public
-License version 2 can be found in \`/usr/share/common-licenses/GPL-2'.
-EOF
-
 # Generate a control file
 cat <<EOF > debian/control
 Source: $sourcename
 Section: kernel
+Architecture: $debarch
 Priority: optional
 Maintainer: $maintainer
 Rules-Requires-Root: no
-Build-Depends: bc, rsync, kmod, cpio, bison, flex | flex:native $extra_build_depends
+Build-Depends: bc, dwarves, rsync, kmod, cpio, bison, flex | flex:native $extra_build_depends
 Homepage: https://www.kernel.org/
 
-Package: $packagename-$version
+Package: $packagename-truenas-$debarch
 Architecture: $debarch
+Provides: $packagename-$debarch, linux-image-generic
+Depends: kmod, linux-base (>= 4.3~), initramfs-tools (>= 0.120+deb8u2) | linux-initramfs-tools
 Description: Linux kernel, version $version
  This package contains the Linux kernel, modules and corresponding other
  files, version: $version.
 
-Package: linux-libc-dev
+Package: linux-truenas-libc-dev
 Section: devel
-Provides: linux-kernel-headers
+Provides: linux-kernel-headers, linux-libc-dev
+Conflicts: linux-libc-dev
 Architecture: $debarch
 Description: Linux support headers for userspace development
  This package provides userspaces headers from the Linux kernel.  These headers
@@ -197,8 +166,9 @@ EOF
 if is_enabled CONFIG_MODULES; then
 cat <<EOF >> debian/control
 
-Package: linux-headers-$version
+Package: linux-headers-truenas-$debarch
 Architecture: $debarch
+Provides: linux-headers-$debarch
 Description: Linux kernel headers for $version on $debarch
  This package provides kernel header files for $version on $debarch
  .
@@ -209,7 +179,8 @@ fi
 if is_enabled CONFIG_DEBUG_INFO; then
 cat <<EOF >> debian/control
 
-Package: linux-image-$version-dbg
+Package: linux-image-truenas-$debarch-dbg
+Provides: linux-image-$debarch-dbg
 Section: debug
 Architecture: $debarch
 Description: Linux kernel debugging symbols for $version
@@ -241,6 +212,11 @@ clean:
 
 binary: binary-arch
 EOF
+
 chmod +x debian/rules
+mkdir debian/certs
+cp scripts/package/truenas/debian-uefi-certs.pem debian/certs
+cp scripts/package/truenas/changelog debian/changelog
+cp scripts/package/truenas/copyright debian/copyright
 
 exit 0

@@ -105,6 +105,22 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 /* called from RCU mode, don't block */
 #define MAY_NOT_BLOCK		0x00000080
 
+#if CONFIG_TRUENAS
+/*
+ * Extended NFSv41 write permissions. These are used selectively
+ * for permissions checks where NFSv4 ACL handling is
+ * more nuanced than a simple POSIX permissions.
+ */
+#define MAY_WRITE_NAMED_ATTRS	0x00000100
+#define MAY_DELETE_CHILD	0x00000400
+#define MAY_WRITE_ATTRS		0x00001000
+#define MAY_DELETE		0x00100000
+#define MAY_WRITE_ACL		0x00400000
+#define MAY_WRITE_OWNER		0x00800000
+#define NFS41ACL_WRITE_ALL	(MAY_DELETE_CHILD|MAY_WRITE_ATTRS|MAY_DELETE|\
+				 MAY_WRITE_ACL|MAY_WRITE_OWNER|MAY_WRITE_NAMED_ATTRS)
+#endif
+
 /*
  * flags in file.f_mode.  Note that FMODE_READ and FMODE_WRITE must correspond
  * to O_WRONLY and O_RDWR via the strange trick in do_dentry_open()
@@ -1415,6 +1431,12 @@ extern int send_sigurg(struct fown_struct *fown);
 #define SB_ACTIVE	(1<<30)
 #define SB_NOUSER	(1<<31)
 
+#ifdef CONFIG_TRUENAS
+/* Thes sb flags are related to TrueNAS-specific features */
+#define SB_NFSV4ACL	(1<<18)
+#define SB_LARGEXATTR	(1<<19)
+#endif
+
 /* These flags relate to encoding and casefolding */
 #define SB_ENC_STRICT_MODE_FL	(1 << 0)
 
@@ -2280,6 +2302,10 @@ static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags 
 #define IS_APPEND(inode)	((inode)->i_flags & S_APPEND)
 #define IS_IMMUTABLE(inode)	((inode)->i_flags & S_IMMUTABLE)
 #define IS_POSIXACL(inode)	__IS_FLG(inode, SB_POSIXACL)
+#ifdef CONFIG_TRUENAS
+#define IS_NFSV4ACL(inode)	__IS_FLG(inode, SB_NFSV4ACL)
+#define IS_LARGE_XATTR(inode)	__IS_FLG(inode, SB_LARGEXATTR)
+#endif
 
 #define IS_DEADDIR(inode)	((inode)->i_flags & S_DEAD)
 #define IS_NOCMTIME(inode)	((inode)->i_flags & S_NOCMTIME)
