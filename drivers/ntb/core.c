@@ -72,6 +72,10 @@ MODULE_VERSION(DRIVER_VERSION);
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESCRIPTION);
 
+static char *driver_override;
+module_param(driver_override, charp, 0);
+MODULE_PARM_DESC(driver_override, "Driver name to force a match");
+
 static struct bus_type ntb_bus;
 static void ntb_dev_release(struct device *dev);
 
@@ -98,6 +102,68 @@ void ntb_unregister_client(struct ntb_client *client)
 }
 EXPORT_SYMBOL(ntb_unregister_client);
 
+
+static ssize_t driver_override_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct ntb_dev *ntb = dev_ntb(dev);
+	char *dro, *old, *cp;
+
+	/* We need to keep extra room for a newline */
+	if (count >= (PAGE_SIZE - 1))
+		return -EINVAL;
+
+	dro = kstrndup(buf, count, GFP_KERNEL);
+	if (!dro)
+		return -ENOMEM;
+
+	cp = strchr(dro, '\n');
+	if (cp)
+		*cp = '\0';
+
+	device_lock(dev);
+	old = ntb->driver_override;
+	if (strlen(dro)) {
+		ntb->driver_override = dro;
+	} else {
+		kfree(dro);
+		ntb->driver_override = NULL;
+	}
+	device_unlock(dev);
+
+	kfree(old);
+
+	return count;
+}
+
+static ssize_t driver_override_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct ntb_dev *ntb = dev_ntb(dev);
+	ssize_t len;
+
+	device_lock(dev);
+	len = scnprintf(buf, PAGE_SIZE, "%s\n", ntb->driver_override);
+	device_unlock(dev);
+	return len;
+}
+static DEVICE_ATTR_RW(driver_override);
+
+static struct attribute *ntb_dev_attrs[] = {
+	&dev_attr_driver_override.attr,
+	NULL,
+};
+
+static const struct attribute_group ntb_dev_group = {
+	.attrs = ntb_dev_attrs,
+};
+
+const struct attribute_group *ntb_dev_groups[] = {
+	&ntb_dev_group,
+	NULL,
+};
+
 int ntb_register_device(struct ntb_dev *ntb)
 {
 	if (!ntb)
@@ -114,7 +180,10 @@ int ntb_register_device(struct ntb_dev *ntb)
 	ntb->dev.bus = &ntb_bus;
 	ntb->dev.parent = &ntb->pdev->dev;
 	ntb->dev.release = ntb_dev_release;
-	dev_set_name(&ntb->dev, "%s", pci_name(ntb->pdev));
+	if (driver_override && driver_override[0] && !ntb->driver_override)
+		ntb->driver_override = kstrdup(driver_override, GFP_KERNEL);
+	if (!dev_name(&ntb->dev))
+		dev_set_name(&ntb->dev, "%s", pci_name(ntb->pdev));
 
 	ntb->ctx = NULL;
 	ntb->ctx_ops = NULL;
@@ -128,6 +197,10 @@ void ntb_unregister_device(struct ntb_dev *ntb)
 {
 	device_unregister(&ntb->dev);
 	wait_for_completion(&ntb->released);
+	if (ntb->driver_override) {
+		kfree(ntb->driver_override);
+		ntb->driver_override = NULL;
+	}
 }
 EXPORT_SYMBOL(ntb_unregister_device);
 
@@ -254,6 +327,18 @@ int ntb_default_peer_port_idx(struct ntb_dev *ntb, int port)
 }
 EXPORT_SYMBOL(ntb_default_peer_port_idx);
 
+static int ntb_match(struct device *dev, struct device_driver *drv)
+{
+	struct ntb_dev *ntb = dev_ntb(dev);
+
+	/* When driver_override is set, only bind to the matching driver */
+	if (!ntb->driver_override ||
+	    strcmp(ntb->driver_override, drv->name) == 0)
+		return 1;
+
+	return 0;
+}
+
 static int ntb_probe(struct device *dev)
 {
 	struct ntb_dev *ntb;
@@ -296,8 +381,10 @@ static void ntb_dev_release(struct device *dev)
 
 static struct bus_type ntb_bus = {
 	.name = "ntb",
+	.match = ntb_match,
 	.probe = ntb_probe,
 	.remove = ntb_remove,
+	.dev_groups = ntb_dev_groups,
 };
 
 static int __init ntb_driver_init(void)
