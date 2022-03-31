@@ -432,6 +432,8 @@ struct ntb_dev {
 #ifdef CONFIG_NTB_MSI
 	struct ntb_msi *msi;
 #endif
+	/* Driver name to force a match. */
+	char				*driver_override;
 };
 #define dev_ntb(__dev) container_of((__dev), struct ntb_dev, dev)
 
