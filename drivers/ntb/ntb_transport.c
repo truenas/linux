@@ -67,7 +67,6 @@
 #define NTB_TRANSPORT_VER	"4"
 #define NTB_TRANSPORT_NAME	"ntb_transport"
 #define NTB_TRANSPORT_DESC	"Software Queue-Pair Transport over NTB"
-#define NTB_TRANSPORT_MIN_SPADS (MW0_SZ_HIGH + 2)
 
 MODULE_DESCRIPTION(NTB_TRANSPORT_DESC);
 MODULE_VERSION(NTB_TRANSPORT_VER);
@@ -89,6 +88,10 @@ MODULE_PARM_DESC(max_num_clients, "Maximum number of NTB transport clients");
 static unsigned int copy_bytes = 1024;
 module_param(copy_bytes, uint, 0644);
 MODULE_PARM_DESC(copy_bytes, "Threshold under which NTB will use the CPU to copy instead of DMA");
+
+static bool compact;
+module_param(compact, bool, 0644);
+MODULE_PARM_DESC(compact, "Use compact version of sratchpad protocol");
 
 static bool use_dma;
 module_param(use_dma, bool, 0644);
@@ -234,6 +237,7 @@ struct ntb_transport_ctx {
 
 	struct ntb_transport_mw *mw_vec;
 	struct ntb_transport_qp *qp_vec;
+	int compact;
 	unsigned int mw_count;
 	unsigned int qp_count;
 	u64 qp_bitmap;
@@ -268,6 +272,15 @@ enum {
 	NUM_MWS,
 	MW0_SZ_HIGH,
 	MW0_SZ_LOW,
+};
+
+/*
+ * Compart version of sratchpad protocol, using twice less registers.
+ */
+enum {
+	NTBTC_PARAMS = 0,	/* NUM_QPS << 24 + NUM_MWS << 16 + VERSION */
+	NTBTC_QP_LINKS,		/* QP links status */
+	NTBTC_MW0_SZ,		/* MW size limited to 32 bits. */
 };
 
 #define dev_client_dev(__dev) \
@@ -1070,47 +1083,76 @@ static void ntb_transport_link_work(struct work_struct *work)
 	for (i = 0; i < nt->qp_count; i++)
 		ntb_transport_setup_qp_msi(nt, i);
 
-	for (i = 0; i < nt->mw_count; i++) {
-		size = nt->mw_vec[i].phys_size;
+	if (nt->compact) {
+		for (i = 0; i < nt->mw_count; i++) {
+			size = nt->mw_vec[i].phys_size;
 
-		if (max_mw_size && size > max_mw_size)
-			size = max_mw_size;
+			if (max_mw_size && size > max_mw_size)
+				size = max_mw_size;
+			BUG_ON(upper_32_bits(size) != 0);
 
-		spad = MW0_SZ_HIGH + (i * 2);
-		ntb_peer_spad_write(ndev, PIDX, spad, upper_32_bits(size));
+			spad = NTBTC_MW0_SZ + i;
+			ntb_peer_spad_write(ndev, PIDX, spad, lower_32_bits(size));
+		}
+		ntb_peer_spad_write(ndev, PIDX, NTBTC_QP_LINKS, 0);
+		ntb_peer_spad_write(ndev, PIDX, NTBTC_PARAMS,
+		    (nt->qp_count << 24) | (nt->mw_count << 16) |
+		    NTB_TRANSPORT_VERSION);
+	} else {
+		for (i = 0; i < nt->mw_count; i++) {
+			size = nt->mw_vec[i].phys_size;
 
-		spad = MW0_SZ_LOW + (i * 2);
-		ntb_peer_spad_write(ndev, PIDX, spad, lower_32_bits(size));
+			if (max_mw_size && size > max_mw_size)
+				size = max_mw_size;
+
+			spad = MW0_SZ_HIGH + (i * 2);
+			ntb_peer_spad_write(ndev, PIDX, spad, upper_32_bits(size));
+
+			spad = MW0_SZ_LOW + (i * 2);
+			ntb_peer_spad_write(ndev, PIDX, spad, lower_32_bits(size));
+		}
+		ntb_peer_spad_write(ndev, PIDX, NUM_MWS, nt->mw_count);
+		ntb_peer_spad_write(ndev, PIDX, NUM_QPS, nt->qp_count);
+		ntb_peer_spad_write(ndev, PIDX, QP_LINKS, 0);
+		ntb_peer_spad_write(ndev, PIDX, VERSION, NTB_TRANSPORT_VERSION);
 	}
-	ntb_peer_spad_write(ndev, PIDX, NUM_MWS, nt->mw_count);
-	ntb_peer_spad_write(ndev, PIDX, NUM_QPS, nt->qp_count);
-	ntb_peer_spad_write(ndev, PIDX, QP_LINKS, 0);
-	ntb_peer_spad_write(ndev, PIDX, VERSION, NTB_TRANSPORT_VERSION);
 
 	/* Query the remote side for its info */
-	val = ntb_spad_read(ndev, VERSION);
-	dev_dbg(&pdev->dev, "Remote version = %d\n", val);
-	if (val != NTB_TRANSPORT_VERSION)
-		goto out;
+	if (nt->compact) {
+		val = ntb_spad_read(ndev, NTBTC_PARAMS);
+		dev_dbg(&pdev->dev, "Remote params = 0x%x\n", val);
+		if (val != ((nt->qp_count << 24) | (nt->mw_count << 16) |
+		    NTB_TRANSPORT_VERSION))
+			goto out;
+	} else {
+		val = ntb_spad_read(ndev, VERSION);
+		dev_dbg(&pdev->dev, "Remote version = %d\n", val);
+		if (val != NTB_TRANSPORT_VERSION)
+			goto out;
 
-	val = ntb_spad_read(ndev, NUM_QPS);
-	dev_dbg(&pdev->dev, "Remote max number of qps = %d\n", val);
-	if (val != nt->qp_count)
-		goto out;
+		val = ntb_spad_read(ndev, NUM_QPS);
+		dev_dbg(&pdev->dev, "Remote max number of qps = %d\n", val);
+		if (val != nt->qp_count)
+			goto out;
 
-	val = ntb_spad_read(ndev, NUM_MWS);
-	dev_dbg(&pdev->dev, "Remote number of mws = %d\n", val);
-	if (val != nt->mw_count)
-		goto out;
+		val = ntb_spad_read(ndev, NUM_MWS);
+		dev_dbg(&pdev->dev, "Remote number of mws = %d\n", val);
+		if (val != nt->mw_count)
+			goto out;
+	}
 
 	for (i = 0; i < nt->mw_count; i++) {
 		u64 val64;
 
-		val = ntb_spad_read(ndev, MW0_SZ_HIGH + (i * 2));
-		val64 = (u64)val << 32;
+		if (nt->compact) {
+			val64 = ntb_spad_read(ndev, NTBTC_MW0_SZ + i);
+		} else {
+			val = ntb_spad_read(ndev, MW0_SZ_HIGH + (i * 2));
+			val64 = (u64)val << 32;
 
-		val = ntb_spad_read(ndev, MW0_SZ_LOW + (i * 2));
-		val64 |= val;
+			val = ntb_spad_read(ndev, MW0_SZ_LOW + (i * 2));
+			val64 |= val;
+		}
 
 		dev_dbg(&pdev->dev, "Remote MW%d size = %#llx\n", i, val64);
 
@@ -1319,14 +1361,23 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 	spad_count = ntb_spad_count(ndev);
 
 	/* Limit the MW's based on the availability of scratchpads */
-
-	if (spad_count < NTB_TRANSPORT_MIN_SPADS) {
-		nt->mw_count = 0;
-		rc = -EINVAL;
-		goto err;
+	nt->compact = compact || (spad_count < 4 + 2 * mw_count);
+	if (nt->compact) {
+		if (spad_count < NTBTC_MW0_SZ + 1) {
+			nt->mw_count = 0;
+			rc = -EINVAL;
+			goto err;
+		}
+		max_mw_count_for_spads = spad_count - NTBTC_MW0_SZ;
+	} else {
+		if (spad_count < MW0_SZ_HIGH + 2) {
+			nt->mw_count = 0;
+			rc = -EINVAL;
+			goto err;
+		}
+		max_mw_count_for_spads = (spad_count - MW0_SZ_HIGH) / 2;
 	}
 
-	max_mw_count_for_spads = (spad_count - MW0_SZ_HIGH) / 2;
 	nt->mw_count = min(mw_count, max_mw_count_for_spads);
 
 	nt->msi_spad_offset = nt->mw_count * 2 + MW0_SZ_HIGH;
@@ -1345,6 +1396,10 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 					  &mw->phys_size);
 		if (rc)
 			goto err1;
+		if (nt->compact && mw->phys_size > 0xffffffff) {
+			rc = -ENXIO;
+			goto err1;
+		}
 
 		mw->vbase = ioremap_wc(mw->phys_addr, mw->phys_size);
 		if (!mw->vbase) {
