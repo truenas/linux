@@ -855,3 +855,9 @@ void __exit libata_transport_exit(void)
 	transport_class_unregister(&ata_port_class);
 	transport_class_unregister(&ata_dev_class);
 }
+
+bool scsi_is_ata(struct scsi_device *sdev)
+{
+	return sdev->host->transportt == ata_scsi_transport_template;
+}
+EXPORT_SYMBOL(scsi_is_ata);
