@@ -197,6 +197,10 @@ static unsigned int ahciem_scsiop_report_luns(struct ahciem_args *args, u8 *rbuf
 	return 0;
 }
 
+/*
+ * SES operations
+ */
+
 static unsigned int ahciem_sesop_rxdx_0(struct ahciem_args *args, u8 *rbuf)
 {
 	static const u8 pages[] = {
