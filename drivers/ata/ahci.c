@@ -1917,6 +1917,12 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (rc)
 		return rc;
 
+	if (pi.flags & ATA_FLAG_EM) {
+		rc = ahciem_host_activate(host);
+		if (rc)
+			return rc;
+	}
+
 	pm_runtime_put_noidle(&pdev->dev);
 	return 0;
 }

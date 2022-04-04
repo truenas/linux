@@ -448,6 +448,7 @@ static void ses_process_descriptor(struct enclosure_component *ecomp,
 		return;
 
 	switch (proto) {
+	case SCSI_PROTOCOL_ATA:
 	case SCSI_PROTOCOL_FCP:
 		if (eip) {
 			d = desc + 4;
