@@ -2766,6 +2766,19 @@ int ahci_host_activate(struct ata_host *host, const struct scsi_host_template *s
 }
 EXPORT_SYMBOL_GPL(ahci_host_activate);
 
+bool scsi_is_ahci(struct scsi_device *sdev)
+{
+	struct ata_port *ap;
+
+	if (!scsi_is_ata(sdev))
+		return false;
+
+	ap = ata_shost_to_port(sdev->host);
+
+	return ap->ops->dev_config == ahci_dev_config;
+}
+EXPORT_SYMBOL_GPL(scsi_is_ahci);
+
 MODULE_AUTHOR("Jeff Garzik");
 MODULE_DESCRIPTION("Common AHCI SATA low-level routines");
 MODULE_LICENSE("GPL");

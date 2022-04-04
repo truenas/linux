@@ -2147,4 +2147,6 @@ static inline u8 ata_wait_idle(struct ata_port *ap)
 }
 #endif /* CONFIG_ATA_SFF */
 
+extern bool scsi_is_ata(struct scsi_device *sdev);
+
 #endif /* __LINUX_LIBATA_H__ */
