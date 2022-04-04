@@ -2165,4 +2165,6 @@ static inline int sata_sff_hardreset(struct ata_link *link, unsigned int *class,
 }
 #endif /* CONFIG_ATA_SFF */
 
+extern bool scsi_is_ata(struct scsi_device *sdev);
+
 #endif /* __LINUX_LIBATA_H__ */
