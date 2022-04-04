@@ -675,7 +675,7 @@ static int plx_init_dev(struct ntb_dev *ntb)
 
 	/* Find configured memory windows at BAR2-5 */
 	ndev->mw_count = 0;
-	for (i = 4; i <= 5; i++) {
+	for (i = 2; i <= 5; i++) {
 		mw = &ndev->mw_info[ndev->mw_count];
 		mw->mw_bar = i;
 		mw->mw_res = pcim_iomap(pdev, mw->mw_bar, 0);
