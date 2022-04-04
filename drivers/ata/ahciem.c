@@ -80,13 +80,6 @@ struct ata_res {
 };
 */
 
-enum semb_cmd_type {
-	SEMB_SAFTE_SEP_TO_HOST = 0x00,
-	SEMB_SAFTE_HOST_TO_SEP = 0x80,
-	SEMB_SES_SEP_TO_HOST = 0x02,
-	SEMB_SES_HOST_TO_SEP = 0x82,
-};
-
 #define AHCIEM_RBUF_SIZE	576	/* size from libata-scsi.c */
 
 static DEFINE_SPINLOCK(ahciem_rbuf_lock);
