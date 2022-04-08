@@ -47,6 +47,12 @@ jobs:
           ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/truenas.config
           ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/debug.config
           ./scripts/package/mkdebian
+          # Workaround to provide additional free space for kernel build
+          # https://github.com/actions/virtual-environments/issues/2840
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Build Kernel
         run: |
