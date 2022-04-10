@@ -87,8 +87,12 @@ static u8 ahciem_rbuf[AHCIEM_RBUF_SIZE];
 
 struct ahciem_args {
 	struct scsi_cmnd *cmd;
-	struct ata_device *dev;
+	struct ata_host *host;
 };
+
+/*
+ * Utility functions
+ */
 
 static void ahciem_rbuf_fill(struct ahciem_args *args,
 		unsigned int (*actor)(struct ahciem_args *args, u8 *rbuf))
@@ -109,6 +113,20 @@ static void ahciem_rbuf_fill(struct ahciem_args *args,
 
 	if (rc == 0)
 		cmd->result = SAM_STAT_GOOD;
+}
+
+static void ahciem_scsi_set_sense(struct scsi_cmnd *cmd,
+				  u8 sk, u8 asc, u8 ascq)
+{
+	scsi_build_sense(cmd, false /* XXX: shrug */, sk, asc, ascq);
+}
+
+static void ahciem_scsi_set_invalid_field(struct scsi_cmnd *cmd,
+					  u16 field, u8 bit)
+{
+	ahciem_scsi_set_sense(cmd, ILLEGAL_REQUEST, 0x24, 0x0);
+	scsi_set_sense_field_pointer(cmd->sense_buffer, SCSI_SENSE_BUFFERSIZE,
+				     field, bit, 1);
 }
 
 /*
@@ -133,7 +151,6 @@ static unsigned int ahciem_scsiop_inq_std(struct ahciem_args *args, u8 *rbuf)
 		0x06, 0x00,	/* SBC-4 (no version claimed) */
 		0x05, 0xC0,	/* SPC-5 (no version claimed) */
 	};
-	struct scsi_device *sdev = args->dev->sdev;
 
 	memcpy(rbuf, hdr, sizeof(hdr));
 	memcpy(rbuf + 8, "AHCI    ", INQUIRY_VENDOR_LEN);
@@ -169,21 +186,21 @@ static unsigned int ahciem_scsiop_inq_83(struct ahciem_args *args, u8 *rbuf)
 	p[0] = 2;
 	p[1] = ATA_ID_SERNO_LEN;
 	p += 4;
-	ata_id_string(args->dev->id, (unsigned char *)p,
-		      ATA_ID_SERNO, ATA_ID_SERNO_LEN);
+	/* TODO */
+	memcpy(p, "00000000000000000000", ATA_ID_SERNO_LEN);
 	p += ATA_ID_SERNO_LEN;
 	/* piv=0, assoc=lu, code_set=ASCII, designator=t10 vendor id */
 	p[0] = 2;
 	p[1] = 1;
 	p[3] = 68;	/* sat model serial desc len */
 	p += 4;
-	memcpy(p, "ATA     ", 8);
+	memcpy(p, "AHCI    ", 8);
 	p += 8;
-	ata_id_string(args->dev->id, (unsigned char *)p,
-		      ATA_ID_PROD, ATA_ID_PROD_LEN);
+	/* TODO */
+	memcpy(p, "SGPIO Enclosure                        ", ATA_ID_PROD_LEN);
 	p += ATA_ID_PROD_LEN;
-	ata_id_string(args->dev->id, (unsigned char *)p,
-		      ATA_ID_SERNO, ATA_ID_SERNO_LEN);
+	/* TODO */
+	memcpy(p, "00000000000000000000", ATA_ID_SERNO_LEN);
 	p += ATA_ID_SERNO_LEN;
 	/* XXX: ignoring wwn stuff for now */
 	rbuf[3] = p - rbuf - 4;
@@ -245,13 +262,11 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 	return 1;
 }
 
-static void __ahciem_queuecmd(struct scsi_cmnd *cmd, struct ata_device *dev)
+static int ahciem_queuecmd(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 {
-	struct ahciem_args args = { .cmd = cmd, .dev = dev };
+	struct ata_host *host = *(struct ata_host **)&shost->hostdata[0];
+	struct ahciem_args args = { .cmd = cmd, .host = host };
 	const u8 *cdb = cmd->cmnd;
-	/* TODO: struct ahciem_enc *enc = ???; */
-
-	//BUG_ON(dev->class != ATA_DEV_SEMB); TODO: what class are we?
 
 	/*
 	 * Commands required for SES devices by SPC:
@@ -265,10 +280,10 @@ static void __ahciem_queuecmd(struct scsi_cmnd *cmd, struct ata_device *dev)
 	switch (cdb[0]) {
 	case INQUIRY:
 		if (cdb[1] & 2)			/* obsolete CMDDT set? */
-			ata_scsi_set_invalid_field(dev, cmd, 1, 1);
+			ahciem_scsi_set_invalid_field(cmd, 1, 1);
 		else if ((cdb[1] & 1) == 0) {	/* standard INQUIRY */
 			if (cdb[2] != 0)
-				ata_scsi_set_invalid_field(dev, cmd, 2, 0xff);
+				ahciem_scsi_set_invalid_field(cmd, 2, 0xff);
 			else
 				ahciem_rbuf_fill(&args, ahciem_scsiop_inq_std);
 		} else switch (cdb[2]) {	/* VPD INQUIRY */
@@ -280,7 +295,7 @@ static void __ahciem_queuecmd(struct scsi_cmnd *cmd, struct ata_device *dev)
 			break;
 		/* TODO: optional/protocol specific pages? */
 		default:
-			ata_scsi_set_invalid_field(dev, cmd, 2, 0xff);
+			ahciem_scsi_set_invalid_field(cmd, 2, 0xff);
 			break;
 		}
 		break;
@@ -290,7 +305,7 @@ static void __ahciem_queuecmd(struct scsi_cmnd *cmd, struct ata_device *dev)
 		break;
 
 	case REQUEST_SENSE:
-		ata_scsi_set_sense(dev, cmd, 0, 0, 0);
+		ahciem_scsi_set_sense(cmd, 0, 0, 0);
 		break;
 
 	case TEST_UNIT_READY:
@@ -304,13 +319,13 @@ static void __ahciem_queuecmd(struct scsi_cmnd *cmd, struct ata_device *dev)
 			 * scsi_bufflen(cmd) vs (((u16)cdb[3] << 8) + cdb[4])
 			 */
 			if (scsi_bufflen(cmd) < (3 + enc->channels)) {
-				ata_scsi_set_invalid_field(dev, cmd, 3, 0);
+				ahciem_scsi_set_invalid_field(cmd, 3, 0);
 				break;
 			}
 			/* TODO: decode sent data and store in enc */
 			break;
 		default:
-			ata_scsi_set_invalid_field(dev, cmd, 2, 0);
+			ahciem_scsi_set_invalid_field(cmd, 2, 0);
 			break;
 		}
 		break;
@@ -341,7 +356,7 @@ static void __ahciem_queuecmd(struct scsi_cmnd *cmd, struct ata_device *dev)
 			action = ahciem_sesop_rxdx_a;
 			break;
 		default:
-			ata_scsi_set_invalid_field(dev, cmd, 2, 0);
+			ahciem_scsi_set_invalid_field(cmd, 2, 0);
 			break;
 		}
 		if (action != NULL) {
@@ -349,43 +364,47 @@ static void __ahciem_queuecmd(struct scsi_cmnd *cmd, struct ata_device *dev)
 			 * scsi_bufflen(cmd) vs (((u16)cdb[3] << 8) + cdb[4])
 			 */
 			if (scsi_bufflen(cmd) < minlen)
-				ata_scsi_set_invalid_field(dev, cmd, 3, 0);
+				ahciem_scsi_set_invalid_field(cmd, 3, 0);
 			else
 				ahciem_rbuf_fill(&args, action);
 		}
 		break;
 	}
 	default:
-		ata_scsi_set_sense(dev, cmd, ILLEGAL_REQUEST, 0x20, 0x0);
+		ahciem_scsi_set_sense(cmd, ILLEGAL_REQUEST, 0x20, 0x0);
 		break;
 	}
+
 	cmd->scsi_done(cmd);
-}
-
-static int ahciem_queuecmd(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
-{
-	struct ata_port *ap;
-	struct ata_device *dev;
-	struct scsi_device *scsidev = cmd->device;
-	unsigned long irq_flags;
-
-	ap = ata_shost_to_port(shost);
-
-	spin_lock_irqsave(ap->lock, irq_flags);
-
-	ata_scsi_dump_cdb(ap, cmd);
-
-	dev = ata_scsi_find_dev(ap, scsidev);
-	if (likely(dev))
-		__ahciem_queuecmd(cmd, dev);
-	else {
-		cmd->result = (DID_BAD_TARGET << 16);
-		cmd->scsi_done(cmd);
-	}
-
-	spin_unlock_irqrestore(ap->lock, irq_flags);
 
 	return 0;
 }
 
-/* TODO: probe, init, fini... */
+static struct scsi_host_template ahciem_sht = {
+	.name = DRV_NAME,
+	.proc_name = DRV_NAME,
+	.queuecommand = ahciem_queuecommand,
+};
+
+atomic_t ahciem_unique_id = ATOMIC_INIT(0);
+
+int ahciem_host_activate(struct ata_host *host)
+{
+	struct Scsi_Host *shost;
+
+	shost = scsi_host_alloc(&ahciem_sht, sizeof(struct ata_host *));
+	if (!shost)
+		return -ENOMEM;
+
+	*(struct ata_host **)&shost->hostdata[0] = host;
+	shost->transportt = NULL; /* XXX: Optional, not sure if useful? */
+	shost->unique_id = atomic_inc_return(&ahciem_unique_id);
+	shost->eh_noresume = 1;
+	shost->max_id = 1; /* XXX: shrug */
+	shost->max_lun = 1;
+	shost->max_channel = 1;
+	shost->max_cmd_len = 32; /* XXX: shrug */
+	shost->max_host_blocked = 1;
+
+	return scsi_add_host(shost, host->dev);
+}

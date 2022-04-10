@@ -1913,9 +1913,32 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	pci_set_master(pdev);
 
+	/*
+	 * NB: A lot happens in here - transport setup, scsi host structures are
+	 * allocated, irqs requested, port descriptions set, etc.
+	 *
+	 * ahci_host_activate()
+	 * + ahci_host_activate_multi_irqs()/ata_host_activate()
+	 *   + ata_host_start()
+	 *   + devm_request_irq()
+	 *   + ata_port_desc()
+	 *   + ata_host_register()
+	 *     + ata_tport_add()
+	 *     + ata_scsi_add_hosts()
+	 *       + scsi_host_alloc()
+	 *       + scsi_add_host_with_dma()
+	 *     + sata_link_init_spd()
+	 *     + async_schedule(async_port_probe)
+	 */
 	rc = ahci_host_activate(host, &ahci_sht);
 	if (rc)
 		return rc;
+
+	if (pi.flags & ATA_FLAG_EM) {
+		rc = ahciem_host_activate(host);
+		if (rc)
+			return rc;
+	}
 
 	pm_runtime_put_noidle(&pdev->dev);
 	return 0;
