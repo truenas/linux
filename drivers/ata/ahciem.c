@@ -262,7 +262,7 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 	return 1;
 }
 
-static int ahciem_queuecmd(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
+static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 {
 	struct ata_host *host = *(struct ata_host **)&shost->hostdata[0];
 	struct ahciem_args args = { .cmd = cmd, .host = host };
@@ -318,7 +318,7 @@ static int ahciem_queuecmd(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 			/* XXX: are these the same?
 			 * scsi_bufflen(cmd) vs (((u16)cdb[3] << 8) + cdb[4])
 			 */
-			if (scsi_bufflen(cmd) < (3 + enc->channels)) {
+			if (scsi_bufflen(cmd) < (3 + host->n_ports)) {
 				ahciem_scsi_set_invalid_field(cmd, 3, 0);
 				break;
 			}
@@ -344,15 +344,15 @@ static int ahciem_queuecmd(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 			action = ahciem_sesop_rxdx_1;
 			break;
 		case 0x2:	/* Enclosure Status */
-			minlen = 3 + enc->channels;
+			minlen = 3 + host->n_ports;
 			action = ahciem_sesop_rxdx_2;
 			break;
 		case 0x7:	/* Element Descriptor */
-			minlen = 6 + 3 * enc->channels;
+			minlen = 6 + 3 * host->n_ports;
 			action = ahciem_sesop_rxdx_7;
 			break;
 		case 0xa:	/* Additional Element Status */
-			minlen = 2 + 3 * enc->channels;
+			minlen = 2 + 3 * host->n_ports;
 			action = ahciem_sesop_rxdx_a;
 			break;
 		default:
