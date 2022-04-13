@@ -236,9 +236,31 @@ static unsigned int ahciem_sesop_rxdx_0(struct ahciem_args *args, u8 *rbuf)
 
 static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 {
+	static const u8 enc_desc[] = {
+		0x11,	/* pid=1, #pid=1 */
+		0,	/* subenclosure id */
+		1,	/* # of type descriptor headers */
+		36,	/* descriptor length - 3 */
+		0x30,	/* enclosure logical id (NAA Locally Assigned) */
+	};
+	static const char desc_txt = "Drive Slots";
+	const u8 type_desc[] = {
+		0x17,			/* element type: array device slot */
+		args->host->n_slots,	/* max number of elements */
+		0,			/* subenclosure id */
+		strlen(desc_txt),	/* type descriptor text length */
+	};
+
 	rbuf[1] = 0x1;	/* this page */
-	/* TODO */
-	return 1;
+	rbuf[3] = 47 + strlen(desc_txt); /* XXX: is strlen ok? */
+	memcpy(rbuf + 4, enc_desc, sizeof(enc_desc));
+	memcpy(rbuf + 9, "ahciem#", 7); /* XXX */
+	memcpy(rbuf + 12, "AHCI    ", INQUIRY_VENDOR_LEN);
+	memcpy(rbuf + 20, "SGPIO Enclosure ", INQUIRY_MODEL_LEN);
+	memcpy(rbuf + 36, "2.00", INQUIRY_REVISION_LEN);
+	memcpy(rbuf + 43, type_desc, sizeof(type_desc)); /* XXX: is that right? */
+	memcpy(rbuf + 47, desc_txt, strlen(desc_txt));
+	return 0;
 }
 
 static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
