@@ -311,9 +311,22 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 
 static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 {
+	int n_ports = args->host->n_ports;
+
 	rbuf[1] = 0x7;	/* this page */
-	/* TODO */
-	return 1;
+	rbuf[3] = 4 + 15 + 11 * n_ports; /* gencode + "Drive Slots" + slots */
+
+	rbuf[11] = 11;
+	memcpy(rbuf + 12, "Drive Slots", 11);
+
+	for (int i = 0; i < n_ports; i++) {
+		int offset = 4 + 4 + 15 + 11 * i; /* pghdr + gencode + "Drive Slots" + slots */
+
+		rbuf[offset + 3] = 7;
+		strncpy(rbuf + offset + 4, 8, "Slot %02d", i);
+	}
+
+	return 0;
 }
 
 static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
