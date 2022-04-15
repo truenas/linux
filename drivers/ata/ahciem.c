@@ -263,11 +263,54 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	return 0;
 }
 
+static inline int page_element_offset(int i)
+{
+	return 4 + 4 + 4 * i; /* pghdr + gencode + elems */
+}
+
 static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 {
+	struct ata_host *host = args->host;
+	int n_ports = host->n_ports;
+
 	rbuf[1] = 0x2;	/* this page */
-	/* TODO */
-	return 1;
+	rbuf[3] = page_element_offset(n_ports);
+
+	for (int i = 0; i < n_ports; i++) {
+		int offset = page_element_offset(i);
+
+		struct ata_port *ap = host->ports[i];
+		if (!ap) {
+			rbuf[offset] |= ENCLOSURE_STATUS_UNKNOWN;
+			continue;
+		}
+
+		struct ata_link *link = ap->link;
+		if (!link) {
+			rbuf[offset] |= ENCLOSURE_STATUS_UNKNOWN;
+			continue;
+		}
+
+		u8 status;
+		if (sata_pmp_attached(ap)) /* XXX: pmp links not handled */
+			status = ENCLOSURE_STATUS_UNKNOWN;
+		else if (ata_link_online(link)) /* XXX: idk if right? */
+			status = ENCLOSURE_STATUS_OK;
+		else if (ata_link_offline(link)) /* XXX: idk if right? */
+			status = ENCLOSURE_STATUS_NOTAVAIL;
+		else
+			status = ENCLOSURE_STATUS_NOTINSTALLED;
+		rbuf[offset] |= status;
+
+		if (ata_link_offline(link)) /* XXX: idk if right? */
+			rbuf[offset + 3] |= 0x10; /* DEVICE OFF */
+
+		struct ahci_port_priv *pp = ap->private_data;
+		struct ahci_em_priv *emp = &pp->em_priv[link->pmp];
+		memcpy(rbuf + offset, emp->led_state, 4);
+	}
+
+	return 0;
 }
 
 static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
