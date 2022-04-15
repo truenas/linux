@@ -305,6 +305,7 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 		if (ata_link_offline(link)) /* XXX: idk if right? */
 			rbuf[offset + 3] |= 0x10; /* DEVICE OFF */
 
+		/* XXX: locking? */
 		struct ahci_port_priv *pp = ap->private_data;
 		struct ahci_em_priv *emp = &pp->em_priv[link->pmp];
 		memcpy(rbuf + offset, emp->led_state, 4);
