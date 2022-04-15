@@ -245,7 +245,7 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	};
 	static const char desc_txt = "Drive Slots";
 	const u8 type_desc[] = {
-		0x17,			/* element type: array device slot */
+		ENCLOSURE_COMPONENT_ARRAY_DEVICE,	/* element type */
 		args->host->n_slots,	/* max number of elements */
 		0,			/* subenclosure id */
 		strlen(desc_txt),	/* type descriptor text length */
