@@ -263,21 +263,16 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	return 0;
 }
 
-static inline int page_element_offset(int i)
-{
-	return 4 + 4 + 4 * i; /* pghdr + gencode + elems */
-}
-
 static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 {
 	struct ata_host *host = args->host;
 	int n_ports = host->n_ports;
 
 	rbuf[1] = 0x2;	/* this page */
-	rbuf[3] = page_element_offset(n_ports);
+	rbuf[3] = 4 + 4 * n_ports; /* gencode + elems */
 
 	for (int i = 0; i < n_ports; i++) {
-		int offset = page_element_offset(i);
+		int offset = 4 + 4 + 4 * i; /* pghdr + gencode + elems */
 
 		struct ata_port *ap = host->ports[i];
 		if (!ap) {
