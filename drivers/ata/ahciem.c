@@ -331,9 +331,34 @@ static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 
 static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 {
+	int n_ports = args->host->n_ports;
+
 	rbuf[1] = 0xa;	/* this page */
-	/* TODO */
-	return 1;
+	rbuf[3] = 4 + (4 + 8) * n_ports; /* gencode + elements */
+
+	for (int i = 0; i < n_ports; i++) {
+		int offset = 4 + 4 + (4 + 8) * i; /* pghdr + gencode + slots */
+
+		/* Additional Element Status Descriptor */
+		rbuf[offset] = 0x10 | 0x08;	/* eip, proto=ATA (FIXME: should be SAS) */
+		rbuf[offset + 1] = 2 + 8;	/* length: index + ata elm */
+		rbuf[offset + 2] = 0x01;	/* eiioe */
+		rbuf[offset + 3] = 1 + i;	/* index */
+
+		struct ata_port *ap = args->host->ports[i];
+		if (!ap) {
+			rbuf[offset] |= 0x80;	/* invalid */
+			continue;
+		}
+		if (sata_pmp_attached(ap) /* XXX: || ch->devices == 0? */)
+			rbuf[offset] |= 0x80;	/* invalid */
+
+		/* ATA Element Status (XXX: not in SES-4? Is this mav's invention?) */
+		/* XXX: ATA is definitely not supported in Linux, only FCP or SAS. */
+		/* TODO: Come up with an addr to use for SAS proto instead. */
+	}
+
+	return 0;
 }
 
 static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
