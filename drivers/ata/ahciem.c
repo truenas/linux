@@ -37,6 +37,7 @@
 #include <scsi/scsi_proto.h>
 #include <target/target_core_base.h>
 #include <linux/libata.h>
+#include <linux/enclosure.h>
 #include "ahci.h"
 
 #define DRV_NAME	"ahciem"
@@ -243,10 +244,10 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 		36,	/* descriptor length - 3 */
 		0x30,	/* enclosure logical id (NAA Locally Assigned) */
 	};
-	static const char desc_txt = "Drive Slots";
+	static const char *desc_txt = "Drive Slots";
 	const u8 type_desc[] = {
 		ENCLOSURE_COMPONENT_ARRAY_DEVICE,	/* element type */
-		args->host->n_slots,	/* max number of elements */
+		args->host->n_ports,	/* max number of elements */
 		0,			/* subenclosure id */
 		strlen(desc_txt),	/* type descriptor text length */
 	};
@@ -267,43 +268,42 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 {
 	struct ata_host *host = args->host;
 	int n_ports = host->n_ports;
+	int i;
 
 	rbuf[1] = 0x2;	/* this page */
 	rbuf[3] = 4 + 4 * n_ports; /* gencode + elems */
 
-	for (int i = 0; i < n_ports; i++) {
+	for (i = 0; i < n_ports; i++) {
+		struct ata_port *ap;
+		struct ata_link *link;
+		struct ahci_port_priv *pp;
+		struct ahci_em_priv *emp;
 		int offset = 4 + 4 + 4 * i; /* pghdr + gencode + elems */
+		u8 status;
 
-		struct ata_port *ap = host->ports[i];
+		ap = host->ports[i];
 		if (!ap) {
 			rbuf[offset] |= ENCLOSURE_STATUS_UNKNOWN;
 			continue;
 		}
-
-		struct ata_link *link = ap->link;
-		if (!link) {
-			rbuf[offset] |= ENCLOSURE_STATUS_UNKNOWN;
-			continue;
-		}
-
-		u8 status;
+		link = &ap->link;
 		if (sata_pmp_attached(ap)) /* XXX: pmp links not handled */
 			status = ENCLOSURE_STATUS_UNKNOWN;
 		else if (ata_link_online(link)) /* XXX: idk if right? */
 			status = ENCLOSURE_STATUS_OK;
 		else if (ata_link_offline(link)) /* XXX: idk if right? */
-			status = ENCLOSURE_STATUS_NOTAVAIL;
+			status = ENCLOSURE_STATUS_UNAVAILABLE;
 		else
-			status = ENCLOSURE_STATUS_NOTINSTALLED;
+			status = ENCLOSURE_STATUS_NOT_INSTALLED;
 		rbuf[offset] |= status;
 
 		if (ata_link_offline(link)) /* XXX: idk if right? */
 			rbuf[offset + 3] |= 0x10; /* DEVICE OFF */
 
 		/* XXX: locking? */
-		struct ahci_port_priv *pp = ap->private_data;
-		struct ahci_em_priv *emp = &pp->em_priv[link->pmp];
-		memcpy(rbuf + offset, emp->led_state, 4);
+		pp = ap->private_data;
+		emp = &pp->em_priv[link->pmp];
+		memcpy(rbuf + offset, &emp->led_state, 4);
 	}
 
 	return 0;
@@ -312,6 +312,7 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 {
 	int n_ports = args->host->n_ports;
+	int i;
 
 	rbuf[1] = 0x7;	/* this page */
 	rbuf[3] = 4 + 15 + 11 * n_ports; /* gencode + "Drive Slots" + slots */
@@ -319,11 +320,11 @@ static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 	rbuf[11] = 11;
 	memcpy(rbuf + 12, "Drive Slots", 11);
 
-	for (int i = 0; i < n_ports; i++) {
+	for (i = 0; i < n_ports; i++) {
 		int offset = 4 + 4 + 15 + 11 * i; /* pghdr + gencode + "Drive Slots" + slots */
 
 		rbuf[offset + 3] = 7;
-		strncpy(rbuf + offset + 4, 8, "Slot %02d", i);
+		snprintf(rbuf + offset + 4, 8, "Slot %02d", i);
 	}
 
 	return 0;
@@ -332,11 +333,13 @@ static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 {
 	int n_ports = args->host->n_ports;
+	int i;
 
 	rbuf[1] = 0xa;	/* this page */
 	rbuf[3] = 4 + (4 + 8) * n_ports; /* gencode + elements */
 
-	for (int i = 0; i < n_ports; i++) {
+	for (i = 0; i < n_ports; i++) {
+		struct ata_port *ap;
 		int offset = 4 + 4 + (4 + 8) * i; /* pghdr + gencode + slots */
 
 		/* Additional Element Status Descriptor */
@@ -345,7 +348,7 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 		rbuf[offset + 2] = 0x01;	/* eiioe */
 		rbuf[offset + 3] = 1 + i;	/* index */
 
-		struct ata_port *ap = args->host->ports[i];
+		ap = args->host->ports[i];
 		if (!ap) {
 			rbuf[offset] |= 0x80;	/* invalid */
 			continue;
