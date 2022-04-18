@@ -414,9 +414,6 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 	case SEND_DIAGNOSTIC:
 		switch (cdb[2]) {
 		case 0x2:	/* Enclosure Control */
-			/* XXX: are these the same?
-			 * scsi_bufflen(cmd) vs (((u16)cdb[3] << 8) + cdb[4])
-			 */
 			if (scsi_bufflen(cmd) < (3 + host->n_ports)) {
 				ahciem_scsi_set_invalid_field(cmd, 3, 0);
 				break;
@@ -459,9 +456,6 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 			break;
 		}
 		if (action != NULL) {
-			/* XXX: are these the same?
-			 * scsi_bufflen(cmd) vs (((u16)cdb[3] << 8) + cdb[4])
-			 */
 			if (scsi_bufflen(cmd) < minlen)
 				ahciem_scsi_set_invalid_field(cmd, 3, 0);
 			else
