@@ -86,9 +86,14 @@ struct ata_res {
 static DEFINE_SPINLOCK(ahciem_rbuf_lock);
 static u8 ahciem_rbuf[AHCIEM_RBUF_SIZE];
 
+struct ahciem_enclosure {
+	struct ata_host *host;
+	u8 status[AHCI_MAX_PORTS][4];
+};
+
 struct ahciem_args {
 	struct scsi_cmnd *cmd;
-	struct ata_host *host;
+	struct ahciem_enclosure *enc;
 };
 
 /*
@@ -210,8 +215,8 @@ static unsigned int ahciem_scsiop_inq_83(struct ahciem_args *args, u8 *rbuf)
 
 static unsigned int ahciem_scsiop_report_luns(struct ahciem_args *args, u8 *rbuf)
 {
-	/* XXX: Is this the right thing to do? */
 	rbuf[3] = 8;	/* one lun, 8 bytes */
+	memset(rbuf + 4, 0, 8);
 	return 0;
 }
 
@@ -247,7 +252,7 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	static const char *desc_txt = "Drive Slots";
 	const u8 type_desc[] = {
 		ENCLOSURE_COMPONENT_ARRAY_DEVICE,	/* element type */
-		args->host->n_ports,	/* max number of elements */
+		args->enc->host->n_ports,/* max number of elements */
 		0,			/* subenclosure id */
 		strlen(desc_txt),	/* type descriptor text length */
 	};
@@ -266,7 +271,7 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 
 static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 {
-	struct ata_host *host = args->host;
+	struct ata_host *host = args->enc->host;
 	int n_ports = host->n_ports;
 	int i;
 
@@ -276,8 +281,6 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 	for (i = 0; i < n_ports; i++) {
 		struct ata_port *ap;
 		struct ata_link *link;
-		struct ahci_port_priv *pp;
-		struct ahci_em_priv *emp;
 		int offset = 4 + 4 + 4 * i; /* pghdr + gencode + elems */
 		u8 status;
 
@@ -287,7 +290,7 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 			continue;
 		}
 		link = &ap->link;
-		if (sata_pmp_attached(ap)) /* XXX: pmp links not handled */
+		if (sata_pmp_attached(ap))
 			status = ENCLOSURE_STATUS_UNKNOWN;
 		else if (ata_link_online(link)) /* XXX: idk if right? */
 			status = ENCLOSURE_STATUS_OK;
@@ -300,10 +303,8 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 		if (ata_link_offline(link)) /* XXX: idk if right? */
 			rbuf[offset + 3] |= 0x10; /* DEVICE OFF */
 
-		/* XXX: locking? */
-		pp = ap->private_data;
-		emp = &pp->em_priv[link->pmp];
-		memcpy(rbuf + offset, &emp->led_state, 4);
+		/* XXX: potentially out of sync with emp->led_state */
+		memcpy(rbuf + offset, args->enc->status[i], 4);
 	}
 
 	return 0;
@@ -311,7 +312,7 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 
 static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 {
-	int n_ports = args->host->n_ports;
+	int n_ports = args->enc->host->n_ports;
 	int i;
 
 	rbuf[1] = 0x7;	/* this page */
@@ -332,7 +333,8 @@ static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 
 static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 {
-	int n_ports = args->host->n_ports;
+	struct ata_host *host = args->enc->host;
+	int n_ports = host->n_ports;
 	int i;
 
 	rbuf[1] = 0xa;	/* this page */
@@ -343,12 +345,12 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 		int offset = 4 + 4 + (4 + 8) * i; /* pghdr + gencode + slots */
 
 		/* Additional Element Status Descriptor */
-		rbuf[offset] = 0x10 | 0x08;	/* eip, proto=ATA (FIXME: should be SAS) */
+		rbuf[offset] = 0x10 | 0x08;	/* eip, proto=ATA (FIXME: maybe SAS instead?) */
 		rbuf[offset + 1] = 2 + 8;	/* length: index + ata elm */
 		rbuf[offset + 2] = 0x01;	/* eiioe */
 		rbuf[offset + 3] = 1 + i;	/* index */
 
-		ap = args->host->ports[i];
+		ap = host->ports[i];
 		if (!ap) {
 			rbuf[offset] |= 0x80;	/* invalid */
 			continue;
@@ -356,18 +358,68 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 		if (sata_pmp_attached(ap) /* XXX: || ch->devices == 0? */)
 			rbuf[offset] |= 0x80;	/* invalid */
 
-		/* ATA Element Status (XXX: not in SES-4? Is this mav's invention?) */
+		/* ATA Element Status (XXX: not in SES-4, this is mav's invention) */
 		/* XXX: ATA is definitely not supported in Linux, only FCP or SAS. */
-		/* TODO: Come up with an addr to use for SAS proto instead. */
+		/* TODO: Come up with an addr to use for SAS proto instead,
+		 * or implement proto=ATA in the Linux SES driver. */
 	}
 
 	return 0;
 }
 
+static void ahciem_setleds(struct ahciem_enclosure *enc, int slot)
+{
+	struct ata_port *ap = enc->host->ports[slot];
+	u32 port_led_state, val;
+
+	if (!ap)
+		return;
+
+	val = 0;
+	if (enc->status[slot][2] & 0x80)		/* Activity */
+		val |= (1 << 0);
+	if (enc->status[slot][1] & 0x02)		/* Rebuild */
+		val |= (1 << 6) | (1 << 3);
+	else if (enc->status[slot][2] & 0x02)		/* Identification */
+		val |= (1 << 3);
+	else if (enc->status[slot][3] & 0x20)		/* Fault */
+		val |= (1 << 6);
+
+	port_led_state = (val << 16) | (slot & EM_MSG_LED_HBA_PORT);
+
+	ap->ops->transmit_led_message(ap, port_led_state, 4);
+}
+
+static void ahciem_sesop_txdx_2(struct ahciem_enclosure *enc, struct scsi_cmnd *cmd)
+{
+	const u8 *cdb = cmd->cmnd;
+	const u8 *ads0 = cdb + 8;
+	int n_ports = enc->host->n_ports;
+	int i;
+
+	for (i = 0; i < n_ports; i++) {
+		const u8 *ads = ads0 + 4 + 4 * i; /* start + overall elem + elems */
+
+		if (ads[0] & 0x80) {
+			enc->status[i][0] = 0;
+			enc->status[i][1] = ads[0] & 0x02;		/* rebuild/remap */
+			enc->status[i][2] = ads[1] & (0x80 | 0x02);	/* rqst active + rqst ident */
+			enc->status[i][3] = ads[2] & 0x20;		/* rqst fault */
+			ahciem_setleds(enc, i);
+		} else if (ads0[0] & 0x80) {
+			enc->status[i][0] = 0;
+			enc->status[i][1] = ads0[0] & 0x02;		/* rebuild/remap */
+			enc->status[i][2] = ads0[1] & (0x80 | 0x02);	/* rqst active + rqst ident */
+			enc->status[i][3] = ads0[2] & 0x20;		/* rqst fault */
+			ahciem_setleds(enc, i);
+		}
+	}
+}
+
 static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 {
-	struct ata_host *host = *(struct ata_host **)&shost->hostdata[0];
-	struct ahciem_args args = { .cmd = cmd, .host = host };
+	struct ahciem_enclosure *enc = (struct ahciem_enclosure *)&shost->hostdata[0];
+	struct ahciem_args args = { .cmd = cmd, .enc = enc };
 	const u8 *cdb = cmd->cmnd;
 
 	/*
@@ -395,7 +447,6 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 		case 0x83:	/* Device Identification */
 			ahciem_rbuf_fill(&args, ahciem_scsiop_inq_83);
 			break;
-		/* TODO: optional/protocol specific pages? */
 		default:
 			ahciem_scsi_set_invalid_field(cmd, 2, 0xff);
 			break;
@@ -417,11 +468,7 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 	case SEND_DIAGNOSTIC:
 		switch (cdb[2]) {
 		case 0x2:	/* Enclosure Control */
-			if (scsi_bufflen(cmd) < (3 + host->n_ports)) {
-				ahciem_scsi_set_invalid_field(cmd, 3, 0);
-				break;
-			}
-			/* TODO: decode sent data and store in enc */
+			ahciem_sesop_txdx_2(enc, cmd);
 			break;
 		default:
 			ahciem_scsi_set_invalid_field(cmd, 2, 0);
@@ -429,43 +476,29 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 		}
 		break;
 
-	case RECEIVE_DIAGNOSTIC: {
-		unsigned int (*action)(struct ahciem_args *args, u8 *rbuf) = NULL;
-		unsigned minlen = 0;
-
+	case RECEIVE_DIAGNOSTIC:
 		switch (cdb[2]) {
 		case 0x0:	/* Supported Diagnostic Pages */
-			minlen = 3;
-			action = ahciem_sesop_rxdx_0;
+			ahciem_rbuf_fill(&args, ahciem_sesop_rxdx_0);
 			break;
 		case 0x1:	/* Configuration */
-			minlen = 16;
-			action = ahciem_sesop_rxdx_1;
+			ahciem_rbuf_fill(&args, ahciem_sesop_rxdx_1);
 			break;
 		case 0x2:	/* Enclosure Status */
-			minlen = 3 + host->n_ports;
-			action = ahciem_sesop_rxdx_2;
+			ahciem_rbuf_fill(&args, ahciem_sesop_rxdx_2);
 			break;
 		case 0x7:	/* Element Descriptor */
-			minlen = 6 + 3 * host->n_ports;
-			action = ahciem_sesop_rxdx_7;
+			ahciem_rbuf_fill(&args, ahciem_sesop_rxdx_7);
 			break;
 		case 0xa:	/* Additional Element Status */
-			minlen = 2 + 3 * host->n_ports;
-			action = ahciem_sesop_rxdx_a;
+			ahciem_rbuf_fill(&args, ahciem_sesop_rxdx_a);
 			break;
 		default:
 			ahciem_scsi_set_invalid_field(cmd, 2, 0);
 			break;
 		}
-		if (action != NULL) {
-			if (scsi_bufflen(cmd) < minlen)
-				ahciem_scsi_set_invalid_field(cmd, 3, 0);
-			else
-				ahciem_rbuf_fill(&args, action);
-		}
 		break;
-	}
+
 	default:
 		ahciem_scsi_set_sense(cmd, ILLEGAL_REQUEST, 0x20, 0x0);
 		break;
@@ -487,12 +520,14 @@ atomic_t ahciem_unique_id = ATOMIC_INIT(0);
 int ahciem_host_activate(struct ata_host *host)
 {
 	struct Scsi_Host *shost;
+	struct ahciem_enclosure *enc;
 
-	shost = scsi_host_alloc(&ahciem_sht, sizeof(struct ata_host *));
+	shost = scsi_host_alloc(&ahciem_sht, sizeof(struct ahciem_enclosure));
 	if (!shost)
 		return -ENOMEM;
 
-	*(struct ata_host **)&shost->hostdata[0] = host;
+	enc = (struct ahciem_enclosure *)&shost->hostdata[0];
+	enc->host = host;
 	shost->transportt = NULL; /* XXX: Optional, not sure if useful? */
 	shost->unique_id = atomic_inc_return(&ahciem_unique_id);
 	shost->eh_noresume = 1;
