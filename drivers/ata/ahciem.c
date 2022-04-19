@@ -283,7 +283,7 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	struct Scsi_Host *shost;
 	unsigned int id;
 
-	shost = container_of(args->enc, struct Scsi_Host, hostdata);
+	shost = ((struct Scsi_Host *)args->enc) - 1;
 	id = shost->unique_id;
 
 	p[0] = 0x1;	/* this page */
