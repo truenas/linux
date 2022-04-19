@@ -100,6 +100,20 @@ struct ahciem_args {
  * Utility functions
  */
 
+static __inline void scsi_ulto2b(u32 val, u8 *bytes)
+{
+	bytes[0] = (val >> 8) & 0xff;
+	bytes[1] = val & 0xff;
+}
+
+static __inline void scsi_ulto4b(u32 val, u8 *bytes)
+{
+	bytes[0] = (val >> 24) & 0xff;
+	bytes[1] = (val >> 16) & 0xff;
+	bytes[2] = (val >> 8) & 0xff;
+	bytes[3] = val & 0xff;
+}
+
 static void ahciem_rbuf_fill(struct ahciem_args *args,
 		unsigned int (*actor)(struct ahciem_args *args, u8 *rbuf))
 {
@@ -176,47 +190,55 @@ static unsigned int ahciem_scsiop_inq_00(struct ahciem_args *args, u8 *rbuf)
 		0x83,	/* device ident page */
 	};
 
-	rbuf[3] = sizeof(pages);
+	rbuf[0] = TYPE_ENCLOSURE;	/* peripheral device type */
+	rbuf[1] = 0x00;	/* this page */
+	scsi_ulto2b(sizeof(pages), rbuf + 2);
+
 	memcpy(rbuf + 4, pages, sizeof(pages));
+
 	return 0;
 }
 
-/* XXX: Mostly copied from ata_scsiop_inq_std, might need more tweaking */
 static unsigned int ahciem_scsiop_inq_83(struct ahciem_args *args, u8 *rbuf)
 {
 	u8 *p = rbuf;
 
+	p[0] = TYPE_ENCLOSURE;	/* peripheral device type */
 	p[1] = 0x83;	/* this page */
+	/* length calculated at the end */
 	p += 4;
-	/* piv=0, assoc=lu, code_set=ASCII, designator=vendor */
-	p[0] = 2;
-	p[1] = ATA_ID_SERNO_LEN;
+
+	p[0] = 2;	/* code_set=ASCII */
+	p[1] = 0;	/* piv=0, assoc=lu, designator=vendor specific */
+	p[3] = ATA_ID_SERNO_LEN;	/* designator length - 4 */
 	p += 4;
 	/* TODO */
 	memcpy(p, "00000000000000000000", ATA_ID_SERNO_LEN);
 	p += ATA_ID_SERNO_LEN;
-	/* piv=0, assoc=lu, code_set=ASCII, designator=t10 vendor id */
-	p[0] = 2;
-	p[1] = 1;
-	p[3] = 68;	/* sat model serial desc len */
+
+	p[0] = 2;	/* code_set=ASCII */
+	p[1] = 1;	/* piv=0, assoc=lu, designator=t10 vendor id */
+	p[3] = 8 + ATA_ID_PROD_LEN + ATA_ID_SERNO_LEN;	/* sat model serial desc len */
 	p += 4;
 	memcpy(p, "AHCI    ", 8);
 	p += 8;
-	/* TODO */
 	memcpy(p, "SGPIO Enclosure                        ", ATA_ID_PROD_LEN);
 	p += ATA_ID_PROD_LEN;
 	/* TODO */
 	memcpy(p, "00000000000000000000", ATA_ID_SERNO_LEN);
 	p += ATA_ID_SERNO_LEN;
+
 	/* XXX: ignoring wwn stuff for now */
-	rbuf[3] = p - rbuf - 4;
+
+	scsi_ulto2b(p - rbuf - 4, rbuf + 2);	/* page length - 4 */
+
 	return 0;
 }
 
 static unsigned int ahciem_scsiop_report_luns(struct ahciem_args *args, u8 *rbuf)
 {
-	rbuf[3] = 8;	/* one lun, 8 bytes */
-	memset(rbuf + 4, 0, 8);
+	scsi_ulto4b(8, rbuf);	/* one lun, 8 bytes */
+	memset(rbuf + 8, 0, 8);
 	return 0;
 }
 
@@ -234,8 +256,8 @@ static unsigned int ahciem_sesop_rxdx_0(struct ahciem_args *args, u8 *rbuf)
 		0xa,
 	};
 
-	rbuf[1] = 0x0;	/* this page */
-	rbuf[3] = sizeof(pages);
+	rbuf[0] = 0x0;	/* this page */
+	scsi_ulto2b(sizeof(pages), rbuf + 2);
 	memcpy(rbuf + 4, pages, sizeof(pages));
 	return 0;
 }
@@ -246,26 +268,56 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 		0x11,	/* pid=1, #pid=1 */
 		0,	/* subenclosure id */
 		1,	/* # of type descriptor headers */
-		36,	/* descriptor length - 3 */
+		36,	/* descriptor length - 4 */
 		0x30,	/* enclosure logical id (NAA Locally Assigned) */
 	};
 	static const char *desc_txt = "Drive Slots";
+	static const int desc_txt_len = sizeof("Drive Slots") - 1;
 	const u8 type_desc[] = {
 		ENCLOSURE_COMPONENT_ARRAY_DEVICE,	/* element type */
-		args->enc->host->n_ports,/* max number of elements */
-		0,			/* subenclosure id */
-		strlen(desc_txt),	/* type descriptor text length */
+		args->enc->host->n_ports,	/* max number of elements */
+		0,		/* subenclosure id */
+		desc_txt_len,	/* type descriptor text length */
 	};
+	u8 *p = rbuf;
+	struct Scsi_Host *shost;
+	unsigned int id;
 
-	rbuf[1] = 0x1;	/* this page */
-	rbuf[3] = 47 + strlen(desc_txt); /* XXX: is strlen ok? */
-	memcpy(rbuf + 4, enc_desc, sizeof(enc_desc));
-	memcpy(rbuf + 9, "ahciem#", 7); /* XXX */
-	memcpy(rbuf + 12, "AHCI    ", INQUIRY_VENDOR_LEN);
-	memcpy(rbuf + 20, "SGPIO Enclosure ", INQUIRY_MODEL_LEN);
-	memcpy(rbuf + 36, "2.00", INQUIRY_REVISION_LEN);
-	memcpy(rbuf + 43, type_desc, sizeof(type_desc)); /* XXX: is that right? */
-	memcpy(rbuf + 47, desc_txt, strlen(desc_txt));
+	shost = container_of(args->enc, struct Scsi_Host, hostdata);
+	id = shost->unique_id;
+
+	p[0] = 0x1;	/* this page */
+	p[1] = 0;	/* number of secondary subenclosures */
+	/* length calculated at the end */
+	/* generation code fixed zeros */
+	p += 8;
+
+	/* enclosure logical identifier */
+	memcpy(p, enc_desc, sizeof(enc_desc));
+	p += sizeof(enc_desc);
+	snprintf(p, 7, "ahciem%01u", id); /* XXX: seems fragile */
+	p += 7;
+
+	/* enclosure vendor identification */
+	memcpy(p, "AHCI    ", INQUIRY_VENDOR_LEN);
+	p += INQUIRY_VENDOR_LEN;
+
+	/* product identification */
+	memcpy(p, "SGPIO Enclosure ", INQUIRY_MODEL_LEN);
+	p += INQUIRY_MODEL_LEN;
+
+	/* product revision level */
+	memcpy(p, "2.00", INQUIRY_REVISION_LEN);
+	p += INQUIRY_REVISION_LEN;
+
+	/* vendor specific enclosure information */
+	memcpy(p, type_desc, sizeof(type_desc));
+	p += sizeof(type_desc);
+	memcpy(p, desc_txt, desc_txt_len);
+	p += desc_txt_len;
+
+	scsi_ulto2b(p - rbuf - 4, rbuf + 2);	/* page length - 4 */
+
 	return 0;
 }
 
@@ -275,8 +327,10 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 	int n_ports = host->n_ports;
 	int i;
 
-	rbuf[1] = 0x2;	/* this page */
-	rbuf[3] = 4 + 4 * n_ports; /* gencode + elems */
+	rbuf[0] = 0x2;	/* this page */
+	rbuf[1] = 0;	/* invop=0, info=0, non-crit=0, crit=0, unrecov=0 */
+	scsi_ulto2b(4 + 4 * n_ports, rbuf + 2); /* gencode + elems */
+	/* generation code fixed zeros */
 
 	for (i = 0; i < n_ports; i++) {
 		struct ata_port *ap;
@@ -315,17 +369,20 @@ static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 	int n_ports = args->enc->host->n_ports;
 	int i;
 
-	rbuf[1] = 0x7;	/* this page */
-	rbuf[3] = 4 + 15 + 11 * n_ports; /* gencode + "Drive Slots" + slots */
+	rbuf[0] = 0x7;	/* this page */
+	scsi_ulto2b(4 + 15 + 11 * n_ports, rbuf + 2); /* gencode + "Drive Slots" + slots */
+	/* generation code fixed zeros */
 
-	rbuf[11] = 11;
+	/* overall descriptor */
+	scsi_ulto2b(11, rbuf + 10);
 	memcpy(rbuf + 12, "Drive Slots", 11);
 
 	for (i = 0; i < n_ports; i++) {
 		int offset = 4 + 4 + 15 + 11 * i; /* pghdr + gencode + "Drive Slots" + slots */
 
-		rbuf[offset + 3] = 7;
-		snprintf(rbuf + offset + 4, 8, "Slot %02d", i);
+		/* element descriptor */
+		scsi_ulto2b(7, rbuf + offset + 2);
+		snprintf(rbuf + offset + 4, 7, "Slot %02d", i);
 	}
 
 	return 0;
@@ -337,15 +394,16 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 	int n_ports = host->n_ports;
 	int i;
 
-	rbuf[1] = 0xa;	/* this page */
-	rbuf[3] = 4 + (4 + 8) * n_ports; /* gencode + elements */
+	rbuf[0] = 0xa;	/* this page */
+	scsi_ulto2b(4 + (4 + 8) * n_ports, rbuf + 2); /* gencode + elements */
+	/* generation code fixed zeros */
 
 	for (i = 0; i < n_ports; i++) {
 		struct ata_port *ap;
 		int offset = 4 + 4 + (4 + 8) * i; /* pghdr + gencode + slots */
 
 		/* Additional Element Status Descriptor */
-		rbuf[offset] = 0x10 | 0x08;	/* eip, proto=ATA (FIXME: maybe SAS instead?) */
+		rbuf[offset] = 0x10 | SCSI_PROTOCOL_ATA;	/* eip=1, proto=ATA */
 		rbuf[offset + 1] = 2 + 8;	/* length: index + ata elm */
 		rbuf[offset + 2] = 0x01;	/* eiioe */
 		rbuf[offset + 3] = 1 + i;	/* index */
@@ -358,10 +416,8 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 		if (sata_pmp_attached(ap) /* XXX: || ch->devices == 0? */)
 			rbuf[offset] |= 0x80;	/* invalid */
 
-		/* ATA Element Status (XXX: not in SES-4, this is mav's invention) */
-		/* XXX: ATA is definitely not supported in Linux, only FCP or SAS. */
-		/* TODO: Come up with an addr to use for SAS proto instead,
-		 * or implement proto=ATA in the Linux SES driver. */
+		/* ATA Element Status (NB: non-standard) */
+		scsi_ulto4b(i, rbuf + 4);
 	}
 
 	return 0;
