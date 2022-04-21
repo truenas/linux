@@ -591,6 +591,7 @@ int ahciem_host_activate(struct ata_host *host)
 	shost->max_channel = 1;
 	shost->max_cmd_len = 32; /* XXX: shrug */
 	shost->max_host_blocked = 1;
+	shost->can_queue = 1;
 
 	return scsi_add_host(shost, host->dev);
 }
