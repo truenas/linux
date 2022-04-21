@@ -584,7 +584,6 @@ int ahciem_host_activate(struct ata_host *host)
 
 	enc = (struct ahciem_enclosure *)&shost->hostdata[0];
 	enc->host = host;
-	shost->transportt = NULL; /* XXX: Optional, not sure if useful? */
 	shost->unique_id = atomic_inc_return(&ahciem_unique_id);
 	shost->eh_noresume = 1;
 	shost->max_id = 1; /* XXX: shrug */
