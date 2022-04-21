@@ -577,6 +577,7 @@ int ahciem_host_activate(struct ata_host *host)
 {
 	struct Scsi_Host *shost;
 	struct ahciem_enclosure *enc;
+	int rc;
 
 	shost = scsi_host_alloc(&ahciem_sht, sizeof(struct ahciem_enclosure));
 	if (!shost)
@@ -592,6 +593,9 @@ int ahciem_host_activate(struct ata_host *host)
 	shost->max_cmd_len = 32; /* XXX: shrug */
 	shost->max_host_blocked = 1;
 	shost->can_queue = 1;
+	rc = scsi_add_host(shost, host->dev);
+	if (rc)
+		return rc;
 
-	return scsi_add_host(shost, host->dev);
+	return scsi_add_device(shost, 0, 0, 0);
 }
