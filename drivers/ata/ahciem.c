@@ -124,7 +124,7 @@ static unsigned int ahciem_scsiop_inq_std(struct ahciem_args *args, u8 *rbuf)
 		0x2,	/* response data format compatible with SPC-5 */
 		95 - 4,	/* additional length */
 		0,
-		0x40,	/* enclosure services provided (XXX: is this correct?) */
+		0x40,	/* enclosure services provided */
 		0x2,	/* claim SAM-5 command management compatibility */
 	};
 	static const u8 versions[] = {
