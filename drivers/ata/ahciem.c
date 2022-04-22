@@ -128,9 +128,8 @@ static unsigned int ahciem_scsiop_inq_std(struct ahciem_args *args, u8 *rbuf)
 		0x2,	/* claim SAM-5 command management compatibility */
 	};
 	static const u8 versions[] = {
-		/* XXX: Copied from ata_scsiop_inq_std, might need tweaking? */
 		0x00, 0xA0,	/* SAM-5 (no version claimed) */
-		0x06, 0x00,	/* SBC-4 (no version claimed) */
+		0x06, 0x80,	/* SES-4 (no version claimed) */
 		0x05, 0xC0,	/* SPC-5 (no version claimed) */
 	};
 
