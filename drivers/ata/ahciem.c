@@ -43,44 +43,6 @@
 #define DRV_NAME	"ahciem"
 #define DRV_VERSION	"0.1"
 
-/* FreeBSD XREF sys/cam/ata/ata_all.h
-struct ata_cmd {
-	u_int8_t	flags;
-
-	u_int8_t	command;		// cmnd[2]
-	u_int8_t	features;		// cmnd[3]
-	u_int8_t	lba_low;		// cmnd[4]
-	u_int8_t	lba_mid;		// cmnd[5]
-	u_int8_t	lba_high;		// cmnd[6]
-	u_int8_t	device;			// cmnd[7]
-	u_int8_t	lba_low_exp;		// cmnd[8]
-	u_int8_t	lba_mid_exp;		// cmnd[9]
-	u_int8_t	lba_high_exp;		// cmnd[10]
-	u_int8_t	features_exp;		// cmnd[11]
-	u_int8_t	sector_count;		// cmnd[12]
-	u_int8_t	sector_count_exp;	// cmnd[13]
-
-	u_int8_t	control;		// cmnd[15]
-};
-
-struct ata_res {
-	u_int8_t	flags;
-
-	u_int8_t	status;			// res[2]
-	u_int8_t	error;			// res[3]
-	u_int8_t	lba_low;		// res[4]
-	u_int8_t	lba_mid;		// res[5]
-	u_int8_t	lba_high;		// res[6]
-	u_int8_t	device;			// res[7]
-	u_int8_t	lba_low_exp;		// res[8]
-	u_int8_t	lba_mid_exp;		// res[9]
-	u_int8_t	lba_high_exp;		// res[10]
-
-	u_int8_t	sector_count;		// res[12]
-	u_int8_t	sector_count_exp;	// res[13]
-};
-*/
-
 #define AHCIEM_RBUF_SIZE	576	/* size from libata-scsi.c */
 
 static DEFINE_SPINLOCK(ahciem_rbuf_lock);
