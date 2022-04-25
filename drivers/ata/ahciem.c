@@ -530,6 +530,7 @@ static struct scsi_host_template ahciem_sht = {
 	.name = DRV_NAME,
 	.proc_name = DRV_NAME,
 	.queuecommand = ahciem_queuecommand,
+	.sg_tablesize = SG_ALL,
 };
 
 atomic_t ahciem_unique_id = ATOMIC_INIT(0);
