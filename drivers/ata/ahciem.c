@@ -343,7 +343,7 @@ static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 
 		/* element descriptor */
 		scsi_ulto2b(7, rbuf + offset + 2);
-		snprintf(rbuf + offset + 4, 7, "Slot %02d", i);
+		snprintf(rbuf + offset + 4, 8, "Slot %02d", i);
 	}
 
 	return 0;
