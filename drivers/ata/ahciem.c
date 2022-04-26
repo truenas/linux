@@ -378,7 +378,7 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 			rbuf[offset] |= 0x80;	/* invalid */
 
 		/* ATA Element Status (NB: non-standard) */
-		scsi_ulto4b(i, rbuf + 4);
+		scsi_ulto4b(ap->print_id, rbuf + offset + 4);
 	}
 
 	return 0;
