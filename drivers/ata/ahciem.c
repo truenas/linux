@@ -407,30 +407,58 @@ static void ahciem_setleds(struct ahciem_enclosure *enc, int slot)
 	ap->ops->transmit_led_message(ap, port_led_state, 4);
 }
 
-static void ahciem_sesop_txdx_2(struct ahciem_enclosure *enc, struct scsi_cmnd *cmd)
+static void ahciem_sesop_txdx(struct ahciem_enclosure *enc, struct scsi_cmnd *cmd)
 {
-	const u8 *cdb = cmd->cmnd;
-	const u8 *ads0 = cdb + 8;
+	const u8 *ads0;
+	u8 *buf, hdr[6];
+	u16 page_len;
 	int n_ports = enc->host->n_ports;
 	int i;
+
+	if (scsi_sg_copy_to_buffer(cmd, hdr, sizeof(hdr)) != sizeof(hdr)) {
+		ahciem_scsi_set_sense(cmd, ABORTED_COMMAND, 0x34, 0x0);
+		return;
+	}
+
+	if (hdr[0] != 0x02) {	/* Enclosure Control page */
+		ahciem_scsi_set_invalid_field(cmd, 0, 0);
+		return;
+	}
+
+	page_len = (((u16)hdr[2] << 8) | hdr[3]) + 4;
+	buf = kzalloc(page_len, GFP_KERNEL);
+	if (!buf) {
+		ahciem_scsi_set_sense(cmd, ABORTED_COMMAND, 0x34, 0x0);
+		return;
+	}
+
+	if (scsi_sg_copy_to_buffer(cmd, buf, page_len) != page_len) {
+		kfree(buf);
+		ahciem_scsi_set_sense(cmd, ABORTED_COMMAND, 0x34, 0x0);
+		return;
+	}
+
+	ads0 = buf + 8;
 
 	for (i = 0; i < n_ports; i++) {
 		const u8 *ads = ads0 + 4 + 4 * i; /* start + overall elem + elems */
 
 		if (ads[0] & 0x80) {
 			enc->status[i][0] = 0;
-			enc->status[i][1] = ads[0] & 0x02;		/* rebuild/remap */
-			enc->status[i][2] = ads[1] & (0x80 | 0x02);	/* rqst active + rqst ident */
-			enc->status[i][3] = ads[2] & 0x20;		/* rqst fault */
+			enc->status[i][1] = ads[1] & 0x02;		/* rebuild/remap */
+			enc->status[i][2] = ads[2] & (0x80 | 0x02);	/* rqst active + rqst ident */
+			enc->status[i][3] = ads[3] & 0x20;		/* rqst fault */
 			ahciem_setleds(enc, i);
 		} else if (ads0[0] & 0x80) {
 			enc->status[i][0] = 0;
-			enc->status[i][1] = ads0[0] & 0x02;		/* rebuild/remap */
-			enc->status[i][2] = ads0[1] & (0x80 | 0x02);	/* rqst active + rqst ident */
-			enc->status[i][3] = ads0[2] & 0x20;		/* rqst fault */
+			enc->status[i][1] = ads0[1] & 0x02;		/* rebuild/remap */
+			enc->status[i][2] = ads0[2] & (0x80 | 0x02);	/* rqst active + rqst ident */
+			enc->status[i][3] = ads0[3] & 0x20;		/* rqst fault */
 			ahciem_setleds(enc, i);
 		}
 	}
+
+	kfree(buf);
 }
 
 static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
@@ -483,14 +511,10 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 		break;
 
 	case SEND_DIAGNOSTIC:
-		switch (cdb[2]) {
-		case 0x2:	/* Enclosure Control */
-			ahciem_sesop_txdx_2(enc, cmd);
-			break;
-		default:
-			ahciem_scsi_set_invalid_field(cmd, 2, 0);
-			break;
-		}
+		if (cdb[1] & 0x10)	/* PF (page format) */
+			ahciem_sesop_txdx(enc, cmd);
+		else
+			ahciem_scsi_set_invalid_field(cmd, 1, 4);
 		break;
 
 	case RECEIVE_DIAGNOSTIC:
