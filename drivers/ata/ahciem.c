@@ -290,13 +290,13 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 
 	rbuf[0] = 0x2;	/* this page */
 	rbuf[1] = 0;	/* invop=0, info=0, non-crit=0, crit=0, unrecov=0 */
-	scsi_ulto2b(4 + 4 * n_ports, rbuf + 2); /* gencode + elems */
+	scsi_ulto2b(4 + 4 * (1 + n_ports), rbuf + 2); /* gencode + elems */
 	/* generation code fixed zeros */
 
 	for (i = 0; i < n_ports; i++) {
 		struct ata_port *ap;
 		struct ata_link *link;
-		int offset = 4 + 4 + 4 * i; /* pghdr + gencode + elems */
+		int offset = 4 + 4 + 4 * (1 + i); /* pghdr + gencode + elems */
 		u8 status;
 
 		ap = host->ports[i];
