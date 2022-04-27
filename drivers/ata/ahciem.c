@@ -585,3 +585,6 @@ int ahciem_host_activate(struct ata_host *host)
 
 	return scsi_add_device(shost, 0, 0, 0);
 }
+EXPORT_SYMBOL(ahciem_host_activate);
+
+MODULE_LICENSE("Dual BSD/GPL");
