@@ -1918,7 +1918,7 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		return rc;
 
 	if (pi.flags & ATA_FLAG_EM) {
-		rc = ahciem_host_activate(host);
+		rc = ahciem_host_activate(pdev, host);
 		if (rc)
 			return rc;
 	}

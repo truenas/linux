@@ -29,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/spinlock.h>
+#include <linux/pci.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_cmnd.h>
@@ -50,6 +51,7 @@ static u8 ahciem_rbuf[AHCIEM_RBUF_SIZE];
 
 struct ahciem_enclosure {
 	struct ata_host *host;
+	u64 serial;
 	u8 status[AHCI_MAX_PORTS][4];
 };
 
@@ -74,6 +76,23 @@ static __inline void scsi_ulto4b(u32 val, u8 *bytes)
 	bytes[1] = (val >> 16) & 0xff;
 	bytes[2] = (val >> 8) & 0xff;
 	bytes[3] = val & 0xff;
+}
+
+static __inline void scsi_u64to8b(u64 val, u8 *bytes)
+{
+	bytes[0] = (val >> 56) & 0xff;
+	bytes[1] = (val >> 48) & 0xff;
+	bytes[2] = (val >> 40) & 0xff;
+	bytes[3] = (val >> 32) & 0xff;
+	bytes[4] = (val >> 24) & 0xff;
+	bytes[5] = (val >> 16) & 0xff;
+	bytes[6] = (val >> 8) & 0xff;
+	bytes[7] = val & 0xff;
+}
+
+static __inline u16 scsi_2btou16(u8 *bytes)
+{
+	return ((u16)bytes[0] << 8) | bytes[1];
 }
 
 static void ahciem_rbuf_fill(struct ahciem_args *args,
@@ -137,9 +156,6 @@ static unsigned int ahciem_scsiop_inq_std(struct ahciem_args *args, u8 *rbuf)
 	memcpy(rbuf + 8, "AHCI    ", INQUIRY_VENDOR_LEN);
 	memcpy(rbuf + 16, "SGPIO Enclosure ", INQUIRY_MODEL_LEN);
 	memcpy(rbuf + 32, "2.00", INQUIRY_REVISION_LEN);
-	memcpy(rbuf + 36, "0001", 4);
-	memcpy(rbuf + 40, "S-E-S ", 6);
-	memcpy(rbuf + 46, "2.00", 4);
 	memcpy(rbuf + 58, versions, sizeof(versions));
 	return 0;
 }
@@ -169,25 +185,15 @@ static unsigned int ahciem_scsiop_inq_83(struct ahciem_args *args, u8 *rbuf)
 	/* length calculated at the end */
 	p += 4;
 
-	p[0] = 2;	/* code_set=ASCII */
-	p[1] = 0;	/* piv=0, assoc=lu, designator=vendor specific */
-	p[3] = ATA_ID_SERNO_LEN;	/* designator length - 4 */
+	p[0] = 1;	/* code_set=binary */
+	p[1] = 3;	/* piv=0, assoc=lu, designator=NAA */
+	p[3] = 8;	/* NAA Locally Assigned designator length */
 	p += 4;
-	/* TODO */
-	memcpy(p, "00000000000000000000", ATA_ID_SERNO_LEN);
-	p += ATA_ID_SERNO_LEN;
-
-	p[0] = 2;	/* code_set=ASCII */
-	p[1] = 1;	/* piv=0, assoc=lu, designator=t10 vendor id */
-	p[3] = 8 + ATA_ID_PROD_LEN + ATA_ID_SERNO_LEN;	/* sat model serial desc len */
-	p += 4;
-	memcpy(p, "AHCI    ", 8);
+	scsi_u64to8b(args->enc->serial, p);
+	/* Locally Assigned designator requires the first 4 bits to be 0x3 */
+	p[0] &= 0x0f;
+	p[0] |= 0x30;
 	p += 8;
-	memcpy(p, "SGPIO Enclosure                        ", ATA_ID_PROD_LEN);
-	p += ATA_ID_PROD_LEN;
-	/* TODO */
-	memcpy(p, "00000000000000000000", ATA_ID_SERNO_LEN);
-	p += ATA_ID_SERNO_LEN;
 
 	scsi_ulto2b(p - rbuf - 4, rbuf + 2);	/* page length - 4 */
 
@@ -228,7 +234,6 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 		0,	/* subenclosure id */
 		1,	/* # of type descriptor headers */
 		36,	/* descriptor length - 4 */
-		0x30,	/* enclosure logical id (NAA Locally Assigned) */
 	};
 	static const char *desc_txt = "Drive Slots";
 	static const int desc_txt_len = sizeof("Drive Slots") - 1;
@@ -239,11 +244,6 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 		desc_txt_len,	/* type descriptor text length */
 	};
 	u8 *p = rbuf;
-	struct Scsi_Host *shost;
-	unsigned int id;
-
-	shost = ((struct Scsi_Host *)args->enc) - 1;
-	id = shost->unique_id;
 
 	p[0] = 0x1;	/* this page */
 	p[1] = 0;	/* number of secondary subenclosures */
@@ -254,8 +254,11 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	/* enclosure logical identifier */
 	memcpy(p, enc_desc, sizeof(enc_desc));
 	p += sizeof(enc_desc);
-	snprintf(p, 7, "ahciem%01u", id); /* XXX: seems fragile */
-	p += 7;
+	scsi_u64to8b(args->enc->serial, p);
+	/* Locally Assigned designator requires the first 4 bits to be 0x3 */
+	p[0] &= 0x0f;
+	p[0] |= 0x30;
+	p += 8;
 
 	/* enclosure vendor identification */
 	memcpy(p, "AHCI    ", INQUIRY_VENDOR_LEN);
@@ -269,13 +272,16 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	memcpy(p, "2.00", INQUIRY_REVISION_LEN);
 	p += INQUIRY_REVISION_LEN;
 
-	/* vendor specific enclosure information */
+	/* type descriptor header list */
 	memcpy(p, type_desc, sizeof(type_desc));
 	p += sizeof(type_desc);
+
+	/* type descriptor text list */
 	memcpy(p, desc_txt, desc_txt_len);
 	p += desc_txt_len;
 
-	scsi_ulto2b(p - rbuf - 4, rbuf + 2);	/* page length - 4 */
+	/* page length - 4 */
+	scsi_ulto2b(p - rbuf - 4, rbuf + 2);
 
 	return 0;
 }
@@ -408,35 +414,30 @@ static void ahciem_setleds(struct ahciem_enclosure *enc, int slot)
 static void ahciem_sesop_txdx(struct ahciem_enclosure *enc, struct scsi_cmnd *cmd)
 {
 	const u8 *ads0;
-	u8 *buf, hdr[6];
-	u16 page_len;
+	u8 *page;
+	u16 page_len = scsi_2btou16(cmd->cmnd + 3);
 	int n_ports = enc->host->n_ports;
 	int i;
 
-	if (scsi_sg_copy_to_buffer(cmd, hdr, sizeof(hdr)) != sizeof(hdr)) {
+	page = kzalloc(page_len, GFP_KERNEL);
+	if (!page) {
 		ahciem_scsi_set_sense(cmd, ABORTED_COMMAND, 0x34, 0x0);
 		return;
 	}
 
-	if (hdr[0] != 0x02) {	/* Enclosure Control page */
+	if (scsi_sg_copy_to_buffer(cmd, page, page_len) != page_len) {
+		kfree(page);
+		ahciem_scsi_set_sense(cmd, ABORTED_COMMAND, 0x34, 0x0);
+		return;
+	}
+
+	if (page[0] != 0x02) {	/* Enclosure Control page */
+		kfree(page);
 		ahciem_scsi_set_invalid_field(cmd, 0, 0);
 		return;
 	}
 
-	page_len = (((u16)hdr[2] << 8) | hdr[3]) + 4;
-	buf = kzalloc(page_len, GFP_KERNEL);
-	if (!buf) {
-		ahciem_scsi_set_sense(cmd, ABORTED_COMMAND, 0x34, 0x0);
-		return;
-	}
-
-	if (scsi_sg_copy_to_buffer(cmd, buf, page_len) != page_len) {
-		kfree(buf);
-		ahciem_scsi_set_sense(cmd, ABORTED_COMMAND, 0x34, 0x0);
-		return;
-	}
-
-	ads0 = buf + 8;
+	ads0 = page + 8;
 
 	for (i = 0; i < n_ports; i++) {
 		const u8 *ads = ads0 + 4 + 4 * i; /* start + overall elem + elems */
@@ -456,7 +457,7 @@ static void ahciem_sesop_txdx(struct ahciem_enclosure *enc, struct scsi_cmnd *cm
 		}
 	}
 
-	kfree(buf);
+	kfree(page);
 }
 
 static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
@@ -557,7 +558,7 @@ static struct scsi_host_template ahciem_sht = {
 
 atomic_t ahciem_unique_id = ATOMIC_INIT(0);
 
-int ahciem_host_activate(struct ata_host *host)
+int ahciem_host_activate(struct pci_dev *pdev, struct ata_host *host)
 {
 	struct Scsi_Host *shost;
 	struct ahciem_enclosure *enc;
@@ -569,6 +570,7 @@ int ahciem_host_activate(struct ata_host *host)
 
 	enc = (struct ahciem_enclosure *)&shost->hostdata[0];
 	enc->host = host;
+	enc->serial = pci_get_dsn(pdev);
 	shost->can_queue = 1;
 	shost->eh_noresume = 1;
 	shost->max_channel = 1;

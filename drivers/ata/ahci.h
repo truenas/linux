@@ -447,6 +447,6 @@ static inline int ahci_nr_ports(u32 cap)
 	return (cap & 0x1f) + 1;
 }
 
-int ahciem_host_activate(struct ata_host *host);
+int ahciem_host_activate(struct pci_dev *pdev, struct ata_host *host);
 
 #endif /* _AHCI_H */
