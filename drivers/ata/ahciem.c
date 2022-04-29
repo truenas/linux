@@ -308,21 +308,22 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 
 		ap = host->ports[i];
 		if (!ap) {
-			rbuf[offset] |= ENCLOSURE_STATUS_UNKNOWN;
+			rbuf[offset] |= ENCLOSURE_STATUS_NOT_INSTALLED;
 			continue;
 		}
 		link = &ap->link;
 		if (sata_pmp_attached(ap))
 			status = ENCLOSURE_STATUS_UNKNOWN;
-		else if (ata_link_online(link)) /* XXX: idk if right? */
+		else if (ata_link_online(link))
 			status = ENCLOSURE_STATUS_OK;
-		else if (ata_link_offline(link)) /* XXX: idk if right? */
+		else if (ata_link_offline(link))
 			status = ENCLOSURE_STATUS_UNAVAILABLE;
 		else
-			status = ENCLOSURE_STATUS_NOT_INSTALLED;
+			status = ENCLOSURE_STATUS_UNKNOWN;
 		rbuf[offset] |= status;
 
-		if (ata_link_offline(link)) /* XXX: idk if right? */
+		/* XXX: should be checking for administratively disabled */
+		if (ata_link_offline(link))
 			rbuf[offset + 3] |= 0x10; /* DEVICE OFF */
 	}
 
@@ -378,7 +379,7 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 			rbuf[offset] |= 0x80;	/* invalid */
 			continue;
 		}
-		if (sata_pmp_attached(ap) /* XXX: || ch->devices == 0? */)
+		if (sata_pmp_attached(ap))
 			rbuf[offset] |= 0x80;	/* invalid */
 
 		/* ATA Element Status (NB: non-standard) */
