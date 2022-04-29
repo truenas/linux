@@ -51,7 +51,7 @@ static u8 ahciem_rbuf[AHCIEM_RBUF_SIZE];
 
 struct ahciem_enclosure {
 	struct ata_host *host;
-	u64 serial;
+	u64 id;
 	u8 status[AHCI_MAX_PORTS][4];
 };
 
@@ -189,10 +189,7 @@ static unsigned int ahciem_scsiop_inq_83(struct ahciem_args *args, u8 *rbuf)
 	p[1] = 3;	/* piv=0, assoc=lu, designator=NAA */
 	p[3] = 8;	/* NAA Locally Assigned designator length */
 	p += 4;
-	scsi_u64to8b(args->enc->serial, p);
-	/* Locally Assigned designator requires the first 4 bits to be 0x3 */
-	p[0] &= 0x0f;
-	p[0] |= 0x30;
+	scsi_u64to8b(args->enc->id, p);
 	p += 8;
 
 	scsi_ulto2b(p - rbuf - 4, rbuf + 2);	/* page length - 4 */
@@ -254,10 +251,7 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	/* enclosure logical identifier */
 	memcpy(p, enc_desc, sizeof(enc_desc));
 	p += sizeof(enc_desc);
-	scsi_u64to8b(args->enc->serial, p);
-	/* Locally Assigned designator requires the first 4 bits to be 0x3 */
-	p[0] &= 0x0f;
-	p[0] |= 0x30;
+	scsi_u64to8b(args->enc->id, p);
 	p += 8;
 
 	/* enclosure vendor identification */
@@ -557,7 +551,14 @@ static struct scsi_host_template ahciem_sht = {
 	.sg_tablesize = SG_ALL,
 };
 
-atomic_t ahciem_unique_id = ATOMIC_INIT(0);
+static __inline u64 encode_naa_id(struct pci_dev *pdev)
+{
+	int domain = pci_domain_nr(pdev->bus);
+	u16 devid = pci_dev_id(pdev);
+
+	/* NAA Locally Assigned */
+	return ((u64)0x3 << 60) | ((u64)domain << 16) | devid;
+}
 
 int ahciem_host_activate(struct pci_dev *pdev, struct ata_host *host)
 {
@@ -571,7 +572,7 @@ int ahciem_host_activate(struct pci_dev *pdev, struct ata_host *host)
 
 	enc = (struct ahciem_enclosure *)&shost->hostdata[0];
 	enc->host = host;
-	enc->serial = pci_get_dsn(pdev);
+	enc->id = encode_naa_id(pdev);
 	shost->can_queue = 1;
 	shost->eh_noresume = 1;
 	shost->max_channel = 1;
@@ -579,7 +580,7 @@ int ahciem_host_activate(struct pci_dev *pdev, struct ata_host *host)
 	shost->max_host_blocked = 1;
 	shost->max_id = 1;
 	shost->max_lun = 1;
-	shost->unique_id = atomic_inc_return(&ahciem_unique_id);
+	shost->unique_id = shost->host_no;
 	rc = scsi_add_host(shost, host->dev);
 	if (rc)
 		return rc;
