@@ -51,7 +51,6 @@ static u8 ahciem_rbuf[AHCIEM_RBUF_SIZE];
 
 struct ahciem_enclosure {
 	struct ata_host *host;
-	u64 id;
 	u8 status[AHCI_MAX_PORTS][4];
 };
 
@@ -76,18 +75,6 @@ static __inline void scsi_ulto4b(u32 val, u8 *bytes)
 	bytes[1] = (val >> 16) & 0xff;
 	bytes[2] = (val >> 8) & 0xff;
 	bytes[3] = val & 0xff;
-}
-
-static __inline void scsi_u64to8b(u64 val, u8 *bytes)
-{
-	bytes[0] = (val >> 56) & 0xff;
-	bytes[1] = (val >> 48) & 0xff;
-	bytes[2] = (val >> 40) & 0xff;
-	bytes[3] = (val >> 32) & 0xff;
-	bytes[4] = (val >> 24) & 0xff;
-	bytes[5] = (val >> 16) & 0xff;
-	bytes[6] = (val >> 8) & 0xff;
-	bytes[7] = val & 0xff;
 }
 
 static __inline u16 scsi_2btou16(u8 *bytes)
@@ -189,7 +176,8 @@ static unsigned int ahciem_scsiop_inq_83(struct ahciem_args *args, u8 *rbuf)
 	p[1] = 3;	/* piv=0, assoc=lu, designator=NAA */
 	p[3] = 8;	/* NAA Locally Assigned designator length */
 	p += 4;
-	scsi_u64to8b(args->enc->id, p);
+	p[0] = 0x30;	/* NAA Locally Assigned */
+	scsi_ulto4b(args->cmd->device->host->unique_id, p + 4);
 	p += 8;
 
 	scsi_ulto2b(p - rbuf - 4, rbuf + 2);	/* page length - 4 */
@@ -251,7 +239,8 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	/* enclosure logical identifier */
 	memcpy(p, enc_desc, sizeof(enc_desc));
 	p += sizeof(enc_desc);
-	scsi_u64to8b(args->enc->id, p);
+	p[0] = 0x30;	/* NAA Locally Assigned */
+	scsi_ulto4b(args->cmd->device->host->unique_id, p + 4);
 	p += 8;
 
 	/* enclosure vendor identification */
@@ -377,7 +366,8 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 			rbuf[offset] |= 0x80;	/* invalid */
 
 		/* ATA Element Status (NB: non-standard) */
-		scsi_ulto4b(ap->print_id, rbuf + offset + 4);
+		scsi_ulto4b(i, rbuf + offset + 4);
+		scsi_ulto4b(args->cmd->device->host->host_no, rbuf + offset + 8);
 	}
 
 	return 0;
@@ -551,16 +541,9 @@ static struct scsi_host_template ahciem_sht = {
 	.sg_tablesize = SG_ALL,
 };
 
-static __inline u64 encode_naa_id(struct pci_dev *pdev)
-{
-	int domain = pci_domain_nr(pdev->bus);
-	u16 devid = pci_dev_id(pdev);
+static atomic_t ahciem_unique_id = ATOMIC_INIT(0);
 
-	/* NAA Locally Assigned */
-	return ((u64)0x3 << 60) | ((u64)domain << 16) | devid;
-}
-
-int ahciem_host_activate(struct pci_dev *pdev, struct ata_host *host)
+int ahciem_host_activate(struct ata_host *host)
 {
 	struct Scsi_Host *shost;
 	struct ahciem_enclosure *enc;
@@ -572,7 +555,6 @@ int ahciem_host_activate(struct pci_dev *pdev, struct ata_host *host)
 
 	enc = (struct ahciem_enclosure *)&shost->hostdata[0];
 	enc->host = host;
-	enc->id = encode_naa_id(pdev);
 	shost->can_queue = 1;
 	shost->eh_noresume = 1;
 	shost->max_channel = 1;
@@ -580,7 +562,7 @@ int ahciem_host_activate(struct pci_dev *pdev, struct ata_host *host)
 	shost->max_host_blocked = 1;
 	shost->max_id = 1;
 	shost->max_lun = 1;
-	shost->unique_id = shost->host_no;
+	shost->unique_id = atomic_inc_return(&ahciem_unique_id);
 	rc = scsi_add_host(shost, host->dev);
 	if (rc)
 		return rc;
