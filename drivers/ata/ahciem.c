@@ -110,11 +110,11 @@ static void ahciem_scsi_set_sense(struct scsi_cmnd *cmd,
 }
 
 static void ahciem_scsi_set_invalid_field(struct scsi_cmnd *cmd,
-					  u16 field, u8 bit)
+					  u16 field, u8 bit, bool cd)
 {
 	ahciem_scsi_set_sense(cmd, ILLEGAL_REQUEST, 0x24, 0x0);
 	scsi_set_sense_field_pointer(cmd->sense_buffer, SCSI_SENSE_BUFFERSIZE,
-				     field, bit, 1);
+				     field, bit, cd);
 }
 
 /*
@@ -418,7 +418,7 @@ static void ahciem_sesop_txdx(struct ahciem_enclosure *enc, struct scsi_cmnd *cm
 
 	if (page[0] != 0x02) {	/* Enclosure Control page */
 		kfree(page);
-		ahciem_scsi_set_invalid_field(cmd, 0, 0);
+		ahciem_scsi_set_invalid_field(cmd, 0, 0, false);
 		return;
 	}
 
@@ -463,10 +463,10 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 	switch (cdb[0]) {
 	case INQUIRY:
 		if (cdb[1] & 2)			/* obsolete CMDDT set? */
-			ahciem_scsi_set_invalid_field(cmd, 1, 1);
+			ahciem_scsi_set_invalid_field(cmd, 1, 1, true);
 		else if ((cdb[1] & 1) == 0) {	/* standard INQUIRY */
 			if (cdb[2] != 0)
-				ahciem_scsi_set_invalid_field(cmd, 2, 0xff);
+				ahciem_scsi_set_invalid_field(cmd, 2, 0xff, true);
 			else
 				ahciem_rbuf_fill(&args, ahciem_scsiop_inq_std);
 		} else switch (cdb[2]) {	/* VPD INQUIRY */
@@ -477,7 +477,7 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 			ahciem_rbuf_fill(&args, ahciem_scsiop_inq_83);
 			break;
 		default:
-			ahciem_scsi_set_invalid_field(cmd, 2, 0xff);
+			ahciem_scsi_set_invalid_field(cmd, 2, 0xff, true);
 			break;
 		}
 		break;
@@ -498,7 +498,7 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 		if (cdb[1] & 0x10)	/* PF (page format) */
 			ahciem_sesop_txdx(enc, cmd);
 		else
-			ahciem_scsi_set_invalid_field(cmd, 1, 4);
+			ahciem_scsi_set_invalid_field(cmd, 1, 4, true);
 		break;
 
 	case RECEIVE_DIAGNOSTIC:
@@ -519,7 +519,7 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 			ahciem_rbuf_fill(&args, ahciem_sesop_rxdx_a);
 			break;
 		default:
-			ahciem_scsi_set_invalid_field(cmd, 2, 0);
+			ahciem_scsi_set_invalid_field(cmd, 2, 0, true);
 			break;
 		}
 		break;
