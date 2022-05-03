@@ -20,6 +20,9 @@
 
 #include <scsi/scsi_transport_sas.h>
 
+#include <linux/libata.h>
+#include "../ata/ahci.h"
+
 struct ses_device {
 	unsigned char *page1;
 	unsigned char *page1_types;
@@ -449,6 +452,13 @@ static void ses_process_descriptor(struct enclosure_component *ecomp,
 
 	switch (proto) {
 	case SCSI_PROTOCOL_ATA:
+		d = desc + 4;
+		if (eip) {
+			slot = get_unaligned_be32(d);
+			d = desc + 8;
+		}
+		addr = get_unaligned_be32(d);
+		break;
 	case SCSI_PROTOCOL_FCP:
 		if (eip) {
 			d = desc + 4;
@@ -627,6 +637,8 @@ static void ses_match_to_enclosure(struct enclosure_device *edev,
 
 	if (scsi_is_sas_rphy(sdev->sdev_target->dev.parent))
 		efd.addr = sas_get_address(sdev);
+	else if (scsi_is_ata(sdev))
+		efd.addr = sdev->host->host_no + 1;
 
 	if (efd.addr) {
 		efd.dev = &sdev->sdev_gendev;
@@ -651,11 +663,20 @@ static int ses_intf_add(struct device *cdev,
 
 	if (!scsi_device_enclosure(sdev)) {
 		/* not an enclosure, but might be in one */
-		struct enclosure_device *prev = NULL;
+		if (scsi_is_ata(sdev)) {
+			struct ata_port *ap = ata_shost_to_port(sdev->host);
+			struct ahci_host_priv *hpriv = ap->host->private_data;
+			struct Scsi_Host *shost = hpriv->em_shost;
 
-		while ((edev = enclosure_find(&sdev->host->shost_gendev, prev)) != NULL) {
+			edev = enclosure_find(&shost->shost_gendev, NULL);
 			ses_match_to_enclosure(edev, sdev, 1);
-			prev = edev;
+		} else {
+			struct enclosure_device *prev = NULL;
+
+			while ((edev = enclosure_find(&sdev->host->shost_gendev, prev)) != NULL) {
+				ses_match_to_enclosure(edev, sdev, 1);
+				prev = edev;
+			}
 		}
 		return -ENODEV;
 	}
@@ -767,10 +788,27 @@ page2_not_supported:
 
 	/* see if there are any devices matching before
 	 * we found the enclosure */
-	shost_for_each_device(tmp_sdev, sdev->host) {
-		if (tmp_sdev->lun != 0 || scsi_device_enclosure(tmp_sdev))
-			continue;
-		ses_match_to_enclosure(edev, tmp_sdev, 0);
+	if (scsi_is_ahciem(sdev)) {
+		struct Scsi_Host *shost = sdev->host;
+		struct ahciem_enclosure *enc = (struct ahciem_enclosure *)&shost->hostdata[0];
+		struct ata_host *host = enc->host;
+
+		for (i = 0; i < host->n_ports; i++) {
+			struct ata_port *ap = host->ports[i];
+
+			if (!ap)
+				continue;
+
+			shost_for_each_device(tmp_sdev, ap->scsi_host) {
+				ses_match_to_enclosure(edev, tmp_sdev, 0);
+			}
+		}
+	} else {
+		shost_for_each_device(tmp_sdev, sdev->host) {
+			if (tmp_sdev->lun != 0 || scsi_device_enclosure(tmp_sdev))
+				continue;
+			ses_match_to_enclosure(edev, tmp_sdev, 0);
+		}
 	}
 
 	return 0;

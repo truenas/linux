@@ -49,11 +49,6 @@
 static DEFINE_SPINLOCK(ahciem_rbuf_lock);
 static u8 ahciem_rbuf[AHCIEM_RBUF_SIZE];
 
-struct ahciem_enclosure {
-	struct ata_host *host;
-	u8 status[AHCI_MAX_PORTS][4];
-};
-
 struct ahciem_args {
 	struct scsi_cmnd *cmd;
 	struct ahciem_enclosure *enc;
@@ -367,7 +362,7 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 
 		/* ATA Element Status (NB: non-standard) */
 		scsi_ulto4b(i, rbuf + offset + 4);
-		scsi_ulto4b(args->cmd->device->host->host_no, rbuf + offset + 8);
+		scsi_ulto4b(ap->scsi_host->host_no + 1, rbuf + offset + 8);
 	}
 
 	return 0;
@@ -541,10 +536,17 @@ static struct scsi_host_template ahciem_sht = {
 	.sg_tablesize = SG_ALL,
 };
 
+bool scsi_is_ahciem(struct scsi_device *sdev)
+{
+	return sdev->host->hostt == &ahciem_sht;
+}
+EXPORT_SYMBOL(scsi_is_ahciem);
+
 static atomic_t ahciem_unique_id = ATOMIC_INIT(0);
 
 int ahciem_host_activate(struct ata_host *host)
 {
+	struct ahci_host_priv *hpriv = host->private_data;
 	struct Scsi_Host *shost;
 	struct ahciem_enclosure *enc;
 	int rc;
@@ -555,6 +557,7 @@ int ahciem_host_activate(struct ata_host *host)
 
 	enc = (struct ahciem_enclosure *)&shost->hostdata[0];
 	enc->host = host;
+	hpriv->em_shost = shost;
 	shost->can_queue = 1;
 	shost->eh_noresume = 1;
 	shost->max_channel = 1;

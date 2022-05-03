@@ -339,6 +339,7 @@ struct ahci_host_priv {
 	u32 			em_loc; /* enclosure management location */
 	u32			em_buf_sz;	/* EM buffer size in byte */
 	u32			em_msg_type;	/* EM message type */
+	struct Scsi_Host	*em_shost;	/* EM SCSI host */
 	u32			remapped_nvme;	/* NVMe remapped device count */
 	bool			got_runtime_pm; /* Did we do pm_runtime_get? */
 	struct clk		*clks[AHCI_MAX_CLKS]; /* Optional */
@@ -447,6 +448,12 @@ static inline int ahci_nr_ports(u32 cap)
 	return (cap & 0x1f) + 1;
 }
 
+struct ahciem_enclosure {
+	struct ata_host *host;
+	u8 status[AHCI_MAX_PORTS][4];
+};
+
+bool scsi_is_ahciem(struct scsi_device *sdev);
 int ahciem_host_activate(struct ata_host *host);
 
 #endif /* _AHCI_H */
