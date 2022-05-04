@@ -30,6 +30,10 @@
 #include <linux/device.h>
 #include <linux/spinlock.h>
 #include <linux/pci.h>
+#include <linux/libata.h>
+#include <linux/enclosure.h>
+#include <asm/unaligned.h>
+
 #include <scsi/scsi.h>
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_cmnd.h>
@@ -37,8 +41,7 @@
 #include <scsi/scsi_transport.h>
 #include <scsi/scsi_proto.h>
 #include <target/target_core_base.h>
-#include <linux/libata.h>
-#include <linux/enclosure.h>
+
 #include "ahci.h"
 
 #define DRV_NAME	"ahciem"
@@ -57,25 +60,6 @@ struct ahciem_args {
 /*
  * Utility functions
  */
-
-static __inline void scsi_ulto2b(u32 val, u8 *bytes)
-{
-	bytes[0] = (val >> 8) & 0xff;
-	bytes[1] = val & 0xff;
-}
-
-static __inline void scsi_ulto4b(u32 val, u8 *bytes)
-{
-	bytes[0] = (val >> 24) & 0xff;
-	bytes[1] = (val >> 16) & 0xff;
-	bytes[2] = (val >> 8) & 0xff;
-	bytes[3] = val & 0xff;
-}
-
-static __inline u16 scsi_2btou16(u8 *bytes)
-{
-	return ((u16)bytes[0] << 8) | bytes[1];
-}
 
 static void ahciem_rbuf_fill(struct ahciem_args *args,
 		unsigned int (*actor)(struct ahciem_args *args, u8 *rbuf))
@@ -151,7 +135,7 @@ static unsigned int ahciem_scsiop_inq_00(struct ahciem_args *args, u8 *rbuf)
 
 	rbuf[0] = TYPE_ENCLOSURE;	/* peripheral device type */
 	rbuf[1] = 0x00;	/* this page */
-	scsi_ulto2b(sizeof(pages), rbuf + 2);
+	put_unaligned_be16(sizeof(pages), rbuf + 2);
 
 	memcpy(rbuf + 4, pages, sizeof(pages));
 
@@ -172,17 +156,17 @@ static unsigned int ahciem_scsiop_inq_83(struct ahciem_args *args, u8 *rbuf)
 	p[3] = 8;	/* NAA Locally Assigned designator length */
 	p += 4;
 	p[0] = 0x30;	/* NAA Locally Assigned */
-	scsi_ulto4b(args->cmd->device->host->unique_id, p + 4);
+	put_unaligned_be32(args->cmd->device->host->unique_id, p + 4);
 	p += 8;
 
-	scsi_ulto2b(p - rbuf - 4, rbuf + 2);	/* page length - 4 */
+	put_unaligned_be16(p - rbuf - 4, rbuf + 2);	/* page length - 4 */
 
 	return 0;
 }
 
 static unsigned int ahciem_scsiop_report_luns(struct ahciem_args *args, u8 *rbuf)
 {
-	scsi_ulto4b(8, rbuf);	/* one lun, 8 bytes */
+	put_unaligned_be32(8, rbuf);	/* one lun, 8 bytes */
 	memset(rbuf + 8, 0, 8);
 	return 0;
 }
@@ -202,7 +186,7 @@ static unsigned int ahciem_sesop_rxdx_0(struct ahciem_args *args, u8 *rbuf)
 	};
 
 	rbuf[0] = 0x0;	/* this page */
-	scsi_ulto2b(sizeof(pages), rbuf + 2);
+	put_unaligned_be16(sizeof(pages), rbuf + 2);
 	memcpy(rbuf + 4, pages, sizeof(pages));
 	return 0;
 }
@@ -235,7 +219,7 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	memcpy(p, enc_desc, sizeof(enc_desc));
 	p += sizeof(enc_desc);
 	p[0] = 0x30;	/* NAA Locally Assigned */
-	scsi_ulto4b(args->cmd->device->host->unique_id, p + 4);
+	put_unaligned_be32(args->cmd->device->host->unique_id, p + 4);
 	p += 8;
 
 	/* enclosure vendor identification */
@@ -259,7 +243,7 @@ static unsigned int ahciem_sesop_rxdx_1(struct ahciem_args *args, u8 *rbuf)
 	p += desc_txt_len;
 
 	/* page length - 4 */
-	scsi_ulto2b(p - rbuf - 4, rbuf + 2);
+	put_unaligned_be16(p - rbuf - 4, rbuf + 2);
 
 	return 0;
 }
@@ -272,7 +256,7 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 
 	rbuf[0] = 0x2;	/* this page */
 	rbuf[1] = 0;	/* invop=0, info=0, non-crit=0, crit=0, unrecov=0 */
-	scsi_ulto2b(4 + 4 * (1 + n_ports), rbuf + 2); /* gencode + elems */
+	put_unaligned_be16(4 + 4 * (1 + n_ports), rbuf + 2); /* gencode + elems */
 	/* generation code fixed zeros */
 
 	for (i = 0; i < n_ports; i++) {
@@ -314,18 +298,18 @@ static unsigned int ahciem_sesop_rxdx_7(struct ahciem_args *args, u8 *rbuf)
 	int i;
 
 	rbuf[0] = 0x7;	/* this page */
-	scsi_ulto2b(4 + 15 + 11 * n_ports, rbuf + 2); /* gencode + "Drive Slots" + slots */
+	put_unaligned_be16(4 + 15 + 11 * n_ports, rbuf + 2); /* gencode + "Drive Slots" + slots */
 	/* generation code fixed zeros */
 
 	/* overall descriptor */
-	scsi_ulto2b(11, rbuf + 10);
+	put_unaligned_be16(11, rbuf + 10);
 	memcpy(rbuf + 12, "Drive Slots", 11);
 
 	for (i = 0; i < n_ports; i++) {
 		int offset = 4 + 4 + 15 + 11 * i; /* pghdr + gencode + "Drive Slots" + slots */
 
 		/* element descriptor */
-		scsi_ulto2b(7, rbuf + offset + 2);
+		put_unaligned_be16(7, rbuf + offset + 2);
 		snprintf(rbuf + offset + 4, 8, "Slot %02d", i);
 	}
 
@@ -339,7 +323,7 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 	int i;
 
 	rbuf[0] = 0xa;	/* this page */
-	scsi_ulto2b(4 + (4 + 8) * n_ports, rbuf + 2); /* gencode + elements */
+	put_unaligned_be16(4 + (4 + 8) * n_ports, rbuf + 2); /* gencode + elements */
 	/* generation code fixed zeros */
 
 	for (i = 0; i < n_ports; i++) {
@@ -361,8 +345,8 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 			rbuf[offset] |= 0x80;	/* invalid */
 
 		/* ATA Element Status (NB: non-standard) */
-		scsi_ulto4b(i, rbuf + offset + 4);
-		scsi_ulto4b(ap->scsi_host->host_no + 1, rbuf + offset + 8);
+		put_unaligned_be32(i, rbuf + offset + 4);
+		put_unaligned_be32(ap->scsi_host->host_no + 1, rbuf + offset + 8);
 	}
 
 	return 0;
@@ -395,7 +379,7 @@ static void ahciem_sesop_txdx(struct ahciem_enclosure *enc, struct scsi_cmnd *cm
 {
 	const u8 *ads0;
 	u8 *page;
-	u16 page_len = scsi_2btou16(cmd->cmnd + 3);
+	u16 page_len = get_unaligned_be16(cmd->cmnd + 3);
 	int n_ports = enc->host->n_ports;
 	int i;
 
