@@ -631,6 +631,10 @@ static struct pci_driver ahci_pci_driver = {
 	},
 };
 
+static int ahciem_enable = 1;
+module_param(ahciem_enable, int, 0644);
+MODULE_PARM_DESC(ahciem_enable, "Emulate SES enclosure (0 = disabled)");
+
 #if IS_ENABLED(CONFIG_PATA_MARVELL)
 static int marvell_enable;
 #else
@@ -1917,7 +1921,7 @@ static int ahci_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (rc)
 		return rc;
 
-	if (pi.flags & ATA_FLAG_EM) {
+	if (ahciem_enable && (pi.flags & ATA_FLAG_EM)) {
 		rc = ahciem_host_activate(host);
 		if (rc)
 			return rc;
