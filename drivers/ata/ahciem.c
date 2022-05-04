@@ -284,8 +284,7 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 			status = ENCLOSURE_STATUS_UNKNOWN;
 		rbuf[offset] |= status;
 
-		/* XXX: should be checking for administratively disabled */
-		if (ata_link_offline(link))
+		if (ata_dev_disabled(link->device))
 			rbuf[offset + 3] |= 0x10; /* DEVICE OFF */
 	}
 
