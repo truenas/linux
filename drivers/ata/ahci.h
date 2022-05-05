@@ -448,6 +448,8 @@ static inline int ahci_nr_ports(u32 cap)
 	return (cap & 0x1f) + 1;
 }
 
+bool scsi_is_ahci(struct scsi_device *sdev);
+
 struct ahciem_enclosure {
 	struct ata_host *host;
 	u8 status[AHCI_MAX_PORTS][4];

@@ -663,7 +663,7 @@ static int ses_intf_add(struct device *cdev,
 
 	if (!scsi_device_enclosure(sdev)) {
 		/* not an enclosure, but might be in one */
-		if (scsi_is_ata(sdev)) {
+		if (scsi_is_ahci(sdev)) {
 			struct ata_port *ap = ata_shost_to_port(sdev->host);
 			struct ahci_host_priv *hpriv = ap->host->private_data;
 			struct Scsi_Host *shost = hpriv->em_shost;
