@@ -352,7 +352,7 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 
 		/* ATA Element Status (NB: non-standard) */
 		put_unaligned_be32(i, rbuf + offset + 4);
-		put_unaligned_be32(ap->scsi_host->host_no + 1, rbuf + offset + 8);
+		put_unaligned_be32(ap->scsi_host->host_no, rbuf + offset + 8);
 	}
 
 	return 0;

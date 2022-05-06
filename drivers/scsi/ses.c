@@ -457,7 +457,7 @@ static void ses_process_descriptor(struct enclosure_component *ecomp,
 			slot = get_unaligned_be32(d);
 			d = desc + 8;
 		}
-		addr = get_unaligned_be32(d);
+		addr = get_unaligned_be32(d) + 1;
 		break;
 	case SCSI_PROTOCOL_FCP:
 		if (eip) {
