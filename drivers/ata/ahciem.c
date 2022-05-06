@@ -1,5 +1,7 @@
 /*-
- * SPDX-License-Indentifier: BSD-2-Clause-FreeBSD
+ * SPDX-License-Indentifier: (GPL-2.0-only OR BSD-2-Clause-FreeBSD)
+ *
+ * Emulated SCSI Enclosure Services for AHCI Enclosure Management
  *
  * Copyright 2022 iXsystems, Inc.
  *
