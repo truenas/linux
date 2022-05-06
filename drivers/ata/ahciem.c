@@ -286,7 +286,7 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 		else if (ata_link_online(link))
 			status = ENCLOSURE_STATUS_OK;
 		else if (ata_link_offline(link))
-			status = ENCLOSURE_STATUS_UNAVAILABLE;
+			status = ENCLOSURE_STATUS_NOT_INSTALLED;
 		else
 			status = ENCLOSURE_STATUS_UNKNOWN;
 		rbuf[offset] |= status;
