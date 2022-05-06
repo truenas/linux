@@ -789,19 +789,22 @@ page2_not_supported:
 	/* see if there are any devices matching before
 	 * we found the enclosure */
 	if (scsi_is_ahciem(sdev)) {
-		struct Scsi_Host *shost = sdev->host;
-		struct ahciem_enclosure *enc = (struct ahciem_enclosure *)&shost->hostdata[0];
-		struct ata_host *host = enc->host;
+		for (i = 0; i < components; i++) {
+			struct ses_component *tmp_scomp;
+			struct Scsi_Host *tmp_shost;
 
-		for (i = 0; i < host->n_ports; i++) {
-			struct ata_port *ap = host->ports[i];
-
-			if (!ap)
+			tmp_scomp = edev->component[i].scratch;
+			if (!tmp_scomp->addr)
 				continue;
+			tmp_shost = scsi_host_lookup(tmp_scomp->addr - 1);
+			shost_for_each_device(tmp_sdev, tmp_shost) {
+				struct device *tmp_dev = &tmp_sdev->sdev_gendev;
 
-			shost_for_each_device(tmp_sdev, ap->scsi_host) {
-				ses_match_to_enclosure(edev, tmp_sdev, 0);
+				if (enclosure_add_device(edev, i, tmp_dev) == 0)
+					kobject_uevent(&tmp_dev->kobj, KOBJ_CHANGE);
+				break; /* there is only one device */
 			}
+			scsi_host_put(tmp_shost);
 		}
 	} else {
 		shost_for_each_device(tmp_sdev, sdev->host) {
