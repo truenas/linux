@@ -841,8 +841,17 @@ static int ses_remove(struct device *dev)
 static void ses_intf_remove_component(struct scsi_device *sdev)
 {
 	struct enclosure_device *edev, *prev = NULL;
+	struct Scsi_Host *shost;
 
-	while ((edev = enclosure_find(&sdev->host->shost_gendev, prev)) != NULL) {
+	if (scsi_is_ahci(sdev)) {
+		struct ata_port *ap = ata_shost_to_port(sdev->host);
+		struct ahci_host_priv *hpriv = ap->host->private_data;
+
+		shost = hpriv->em_shost;
+	} else
+		shost = sdev->host;
+
+	while ((edev = enclosure_find(&shost->shost_gendev, prev)) != NULL) {
 		prev = edev;
 		if (!enclosure_remove_device(edev, &sdev->sdev_gendev))
 			break;
