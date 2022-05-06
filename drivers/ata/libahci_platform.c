@@ -24,6 +24,10 @@
 #include <linux/reset.h>
 #include "ahci.h"
 
+static int ahciem_enable = 1;
+module_param(ahciem_enable, int, 0644);
+MODULE_PARM_DESC(ahciem_enable, "Emulate SES enclosure (0 = disabled)");
+
 static void ahci_host_stop(struct ata_host *host);
 
 struct ata_port_operations ahci_platform_ops = {
@@ -659,7 +663,17 @@ int ahci_platform_init_host(struct platform_device *pdev,
 	ahci_init_controller(host);
 	ahci_print_info(host, "platform");
 
-	return ahci_host_activate(host, sht);
+	rc = ahci_host_activate(host, sht);
+	if (rc)
+		return rc;
+
+	if (ahciem_enable && (pi.flags & ATA_FLAG_EM)) {
+		rc = ahciem_host_activate(host);
+		if (rc)
+			return rc;
+	}
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(ahci_platform_init_host);
 
