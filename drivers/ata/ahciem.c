@@ -363,7 +363,7 @@ static void ahciem_setleds(struct ahciem_enclosure *enc, int slot)
 	struct ata_port *ap = enc->host->ports[slot];
 	u32 port_led_state, val;
 
-	if (!ap)
+	if (!ap->ops->transmit_led_message)
 		return;
 
 	val = 0;
