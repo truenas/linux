@@ -276,10 +276,6 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 		memcpy(rbuf + offset, args->enc->status[i], 4);
 
 		ap = host->ports[i];
-		if (!ap) {
-			rbuf[offset] |= ENCLOSURE_STATUS_NOT_INSTALLED;
-			continue;
-		}
 		link = &ap->link;
 		if (sata_pmp_attached(ap))
 			status = ENCLOSURE_STATUS_UNKNOWN;
@@ -343,10 +339,6 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 		rbuf[offset + 3] = 1 + i;	/* index */
 
 		ap = host->ports[i];
-		if (!ap) {
-			rbuf[offset] |= 0x80;	/* invalid */
-			continue;
-		}
 		if (sata_pmp_attached(ap))
 			rbuf[offset] |= 0x80;	/* invalid */
 
@@ -363,7 +355,7 @@ static void ahciem_setleds(struct ahciem_enclosure *enc, int slot)
 	struct ata_port *ap = enc->host->ports[slot];
 	u32 port_led_state, val;
 
-	if (!ap)
+	if (!ap->ops->transmit_led_message)
 		return;
 
 	val = 0;
@@ -435,6 +427,13 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 	struct ahciem_enclosure *enc = (struct ahciem_enclosure *)&shost->hostdata[0];
 	struct ahciem_args args = { .cmd = cmd, .enc = enc };
 	const u8 *cdb = cmd->cmnd;
+
+	if (unlikely(!cmd->cmd_len)) {
+		DPRINTK("bad CDB len=0 in %s\n", DRV_NAME);
+		cmd->result = DID_ERROR << 16;
+		cmd->scsi_done(cmd);
+		return 0;
+	}
 
 	/*
 	 * Commands required for SES devices by SPC:

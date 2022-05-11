@@ -24,9 +24,9 @@
 #include <linux/reset.h>
 #include "ahci.h"
 
-static int ahciem_enable = 1;
+static int ahciem_enable = -1;
 module_param(ahciem_enable, int, 0644);
-MODULE_PARM_DESC(ahciem_enable, "Emulate SES enclosure (0 = disabled)");
+MODULE_PARM_DESC(ahciem_enable, "Emulate SES enclosure (-1 = detected, 0 = disabled, 1 = forced)");
 
 static void ahci_host_stop(struct ata_host *host);
 
@@ -667,7 +667,8 @@ int ahci_platform_init_host(struct platform_device *pdev,
 	if (rc)
 		return rc;
 
-	if (ahciem_enable && (pi.flags & ATA_FLAG_EM)) {
+	if (ahciem_enable == 1 ||
+	    (ahciem_enable == -1 && (pi.flags & ATA_FLAG_EM))) {
 		rc = ahciem_host_activate(host);
 		if (rc)
 			return rc;
