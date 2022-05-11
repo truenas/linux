@@ -428,6 +428,13 @@ static int ahciem_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 	struct ahciem_args args = { .cmd = cmd, .enc = enc };
 	const u8 *cdb = cmd->cmnd;
 
+	if (unlikely(!cmd->cmd_len)) {
+		DPRINTK("bad CDB len=0 in %s\n", DRV_NAME);
+		cmd->result = DID_ERROR << 16;
+		cmd->scsi_done(cmd);
+		return 0;
+	}
+
 	/*
 	 * Commands required for SES devices by SPC:
 	 *  - INQUIRY
