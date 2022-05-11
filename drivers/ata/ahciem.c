@@ -276,10 +276,6 @@ static unsigned int ahciem_sesop_rxdx_2(struct ahciem_args *args, u8 *rbuf)
 		memcpy(rbuf + offset, args->enc->status[i], 4);
 
 		ap = host->ports[i];
-		if (!ap) {
-			rbuf[offset] |= ENCLOSURE_STATUS_NOT_INSTALLED;
-			continue;
-		}
 		link = &ap->link;
 		if (sata_pmp_attached(ap))
 			status = ENCLOSURE_STATUS_UNKNOWN;
@@ -343,10 +339,6 @@ static unsigned int ahciem_sesop_rxdx_a(struct ahciem_args *args, u8 *rbuf)
 		rbuf[offset + 3] = 1 + i;	/* index */
 
 		ap = host->ports[i];
-		if (!ap) {
-			rbuf[offset] |= 0x80;	/* invalid */
-			continue;
-		}
 		if (sata_pmp_attached(ap))
 			rbuf[offset] |= 0x80;	/* invalid */
 
