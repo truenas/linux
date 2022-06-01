@@ -335,7 +335,7 @@ static int plx_ntb_peer_mw_get_addr(struct ntb_dev *ntb, int idx, phys_addr_t *b
 	offset = 0;
 	if (idx == ndev->b2b_mw) {
 		/* User should not get non-shared B2B MW */
-		BUG_ON(ndev->b2b_off != 0);
+		BUG_ON(ndev->b2b_off == 0);
 		offset = ndev->b2b_off;
 	}
 	mw = &ndev->mw_info[idx];
