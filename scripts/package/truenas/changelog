@@ -1,3 +1,9 @@
+linux-5.10.119+truenas (5.10.119+truenas-1) sid; urgency=low
+
+  * Merge upstream v5.10.119
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Thu, 2 Jun 2022 12:00:00 -0500
+
 linux-5.10.109+truenas (5.10.109+truenas-1) sid; urgency=low
 
   * Merge upstream v5.10.109
