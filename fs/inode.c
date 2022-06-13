@@ -2160,11 +2160,21 @@ void inode_init_owner(struct user_namespace *mnt_userns, struct inode *inode,
 		      const struct inode *dir, umode_t mode)
 {
 	inode_fsuid_set(inode, mnt_userns);
-	if (dir && dir->i_mode & S_ISGID) {
+	/*
+	 * For compatibility purposes with data migrated from FreeBSD
+	 * (which will have NFSv4 ACL type), BSD file creation semantics
+	 * are forced rather than System V. Hence on new file creation
+	 * if NFSV4ACL we inherit GID from parent rather than take current
+	 * process GID. This makes S_ISGID on directories a de-facto
+	 * no-op, but we still honor setting / removing it and normal
+	 * inheritance of the bit on new directories in case user changes
+	 * the underlying ACL type.
+	 */
+	if (dir && ((dir->i_mode & S_ISGID) || IS_NFSV4ACL(inode))) {
 		inode->i_gid = dir->i_gid;
 
 		/* Directories are special, and always inherit S_ISGID */
-		if (S_ISDIR(mode))
+		if (S_ISDIR(mode) && (dir->i_mode & S_ISGID))
 			mode |= S_ISGID;
 		else if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP) &&
 			 !in_group_p(i_gid_into_mnt(mnt_userns, dir)) &&
