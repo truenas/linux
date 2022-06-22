@@ -669,7 +669,8 @@ static int ses_intf_add(struct device *cdev,
 			struct Scsi_Host *shost = hpriv->em_shost;
 
 			edev = enclosure_find(&shost->shost_gendev, NULL);
-			ses_match_to_enclosure(edev, sdev, 1);
+			if (edev)
+				ses_match_to_enclosure(edev, sdev, 1);
 		} else {
 			struct enclosure_device *prev = NULL;
 
