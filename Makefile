@@ -2,8 +2,12 @@
 VERSION = 6
 PATCHLEVEL = 12
 SUBLEVEL = 0
-EXTRAVERSION = -rc4
+EXTRAVERSION = -rc4$(EXVERSION)
 NAME = Baby Opossum Posse
+
+ifndef EXTRAVERSION
+EXTRAVERSION = -production
+endif
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
