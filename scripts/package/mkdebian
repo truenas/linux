@@ -8,7 +8,7 @@ set -e
 
 KERNELRELEASE="${KERNELRELEASE:=$(cat include/config/kernel.release)}"
 KDEB_SOURCENAME="${KDEB_SOURCENAME:="linux-$KERNELRELEASE"}"
-MAINTAINER="Andrew Walker <awalker@ixsystems.com>"
+MAINTAINER="iXsystems engineering team <dev@ixsystems.com>"
 MAKE="${MAKE:="/usr/bin/make"}"
 ARCH="${ARCH:="x86"}"
 
