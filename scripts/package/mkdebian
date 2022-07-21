@@ -141,6 +141,12 @@ fi
 # Some variables and settings used throughout the script
 version=$KERNELRELEASE
 echo "XXX: Kernel_release: ${version}"
+if echo "$version" | grep -q "debug"; then
+	exversion="debug"
+else
+	exversion="production"
+fi
+echo "XXX: Extra version: ${exversion}"
 if [ -n "$KDEB_PKGVERSION" ]; then
 	packageversion=$KDEB_PKGVERSION
 else
@@ -152,7 +158,7 @@ sourcename=${KDEB_SOURCENAME:-linux-$KERNELRELEASE}
 if [ "$ARCH" = "um" ] ; then
 	packagename=user-mode-linux
 else
-	packagename=linux-image-truenas-amd64
+	packagename=linux-image-truenas-$exversion-amd64
 fi
 
 debarch=
@@ -196,7 +202,7 @@ EOF
 if [ "${SRCARCH}" != um ]; then
 cat <<EOF >> debian/control
 
-Package: linux-truenas-libc-dev
+Package: linux-truenas-$exversion-libc-dev
 Section: devel
 Provides: linux-kernel-headers, linux-libc-dev
 Conflicts: linux-libc-dev
@@ -210,7 +216,7 @@ EOF
 if is_enabled CONFIG_MODULES; then
 cat <<EOF >> debian/control
 
-Package: linux-headers-truenas-$debarch
+Package: linux-headers-truenas-$exversion-$debarch
 Architecture: $debarch
 Provides: linux-headers-$debarch
 Description: Linux kernel headers for $version on $debarch
@@ -232,6 +238,13 @@ Description: Linux kernel debugging symbols for $version
  This package will come in handy if you need to debug the kernel. It provides
  all the necessary debug symbols for the kernel and its modules.
 EOF
+fi
+
+if [ ! -f debian/changelog ]; then
+	dch --no-conf -b --package $sourcename --newversion $version-1 \
+		--distribution sid --urgency low \
+		--changelog scripts/package/truenas/changelog \
+		--controlmaint Build TrueNAS $exverison kernel
 fi
 
 cat <<EOF > debian/rules.vars
