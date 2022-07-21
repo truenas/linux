@@ -108,10 +108,17 @@ deploy_libc_headers () {
 
 version=$KERNELRELEASE
 #version=${KERNELRELEASE}-amd64
+exversion=""
 echo "XXX: Kernel_release: ${version}"
+if echo "$version" | grep -q "debug"; then
+	exversion="debug"
+elif echo "$version" | grep -q "production"; then
+	exversion="production"
+fi
+echo "XXX: Extra version: ${exversion}"
 tmpdir=debian/linux-image
 dbg_dir=debian/linux-image-dbg
-packagename=linux-image-truenas-amd64
+packagename=linux-image-truenas-$exversion-amd64
 dbg_packagename=$packagename-dbg
 
 if [ "$ARCH" = "um" ] ; then
@@ -201,11 +208,11 @@ done
 if [ "$ARCH" != "um" ]; then
 	if is_enabled CONFIG_MODULES; then
 		deploy_kernel_headers debian/linux-headers
-		create_package linux-headers-truenas-amd64 debian/linux-headers
+		create_package linux-headers-truenas-$exversion-amd64 debian/linux-headers
 	fi
 
 	deploy_libc_headers debian/linux-libc-dev
-	create_package linux-truenas-libc-dev debian/linux-libc-dev
+	create_package linux-truenas-$exversion-libc-dev debian/linux-libc-dev
 fi
 
 create_package "$packagename" "$tmpdir"

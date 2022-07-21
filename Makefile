@@ -2,8 +2,11 @@
 VERSION = 5
 PATCHLEVEL = 15
 SUBLEVEL = 79
-EXTRAVERSION =
 NAME = Trick or Treat
+
+ifndef EXTRAVERSION
+EXTRAVERSION =
+endif
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
