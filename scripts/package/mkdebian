@@ -92,6 +92,16 @@ set_debarch() {
 
 # Some variables and settings used throughout the script
 version=$KERNELRELEASE
+
+exversion=""
+echo "XXX: Kernel_release: ${version}"
+if echo "$version" | grep -q "debug"; then
+	exversion="debug"
+elif echo "$version" | grep -q "production"; then
+	exversion="production"
+fi
+echo "XXX: Extra version: ${exversion}"
+
 if [ -n "$KDEB_PKGVERSION" ]; then
 	packageversion=$KDEB_PKGVERSION
 	revision=${packageversion##*-}
@@ -145,7 +155,7 @@ Rules-Requires-Root: no
 Build-Depends: bc, dwarves, rsync, kmod, cpio, bison, flex | flex:native $extra_build_depends
 Homepage: https://www.kernel.org/
 
-Package: $packagename-truenas-$debarch
+Package: $packagename-truenas-$exversion-$debarch
 Architecture: $debarch
 Provides: $packagename-$debarch, linux-image-generic
 Depends: kmod, linux-base (>= 4.3~), initramfs-tools (>= 0.120+deb8u2) | linux-initramfs-tools
@@ -153,7 +163,7 @@ Description: Linux kernel, version $version
  This package contains the Linux kernel, modules and corresponding other
  files, version: $version.
 
-Package: linux-truenas-libc-dev
+Package: linux-truenas-$exversion-libc-dev
 Section: devel
 Provides: linux-kernel-headers, linux-libc-dev
 Conflicts: linux-libc-dev
@@ -167,7 +177,7 @@ EOF
 if is_enabled CONFIG_MODULES; then
 cat <<EOF >> debian/control
 
-Package: linux-headers-truenas-$debarch
+Package: linux-headers-truenas-$exversion-$debarch
 Architecture: $debarch
 Provides: linux-headers-$debarch
 Description: Linux kernel headers for $version on $debarch
@@ -180,7 +190,7 @@ fi
 if is_enabled CONFIG_DEBUG_INFO; then
 cat <<EOF >> debian/control
 
-Package: linux-image-truenas-$debarch-dbg
+Package: linux-image-truenas-$exversion-$debarch-dbg
 Provides: linux-image-$debarch-dbg
 Section: debug
 Architecture: $debarch
@@ -213,6 +223,10 @@ clean:
 
 binary: binary-arch
 EOF
+
+if [ ! -f debian/changelog ]; then
+	dch --no-conf -b --package $sourcename --newversion $version-1 --distribution sid --urgency low --changelog scripts/package/truenas/changelog --controlmaint Build TrueNAS kernel
+fi
 
 chmod +x debian/rules
 mkdir -p debian/certs
