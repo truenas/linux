@@ -45,11 +45,11 @@ struct plx_ntb_mw_info {
 	int		mw_bar;
 	int		mw_64bit;
 	void __iomem	*mw_res;
-	unsigned long	mw_pbase;
-	unsigned long	mw_size;
+	dma_addr_t	mw_pbase;
+	resource_size_t	mw_size;
 	struct {
-		unsigned long mw_xlat_addr;
-		unsigned long mw_xlat_size;
+		dma_addr_t mw_xlat_addr;
+		resource_size_t mw_xlat_size;
 	} splits[PLX_MAX_SPLIT];
 };
 
@@ -443,7 +443,7 @@ static int plx_ntb_mw_set_trans_internal(struct ntb_dev *ntb, int idx)
 			val64 = (~(bsize - 1) & ~0xfffff);
 		val64 |= 0xc;
 		writel(val64, PEER_BASE(ndev) + PLX_MEM_BAR2_SETUP + (mw->mw_bar - 2) * 4);
-		writel(val64 >> 32, PEER_BASE(ndev) + PLX_MEM_BAR2_SETUP + (mw->mw_bar - 2) * 4);
+		writel(val64 >> 32, PEER_BASE(ndev) + PLX_MEM_BAR2_SETUP + (mw->mw_bar - 2) * 4 + 4);
 
 		val64 = 0x2000000000000000 * mw->mw_bar + off;
 		writel(val64, PEER_BASE(ndev) + PCIR_BAR(mw->mw_bar));
