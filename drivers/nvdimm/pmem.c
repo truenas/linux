@@ -45,6 +45,25 @@ static struct nd_region *to_region(struct pmem_device *pmem)
 	return to_nd_region(to_dev(pmem)->parent);
 }
 
+static int pmem_open(struct block_device *bdev, fmode_t mode)
+{
+	struct pmem_device *pmem = bdev->bd_disk->private_data;
+	struct pmem_label *label = pmem->label;
+
+	if (label && (mode & FMODE_WRITE))
+		label->opened++;
+	return 0;
+}
+
+static void pmem_release(struct gendisk *disk, fmode_t mode)
+{
+	struct pmem_device *pmem = disk->private_data;
+	struct pmem_label *label = pmem->label;
+
+	if (label && (mode & FMODE_WRITE))
+		label->opened--;
+}
+
 static phys_addr_t pmem_to_phys(struct pmem_device *pmem, phys_addr_t offset)
 {
 	return pmem->phys_addr + offset;
@@ -121,6 +140,26 @@ static blk_status_t pmem_clear_poison(struct pmem_device *pmem,
 	return BLK_STS_OK;
 }
 
+static void write_pmem2(void *pmem_addr, void *pmem_addr2, struct page *page,
+		unsigned int off, unsigned int len)
+{
+	unsigned int chunk;
+	void *mem;
+
+	while (len) {
+		mem = kmap_atomic(page);
+		chunk = min_t(unsigned int, len, PAGE_SIZE - off);
+		memcpy_flushcache(pmem_addr, mem + off, chunk);
+		memcpy(pmem_addr2, mem + off, chunk);
+		kunmap_atomic(mem);
+		len -= chunk;
+		off = 0;
+		page++;
+		pmem_addr += chunk;
+		pmem_addr2 += chunk;
+	}
+}
+
 static void write_pmem(void *pmem_addr, struct page *page,
 		unsigned int off, unsigned int len)
 {
@@ -183,6 +222,21 @@ static blk_status_t pmem_do_write(struct pmem_device *pmem,
 {
 	phys_addr_t pmem_off = to_offset(pmem, sector);
 	void *pmem_addr = pmem->virt_addr + pmem_off;
+	struct pmem_label *label = pmem->label;
+	struct pmem_label *rlabel = pmem->rlabel;
+	void *rpmem_addr = pmem->rvirt_addr;
+
+	if (label) {
+		if (unlikely(label->empty)) {
+			label->empty = 0;
+			if (rlabel)
+				rlabel->empty = 0;
+		}
+		if (!rpmem_addr && unlikely(!label->dirty)) {
+			label->dirty = 1;
+			arch_wb_cache_pmem(label, sizeof(struct pmem_label));
+		}
+	}
 
 	if (unlikely(is_bad_pmem(&pmem->bb, sector, len))) {
 		blk_status_t rc = pmem_clear_poison(pmem, pmem_off, len);
@@ -192,7 +246,11 @@ static blk_status_t pmem_do_write(struct pmem_device *pmem,
 	}
 
 	flush_dcache_page(page);
-	write_pmem(pmem_addr, page, page_off, len);
+	if (rpmem_addr) {
+		write_pmem2(pmem_addr, rpmem_addr + pmem_off, page, page_off,
+		    len);
+	} else
+		write_pmem(pmem_addr, page, page_off, len);
 
 	return BLK_STS_OK;
 }
@@ -309,6 +367,8 @@ __weak long __pmem_direct_access(struct pmem_device *pmem, pgoff_t pgoff,
 
 static const struct block_device_operations pmem_fops = {
 	.owner =		THIS_MODULE,
+	.open =			pmem_open,
+	.release =		pmem_release,
 	.submit_bio =		pmem_submit_bio,
 	.rw_page =		pmem_rw_page,
 };
@@ -393,6 +453,53 @@ static const struct dax_operations pmem_dax_ops = {
 	.recovery_write = pmem_recovery_write,
 };
 
+static ssize_t label_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct pmem_device *pmem = dev_to_disk(dev)->private_data;
+	struct pmem_label *label = pmem->label;
+
+	if (label) {
+		memcpy(buf, label, sizeof(*label));
+		return sizeof(*label);
+	}
+	return -ENXIO;
+}
+static DEVICE_ATTR_RO(label);
+
+static ssize_t uuid_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct pmem_device *pmem = dev_to_disk(dev)->private_data;
+	struct pmem_label *label = pmem->label;
+
+	if (label)
+		return sprintf(buf, "%016llX\n", label->array);
+	return -ENXIO;
+}
+static DEVICE_ATTR_RO(uuid);
+
+static struct attribute *label_attributes[] = {
+	&dev_attr_label.attr,
+	&dev_attr_uuid.attr,
+	NULL,
+};
+
+static umode_t label_visible(struct kobject *kobj, struct attribute *a, int n)
+{
+	struct device *dev = container_of(kobj, typeof(*dev), kobj);
+	struct pmem_device *pmem = dev_to_disk(dev)->private_data;
+
+	if (!pmem->label)
+		return 0;
+	return a->mode;
+}
+
+static const struct attribute_group label_attribute_group = {
+	.attrs		= label_attributes,
+	.is_visible	= label_visible,
+};
+
 static ssize_t write_cache_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -437,6 +544,7 @@ static const struct attribute_group dax_attribute_group = {
 };
 
 static const struct attribute_group *pmem_attribute_groups[] = {
+	&label_attribute_group,
 	&dax_attribute_group,
 	NULL,
 };
@@ -560,16 +668,26 @@ static int pmem_attach_disk(struct device *dev,
 	}
 	pmem->virt_addr = addr;
 
+	/* Register raw pmems for NTB mirroring. */
+	if (!is_nd_pfn(dev) && !is_nd_dax(dev) &&
+	    uuid_is_null((const uuid_t *)nd_dev_to_uuid(&ndns->dev))) {
+		pmem->bb.dev = dev;
+		ntb_pmem_register(pmem);
+	}
+
 	blk_queue_write_cache(q, true, fua);
 	blk_queue_physical_block_size(q, PAGE_SIZE);
 	blk_queue_logical_block_size(q, pmem_sector_size(ndns));
 	blk_queue_max_hw_sectors(q, UINT_MAX);
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, q);
-	if (pmem->pfn_flags & PFN_MAP)
+	/* Block DAX if we are registered for NTB mirroring. */
+	if ((pmem->pfn_flags & PFN_MAP) && !pmem->label)
 		blk_queue_flag_set(QUEUE_FLAG_DAX, q);
 
 	disk->fops		= &pmem_fops;
 	disk->private_data	= pmem;
+	disk->events		= DISK_EVENT_MEDIA_CHANGE;
+	disk->event_flags	= DISK_EVENT_FLAG_UEVENT;
 	nvdimm_namespace_disk_name(ndns, disk->disk_name);
 	set_capacity(disk, (pmem->size - pmem->pfn_pad - pmem->data_offset)
 			/ 512);
@@ -676,6 +794,10 @@ static void nd_pmem_remove(struct device *dev)
 	if (is_nd_btt(dev))
 		nvdimm_namespace_detach_btt(to_nd_btt(dev));
 	else {
+		/* Unregister from NTB mirroring. */
+		if (pmem->label)
+			ntb_pmem_unregister(pmem);
+
 		/*
 		 * Note, this assumes device_lock() context to not
 		 * race nd_pmem_notify()
