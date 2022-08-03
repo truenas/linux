@@ -44,12 +44,11 @@ static struct dentry *debugfs_dir;
 struct plx_ntb_mw_info {
 	int		mw_bar;
 	int		mw_64bit;
-	void __iomem	*mw_res;
-	unsigned long	mw_pbase;
-	unsigned long	mw_size;
+	dma_addr_t	mw_pbase;
+	resource_size_t	mw_size;
 	struct {
-		unsigned long mw_xlat_addr;
-		unsigned long mw_xlat_size;
+		dma_addr_t mw_xlat_addr;
+		resource_size_t mw_xlat_size;
 	} splits[PLX_MAX_SPLIT];
 };
 
@@ -81,6 +80,7 @@ struct plx_ntb_dev {
 	/* Parameters of window shared with peer config access in B2B mode. */
 	unsigned int b2b_mw;	/* Shared window number. */
 	u64 b2b_off;	/* Offset in shared window. */
+	void __iomem *b2b_mmio;
 };
 
 #define NTB_LNK_STA_SPEED_MASK	0x000F
@@ -140,7 +140,7 @@ struct plx_ntb_dev {
 #define PEER_BASE(n)			((n)->self_mmio + PLX_NTX_PEER_BASE(n))
 
 /* B2B NTx registers */
-#define B2B_BASE(n)			((n)->mw_info[(n)->b2b_mw].mw_res)
+#define B2B_BASE(n)			((n)->b2b_mmio)
 #define B2B_REG(n, reg)			(PLX_NTX_BASE(n) + (reg))
 
 #define PLX_PORT_BASE(p)		((p) << 12)
@@ -212,14 +212,6 @@ err_pci_enable:
 static void plx_ntb_deinit_pci(struct plx_ntb_dev *ndev)
 {
 	struct pci_dev *pdev = ndev->ntb.pdev;
-	struct plx_ntb_mw_info *mw;
-	int i;
-
-	for (i = 0; i < ndev->mw_count; i++) {
-		mw = &ndev->mw_info[i];
-		pcim_iounmap(pdev, mw->mw_res);
-	}
-	pcim_iounmap(pdev, ndev->self_mmio);
 
 	pci_clear_master(pdev);
 	pci_release_regions(pdev);
@@ -443,7 +435,7 @@ static int plx_ntb_mw_set_trans_internal(struct ntb_dev *ntb, int idx)
 			val64 = (~(bsize - 1) & ~0xfffff);
 		val64 |= 0xc;
 		writel(val64, PEER_BASE(ndev) + PLX_MEM_BAR2_SETUP + (mw->mw_bar - 2) * 4);
-		writel(val64 >> 32, PEER_BASE(ndev) + PLX_MEM_BAR2_SETUP + (mw->mw_bar - 2) * 4);
+		writel(val64 >> 32, PEER_BASE(ndev) + PLX_MEM_BAR2_SETUP + (mw->mw_bar - 2) * 4 + 4);
 
 		val64 = 0x2000000000000000 * mw->mw_bar + off;
 		writel(val64, PEER_BASE(ndev) + PCIR_BAR(mw->mw_bar));
@@ -678,9 +670,6 @@ static int plx_init_dev(struct ntb_dev *ntb)
 	for (i = 2; i <= 5; i++) {
 		mw = &ndev->mw_info[ndev->mw_count];
 		mw->mw_bar = i;
-		mw->mw_res = pcim_iomap(pdev, mw->mw_bar, 0);
-		if (!mw->mw_res)
-			continue;
 		mw->mw_pbase = pci_resource_start(pdev, mw->mw_bar);
 		mw->mw_size = pci_resource_len(pdev, mw->mw_bar);
 		ndev->mw_count++;
@@ -723,6 +712,14 @@ static int plx_init_dev(struct ntb_dev *ntb)
 			ndev->b2b_off = mw->mw_size / 2;
 		else
 			ndev->b2b_off = 0;
+
+		ndev->b2b_mmio = pcim_iomap(pdev, mw->mw_bar,
+		    mw->mw_size - ndev->b2b_off);
+		if (!ndev->b2b_mmio) {
+			dev_info(&pdev->dev, "Can't map B2B BAR.\n");
+			rc = -ENOMEM;
+			goto out;
+		}
 	}
 
 	/* Check the module parameter for user defined split value, default is 0 if
@@ -863,7 +860,7 @@ static int plx_ntb_peer_spad_write(struct ntb_dev *ntb, int pidx, int sidx, u32 
 	else
 		offset = ndev->pspad_off2 + (sidx - ndev->spad_cnt1) * 4;
 	if (ndev->b2b_mw >= 0)
-		writel(val, ndev->mw_info[ndev->b2b_mw].mw_res + offset);
+		writel(val, ndev->b2b_mmio + offset);
 	else
 		writel(val, ndev->self_mmio + offset);
 
@@ -883,7 +880,7 @@ static u32 plx_ntb_peer_spad_read(struct ntb_dev *ntb, int pidx, int sidx)
 	else
 		offset = ndev->pspad_off2 + (sidx - ndev->spad_cnt1) * 4;
 	if (ndev->b2b_mw >= 0)
-		return readl(ndev->mw_info[ndev->b2b_mw].mw_res + offset);
+		return readl(ndev->b2b_mmio + offset);
 	else
 		return readl(ndev->self_mmio + offset);
 }
