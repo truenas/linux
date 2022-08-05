@@ -342,6 +342,54 @@ static int blkdev_pr_clear(struct block_device *bdev,
 	return ops->pr_clear(bdev, c.key);
 }
 
+static int blkdev_pr_read_keys(struct block_device *bdev,
+		struct pr_read_keys __user *arg)
+{
+	const struct pr_ops *ops = bdev->bd_disk->fops->pr_ops;
+	u64 __user *ukeys;
+	u64 *keys;
+	u16 len;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (!ops || !ops->pr_read_keys)
+		return -EOPNOTSUPP;
+	if (get_user(ukeys, &arg->keys) || get_user(len, &arg->len))
+		return -EFAULT;
+	keys = kzalloc(len, GFP_KERNEL);
+	if (keys == NULL)
+		return -ENOMEM;
+	err = ops->pr_read_keys(bdev, keys, &len);
+	if (err == 0) {
+		unsigned long klen = len * sizeof(u64);
+		if (copy_to_user(ukeys, keys, klen) || put_user(len, &arg->len))
+			err = -EFAULT;
+	}
+	kfree(keys);
+	return err;
+}
+
+static int blkdev_pr_read_reservation(struct block_device *bdev,
+		struct pr_read_reservation __user *arg)
+{
+	const struct pr_ops *ops = bdev->bd_disk->fops->pr_ops;
+	u64 key;
+	enum pr_type type;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (!ops || !ops->pr_read_reservation)
+		return -EOPNOTSUPP;
+	err = ops->pr_read_reservation(bdev, &key, &type);
+	if (err == 0) {
+		if (put_user(key, &arg->key) || put_user(type, &arg->type))
+			err = -EFAULT;
+	}
+	return err;
+}
+
 static int blkdev_flushbuf(struct block_device *bdev, fmode_t mode,
 		unsigned cmd, unsigned long arg)
 {
@@ -539,6 +587,10 @@ static int blkdev_common_ioctl(struct block_device *bdev, fmode_t mode,
 		return blkdev_pr_preempt(bdev, argp, true);
 	case IOC_PR_CLEAR:
 		return blkdev_pr_clear(bdev, argp);
+	case IOC_PR_READ_KEYS:
+		return blkdev_pr_read_keys(bdev, argp);
+	case IOC_PR_READ_RESERVATION:
+		return blkdev_pr_read_reservation(bdev, argp);
 	default:
 		return -ENOIOCTLCMD;
 	}

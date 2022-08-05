@@ -1967,10 +1967,30 @@ static char nvme_pr_type(enum pr_type type)
 	default:
 		return 0;
 	}
-};
+}
+
+static enum pr_type nvme_pr_type_inv(char c)
+{
+	switch (c) {
+	case 1:
+		return PR_WRITE_EXCLUSIVE;
+	case 2:
+		return PR_EXCLUSIVE_ACCESS;
+	case 3:
+		return PR_WRITE_EXCLUSIVE_REG_ONLY;
+	case 4:
+		return PR_EXCLUSIVE_ACCESS_REG_ONLY;
+	case 5:
+		return PR_WRITE_EXCLUSIVE_ALL_REGS;
+	case 6:
+		return PR_EXCLUSIVE_ACCESS_ALL_REGS;
+	default:
+		return 0;
+	}
+}
 
 static int nvme_send_ns_head_pr_command(struct block_device *bdev,
-		struct nvme_command *c, u8 data[16])
+		struct nvme_command *c, u8 *data, u32 len)
 {
 	struct nvme_ns_head *head = bdev->bd_disk->private_data;
 	int srcu_idx = srcu_read_lock(&head->srcu);
@@ -1979,35 +1999,43 @@ static int nvme_send_ns_head_pr_command(struct block_device *bdev,
 
 	if (ns) {
 		c->common.nsid = cpu_to_le32(ns->head->ns_id);
-		ret = nvme_submit_sync_cmd(ns->queue, c, data, 16);
+		ret = nvme_submit_sync_cmd(ns->queue, c, data, len);
 	}
 	srcu_read_unlock(&head->srcu, srcu_idx);
 	return ret;
 }
 	
 static int nvme_send_ns_pr_command(struct nvme_ns *ns, struct nvme_command *c,
-		u8 data[16])
+		u8 *data, u32 len)
 {
 	c->common.nsid = cpu_to_le32(ns->head->ns_id);
-	return nvme_submit_sync_cmd(ns->queue, c, data, 16);
+	return nvme_submit_sync_cmd(ns->queue, c, data, len);
 }
 
-static int nvme_pr_command(struct block_device *bdev, u32 cdw10,
-				u64 key, u64 sa_key, u8 op)
+static int nvme_pr_command_impl(struct block_device *bdev, u8 *data, u32 len,
+		u32 cdw10, u8 op)
 {
 	struct nvme_command c = { };
-	u8 data[16] = { 0, };
-
-	put_unaligned_le64(key, &data[0]);
-	put_unaligned_le64(sa_key, &data[8]);
 
 	c.common.opcode = op;
 	c.common.cdw10 = cpu_to_le32(cdw10);
 
 	if (IS_ENABLED(CONFIG_NVME_MULTIPATH) &&
 	    bdev->bd_disk->fops == &nvme_ns_head_ops)
-		return nvme_send_ns_head_pr_command(bdev, &c, data);
-	return nvme_send_ns_pr_command(bdev->bd_disk->private_data, &c, data);
+		return nvme_send_ns_head_pr_command(bdev, &c, data, len);
+	return nvme_send_ns_pr_command(bdev->bd_disk->private_data, &c, data,
+			len);
+}
+
+static int nvme_pr_command(struct block_device *bdev, u32 cdw10,
+				u64 key, u64 sa_key, u8 op)
+{
+	u8 data[16] = { 0, };
+
+	put_unaligned_le64(key, &data[0]);
+	put_unaligned_le64(sa_key, &data[8]);
+
+	return nvme_pr_command_impl(bdev, data, sizeof(data), cdw10, op);
 }
 
 static int nvme_pr_register(struct block_device *bdev, u64 old,
@@ -2059,12 +2087,117 @@ static int nvme_pr_release(struct block_device *bdev, u64 key, enum pr_type type
 	return nvme_pr_command(bdev, cdw10, key, 0, nvme_cmd_resv_release);
 }
 
+struct nvme_regctl {
+	u16	cntlid;
+	u8	rcsts;
+	u8	reserved[3];
+	u64	hostid;
+	u64	rkey;
+} __packed;
+
+struct nvme_resv_report {
+	u32	gen;
+	u8	rtype;
+	u16	regctl;
+	u16	reserved;
+	u8	ptpls;
+	u8	reserved1[14];
+	struct nvme_regctl	regctls[0];
+} __packed;
+
+static int nvme_pr_resv_report(struct block_device *bdev,
+		struct nvme_resv_report **reportp)
+{
+	u8 data[8] = { 0, };
+	struct nvme_resv_report *report;
+	u32 len;
+	u16 regctl;
+	int i, ret;
+
+	ret = nvme_pr_command_impl(bdev, data, sizeof(data),
+			sizeof(data) / 4, nvme_cmd_resv_report);
+	if (ret)
+		return ret;
+
+	regctl = get_unaligned_le16(&data[5]);
+	len = sizeof(*report) + sizeof(report->regctls[0]) * regctl;
+	report = kzalloc(len, GFP_KERNEL);
+	if (report == NULL)
+		return -ENOMEM;
+
+	ret = nvme_pr_command_impl(bdev, (u8 *)report, len,
+			len / 4, nvme_cmd_resv_report);
+	if (ret) {
+		kfree(report);
+		return ret;
+	}
+
+	report->gen = le32_to_cpu(report->gen);
+	report->regctl = regctl = le16_to_cpu(report->regctl);
+	for (i = 0; i < regctl; i++) {
+		struct nvme_regctl *r = &report->regctls[i];
+
+		r->cntlid = le16_to_cpu(r->cntlid);
+		r->hostid = le64_to_cpu(r->hostid);
+		r->rkey = le64_to_cpu(r->rkey);
+	}
+	*reportp = report;
+
+	return ret;
+}
+
+static int nvme_pr_read_keys(struct block_device *bdev, u64 *keys, u16 *len)
+{
+	struct nvme_resv_report *report;
+	u16 nkeys;
+	int i, ret;
+
+	ret = nvme_pr_resv_report(bdev, &report);
+	if (ret)
+		return ret;
+
+	nkeys = min(*len, report->regctl);
+	for (i = 0; i < nkeys; i++)
+		keys[i] = report->regctls[i].rkey;
+	*len = report->regctl;
+
+	kfree(report);
+	return ret;
+}
+
+static int nvme_pr_read_reservation(struct block_device *bdev, u64 *key,
+		enum pr_type *type)
+{
+	struct nvme_resv_report *report;
+	int i, ret;
+
+	ret = nvme_pr_resv_report(bdev, &report);
+	if (ret)
+		return ret;
+
+	*key = 0;
+	*type = nvme_pr_type_inv(report->rtype);
+	for (i = 0; i < report->regctl; i++) {
+		struct nvme_regctl *r = &report->regctls[i];
+
+		if (r->rcsts & 1) {
+			*key = r->rkey;
+			break;
+		}
+	}
+
+	kfree(report);
+	return ret;
+}
+
 const struct pr_ops nvme_pr_ops = {
 	.pr_register	= nvme_pr_register,
 	.pr_reserve	= nvme_pr_reserve,
 	.pr_release	= nvme_pr_release,
 	.pr_preempt	= nvme_pr_preempt,
 	.pr_clear	= nvme_pr_clear,
+	.pr_read_keys	= nvme_pr_read_keys,
+	.pr_read_reservation	= nvme_pr_read_reservation,
 };
 
 #ifdef CONFIG_BLK_SED_OPAL

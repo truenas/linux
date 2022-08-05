@@ -14,6 +14,9 @@ struct pr_ops {
 	int (*pr_preempt)(struct block_device *bdev, u64 old_key, u64 new_key,
 			enum pr_type type, bool abort);
 	int (*pr_clear)(struct block_device *bdev, u64 key);
+	int (*pr_read_keys)(struct block_device *bdev, u64 *keys, u16 *len);
+	int (*pr_read_reservation)(struct block_device *bdev, u64 *key,
+			enum pr_type *type);
 };
 
 #endif /* LINUX_PR_H */
