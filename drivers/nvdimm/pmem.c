@@ -17,6 +17,8 @@
 #include <linux/moduleparam.h>
 #include <linux/badblocks.h>
 #include <linux/memremap.h>
+#include <linux/dma-mapping.h>
+#include <linux/dmaengine.h>
 #include <linux/vmalloc.h>
 #include <linux/blk-mq.h>
 #include <linux/pfn_t.h>
@@ -30,6 +32,24 @@
 #include "btt.h"
 #include "pfn.h"
 #include "nd.h"
+
+static unsigned int min_dma_size = 24 * 1024;
+module_param(min_dma_size, uint, 0644);
+MODULE_PARM_DESC(min_dma_size, "Minimal I/O size to use DMA");
+
+struct pmem_dma_tr {
+	struct pmem_device	*pmem;
+	struct bio		*bio;
+	struct device		*dma_dev1;	/* DMA for local PMEM */
+	struct device		*dma_dev2;	/* DMA for remote PMEM */
+	bool			 single;	/* No remote PMEM access */
+	bool			 do_acct;	/* Accounting needed */
+	unsigned long		 start;		/* Acoounting start time */
+	refcount_t		 inprog;	/* Number of active DMAs */
+	dma_addr_t		 laddr;		/* Local PMEM DMA address */
+	dma_addr_t		 raddr;		/* Remove PMEM DMA address */
+	dma_addr_t		 addr[];	/* BIO DMA addresses */
+};
 
 static struct device *to_dev(struct pmem_device *pmem)
 {
@@ -45,11 +65,352 @@ static struct nd_region *to_region(struct pmem_device *pmem)
 	return to_nd_region(to_dev(pmem)->parent);
 }
 
+static bool pmem_dma_feq(struct dma_chan *chan, void *data)
+{
+	return dev_to_node(chan->device->dev) == (long)data;
+}
+
+static bool pmem_dma_fne(struct dma_chan *chan, void *data)
+{
+	return dev_to_node(chan->device->dev) != (long)data;
+}
+
+static void pmem_dma_init(struct pmem_device *pmem)
+{
+	struct device *dev = to_dev(pmem);
+	dma_cap_mask_t dma_mask;
+
+	dma_cap_zero(dma_mask);
+	dma_cap_set(DMA_MEMCPY, dma_mask);
+
+	/*
+	 * Prefer to allocate NUMA-local DMA channel for remote PMEM writes.
+	 * Remote writes are slower than local and need all boost we can give.
+	 */
+	pmem->rdma_chan = dma_request_channel(dma_mask, pmem_dma_feq,
+	    (void *)(long)pmem->rnode);
+	if (!pmem->rdma_chan)
+		pmem->rdma_chan = dma_request_channel(dma_mask, NULL, NULL);
+	if (!pmem->rdma_chan) {
+		dev_info(dev, "Unable to allocate DMA channel\n");
+		return;
+	}
+
+	/*
+	 * If local PMEM is in different NUMA-node, try to allocate DMA there.
+	 * If it is in the same NUMA-node, then DMA allocation from some other
+	 * allows to avoid DMA engine bottleneck and shows better throughput.
+	 */
+	if (pmem->node != dev_to_node(pmem->rdma_chan->device->dev)) {
+		pmem->dma_chan = dma_request_channel(dma_mask, pmem_dma_feq,
+		    (void *)(long)pmem->node);
+	} else {
+		pmem->dma_chan = dma_request_channel(dma_mask, pmem_dma_fne,
+		    (void *)(long)dev_to_node(pmem->rdma_chan->device->dev));
+	}
+	if (!pmem->dma_chan)
+		pmem->dma_chan = dma_request_channel(dma_mask, NULL, NULL);
+	if (!pmem->dma_chan)
+		pmem->dma_chan = pmem->rdma_chan;
+
+	/*
+	 * After all the dances above, we may use remote PMEM DMA channel for
+	 * single destination copies if it is closer to the local PMEM.
+	 */
+	pmem->rdma_for_single =
+	    dev_to_node(pmem->dma_chan->device->dev) != pmem->node &&
+	    dev_to_node(pmem->rdma_chan->device->dev) == pmem->node;
+}
+
+static void pmem_dma_shutdown(struct pmem_device *pmem)
+{
+	if (pmem->dma_chan == NULL)
+		return;
+	dma_release_channel(pmem->dma_chan);
+	if (pmem->dma_chan != pmem->rdma_chan)
+		dma_release_channel(pmem->rdma_chan);
+	pmem->dma_chan = pmem->rdma_chan = NULL;
+}
+
+static void pmem_dma_unmap(struct pmem_dma_tr *tr)
+{
+	struct bio_vec bvec;
+	struct bvec_iter iter;
+	enum dma_data_direction dir;
+	unsigned int size = tr->bio->bi_iter.bi_size;
+	int i = 0;
+
+	/* Unmap local PMEM. */
+	dir = op_is_write(bio_op(tr->bio)) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+	if (dma_mapping_error(tr->dma_dev1, tr->laddr))
+		goto done;
+	dma_unmap_resource(tr->dma_dev1, tr->laddr, size, dir, 0);
+
+	if (!tr->single) {
+		/* Unmap remote PMEM. */
+		if (dma_mapping_error(tr->dma_dev2, tr->raddr))
+			goto done;
+		dma_unmap_resource(tr->dma_dev2, tr->raddr, size, dir, 0);
+	}
+
+	/* Unmap BIO data. */
+	dir = op_is_write(bio_op(tr->bio)) ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+	bio_for_each_bvec(bvec, tr->bio, iter) {
+		if (dma_mapping_error(tr->dma_dev1, tr->addr[i]))
+			break;
+		dma_unmap_page(tr->dma_dev1, tr->addr[i], bvec.bv_len, dir);
+		i++;
+		if (tr->single)
+			continue;
+		if (dma_mapping_error(tr->dma_dev2, tr->addr[i]))
+			break;
+		dma_unmap_page(tr->dma_dev2, tr->addr[i], bvec.bv_len, dir);
+		i++;
+	}
+done:
+	kfree(tr);
+}
+
+static void pmem_dma_callback(void *data, const struct dmaengine_result *result)
+{
+	struct pmem_dma_tr *tr = data;
+	struct bio *bio = tr->bio;
+	struct device *dev = to_dev(tr->pmem);
+
+	if (result->result != DMA_TRANS_NOERROR) {
+		dev_err(dev, "DMA error %x\n", result->result);
+		if (result->result == DMA_TRANS_ABORTED)
+			bio->bi_status = BLK_STS_TRANSPORT;
+		else
+			bio->bi_status = BLK_STS_IOERR;
+	}
+	if (refcount_dec_and_test(&tr->inprog)) {
+		if (tr->do_acct)
+			bio_end_io_acct(bio, tr->start);
+		pmem_dma_unmap(tr);
+		bio_endio(bio);
+	}
+}
+
+static bool pmem_dma_submit_bio(struct pmem_device *pmem, struct bio *bio,
+    bool do_acct, unsigned long start)
+{
+	struct device *dev = to_dev(pmem);
+	struct dma_chan	*dma_chan1, *dma_chan2;
+	struct dma_device *dma_dev1, *dma_dev2;
+	struct dma_async_tx_descriptor *tx;
+	dma_async_tx_callback_result cb;
+	enum dma_data_direction dir;
+	dma_cookie_t cookie, last_cookie1 = 0, last_cookie2 = 0;
+	struct pmem_dma_tr *tr;
+	phys_addr_t laddr, raddr;
+	struct bio_vec bvec;
+	struct bvec_iter iter;
+	unsigned long flags;
+	unsigned int dmas, i, vecs = 0;
+	sector_t sector;
+	static struct dmaengine_result dummy_result = {
+		.result = DMA_TRANS_ABORTED,
+		.residue = 0
+	};
+
+	/* For small I/Os softwate copy is faster. */
+	if (bio->bi_iter.bi_size < min_dma_size)
+		return false;
+
+	/* Choose DMA channels for local and remote PMEM accesses. */
+	laddr = pmem->phys_addr + pmem->data_offset;
+	raddr = op_is_write(bio_op(bio)) ? pmem->rphys_addr : 0;
+	if (raddr)
+		raddr += pmem->data_offset;
+	if (!raddr && pmem->rdma_for_single) {
+		dma_chan1 = pmem->rdma_chan;
+		dma_chan2 = pmem->dma_chan;
+	} else {
+		dma_chan1 = pmem->dma_chan;
+		dma_chan2 = pmem->rdma_chan;
+	}
+	if (dma_chan1 == NULL || dma_chan2 == NULL)
+		return false;
+
+	/* Check the addresses alignment fit DMA device(s) requirements. */
+	dma_dev1 = dma_chan1->device;
+	dma_dev2 = dma_chan2->device;
+	bio_for_each_bvec(bvec, bio, iter) {
+		if (!is_dma_copy_aligned(dma_dev1, bvec.bv_offset,
+		    laddr + iter.bi_sector * 512, bvec.bv_len))
+			return false;
+		if (raddr &&
+		    !is_dma_copy_aligned(dma_dev2, bvec.bv_offset,
+		    raddr + iter.bi_sector * 512, bvec.bv_len))
+			return false;
+		vecs++;
+	}
+
+	/* Collect information needed to complete BIO on DMA completion. */
+	dmas = raddr ? 2 : 1;
+	tr = kmalloc(offsetof(struct pmem_dma_tr, addr[vecs * dmas]),
+	    GFP_NOWAIT | __GFP_ZERO);
+	if (!tr) {
+		dev_warn(dev, "kmalloc() failed\n");
+		return false;
+	}
+	tr->pmem = pmem;
+	tr->bio = bio;
+	tr->single = !raddr;
+	tr->dma_dev1 = dma_dev1->dev;
+	tr->dma_dev2 = dma_dev2->dev;
+	refcount_set(&tr->inprog, dmas);
+	tr->do_acct = do_acct;
+	tr->start = start;
+
+	/* Map local PMEM for the first DMA device. */
+	sector = bio->bi_iter.bi_sector;
+	dir = op_is_write(bio_op(bio)) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+	tr->laddr = dma_map_resource(dma_dev1->dev,
+	    laddr + sector * 512, bio->bi_iter.bi_size, dir, 0);
+	if (dma_mapping_error(dma_dev1->dev, tr->laddr)) {
+		dev_warn(dev, "dma_map_page() 1 failed\n");
+		pmem_dma_unmap(tr);
+		return false;
+	}
+
+	if (raddr) {
+		/* Map remote PMEM for the second DMA device. */
+		tr->raddr = dma_map_resource(dma_dev2->dev,
+		    raddr + sector * 512, bio->bi_iter.bi_size, dir, 0);
+		if (dma_mapping_error(dma_dev2->dev, tr->raddr)) {
+			dev_warn(dev, "dma_map_page() 2 failed\n");
+			pmem_dma_unmap(tr);
+			return false;
+		}
+	}
+
+	/* Map BIO data for the DMA device(s). */
+	i = 0;
+	dir = op_is_write(bio_op(bio)) ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+	bio_for_each_bvec(bvec, bio, iter) {
+		tr->addr[i] = dma_map_page(dma_dev1->dev, bvec.bv_page,
+		    bvec.bv_offset, bvec.bv_len, dir);
+		if (dma_mapping_error(dma_dev1->dev, tr->addr[i])) {
+			dev_warn(dev, "dma_map_page() 3 failed\n");
+			pmem_dma_unmap(tr);
+			return false;
+		}
+		i++;
+		if (!raddr)
+			continue;
+		tr->addr[i] = dma_map_page(dma_dev2->dev, bvec.bv_page,
+		    bvec.bv_offset, bvec.bv_len, dir);
+		if (dma_mapping_error(dma_dev2->dev, tr->addr[i])) {
+			dev_warn(dev, "dma_map_page() 4 failed\n");
+			pmem_dma_unmap(tr);
+			return false;
+		}
+		i++;
+	}
+
+	/* Issue the local PMEM I/O. */
+	i = 0;
+	flags = DMA_CTRL_ACK;
+	cb = NULL;
+	bio_for_each_bvec(bvec, bio, iter) {
+		if (iter.bi_size == bvec.bv_len) {
+			flags |= DMA_PREP_INTERRUPT;
+			cb = pmem_dma_callback;
+		}
+		if (op_is_write(bio_op(bio))) {
+			tx = dmaengine_prep_dma_memcpy(dma_chan1,
+			    tr->laddr + (iter.bi_sector - sector) * 512,
+			    tr->addr[i], bvec.bv_len, flags);
+		} else {
+			tx = dmaengine_prep_dma_memcpy(dma_chan1, tr->addr[i],
+			    tr->laddr + (iter.bi_sector - sector) * 512,
+			    bvec.bv_len, flags);
+		}
+		if (!tx) {
+			dev_warn(dev, "dmaengine_prep_dma_memcpy() 1 failed\n");
+			goto error;
+		}
+		tx->callback_result = cb;
+		tx->callback_param = tr;
+		cookie = dmaengine_submit(tx);
+		if (dma_submit_error(cookie)) {
+			dev_warn(dev, "dmaengine_submit() 1 failed\n");
+			goto error;
+		}
+		last_cookie1 = cookie;
+		i += dmas;
+	}
+	dma_async_issue_pending(dma_chan1);
+
+	if (!raddr)
+		return true;
+
+	/* Issue the remote PMEM I/O. */
+	i = 1;
+	flags = DMA_CTRL_ACK;
+	cb = NULL;
+	bio_for_each_bvec(bvec, bio, iter) {
+		if (iter.bi_size == bvec.bv_len) {
+			flags |= DMA_PREP_INTERRUPT;
+			cb = pmem_dma_callback;
+		}
+		tx = dmaengine_prep_dma_memcpy(dma_chan2,
+		    tr->raddr + (iter.bi_sector - sector) * 512,
+		    tr->addr[i], bvec.bv_len, flags);
+		if (!tx) {
+			dev_warn(dev, "dmaengine_prep_dma_memcpy() 2 failed\n");
+			goto error2;
+		}
+		tx->callback_result = cb;
+		tx->callback_param = tr;
+		cookie = dmaengine_submit(tx);
+		if (dma_submit_error(cookie)) {
+			dev_warn(dev, "dmaengine_submit() 2 failed\n");
+			goto error2;
+		}
+		last_cookie2 = cookie;
+		i += 2;
+	}
+	dma_async_issue_pending(dma_chan2);
+	return true;
+
+error:
+	/*
+	 * Some error has happened during the local PMEM I/O issue.
+	 * Since none of issued transactions had callback, just wait for
+	 * them to complete, free memory and fall back to software copy.
+	 */
+	if (last_cookie1) {
+		dma_async_issue_pending(dma_chan1);
+		dma_sync_wait(dma_chan1, last_cookie1);
+	}
+	pmem_dma_unmap(tr);
+	return false;
+
+error2:
+	/*
+	 * Some error has happened during the remote PMEM I/O issue.
+	 * The local PMEM I/O is already running and we can't stop it.
+	 * Since none of issued remote transactions had callback, wait for
+	 * them to complete and return I/O error when local I/O completes.
+	 */
+	if (last_cookie2) {
+		dma_async_issue_pending(dma_chan2);
+		dma_sync_wait(dma_chan2, last_cookie2);
+	}
+	pmem_dma_callback(tr, &dummy_result);
+	return true;
+}
+
 static int pmem_open(struct block_device *bdev, fmode_t mode)
 {
 	struct pmem_device *pmem = bdev->bd_disk->private_data;
 	struct pmem_label *label = pmem->label;
 
+	if ((pmem->opened++) == 0)
+		pmem_dma_init(pmem);
 	if (label && (mode & FMODE_WRITE))
 		label->opened++;
 	return 0;
@@ -60,6 +421,8 @@ static void pmem_release(struct gendisk *disk, fmode_t mode)
 	struct pmem_device *pmem = disk->private_data;
 	struct pmem_label *label = pmem->label;
 
+	if ((--pmem->opened) == 0)
+		pmem_dma_shutdown(pmem);
 	if (label && (mode & FMODE_WRITE))
 		label->opened--;
 }
@@ -120,60 +483,38 @@ static blk_status_t pmem_clear_poison(struct pmem_device *pmem,
 static void write_pmem(void *pmem_addr, struct page *page,
 		unsigned int off, unsigned int len)
 {
-	unsigned int chunk;
 	void *mem;
 
-	while (len) {
-		mem = kmap_atomic(page);
-		chunk = min_t(unsigned int, len, PAGE_SIZE - off);
-		memcpy_flushcache(pmem_addr, mem + off, chunk);
-		kunmap_atomic(mem);
-		len -= chunk;
-		off = 0;
-		page++;
-		pmem_addr += chunk;
-	}
+	BUG_ON(off + len > PAGE_SIZE);
+	mem = kmap_local_page(page);
+	memcpy_flushcache(pmem_addr, mem + off, len);
+	kunmap_local(mem);
 }
 
 static void write_pmem2(void *pmem_addr, void *pmem_addr2, struct page *page,
 		unsigned int off, unsigned int len)
 {
-	unsigned int chunk;
 	void *mem;
 
-	while (len) {
-		mem = kmap_atomic(page);
-		chunk = min_t(unsigned int, len, PAGE_SIZE - off);
-		memcpy_flushcache(pmem_addr, mem + off, chunk);
-		memcpy(pmem_addr2, mem + off, chunk);
-		kunmap_atomic(mem);
-		len -= chunk;
-		off = 0;
-		page++;
-		pmem_addr += chunk;
-		pmem_addr2 += chunk;
-	}
+	BUG_ON(off + len > PAGE_SIZE);
+	mem = kmap_local_page(page);
+	memcpy_flushcache(pmem_addr, mem + off, len);
+	memcpy(pmem_addr2, mem + off, len);
+	kunmap_local(mem);
 }
 
 static blk_status_t read_pmem(struct page *page, unsigned int off,
 		void *pmem_addr, unsigned int len)
 {
-	unsigned int chunk;
 	unsigned long rem;
 	void *mem;
 
-	while (len) {
-		mem = kmap_atomic(page);
-		chunk = min_t(unsigned int, len, PAGE_SIZE - off);
-		rem = copy_mc_to_kernel(mem + off, pmem_addr, chunk);
-		kunmap_atomic(mem);
-		if (rem)
-			return BLK_STS_IOERR;
-		len -= chunk;
-		off = 0;
-		page++;
-		pmem_addr += chunk;
-	}
+	BUG_ON(off + len > PAGE_SIZE);
+	mem = kmap_local_page(page);
+	rem = copy_mc_to_kernel(mem + off, pmem_addr, len);
+	kunmap_local(mem);
+	if (rem)
+		return BLK_STS_IOERR;
 	return BLK_STS_OK;
 }
 
@@ -201,21 +542,7 @@ static blk_status_t pmem_do_write(struct pmem_device *pmem,
 	bool bad_pmem = false;
 	phys_addr_t pmem_off = sector * 512 + pmem->data_offset;
 	void *pmem_addr = pmem->virt_addr + pmem_off;
-	struct pmem_label *label = pmem->label;
-	struct pmem_label *rlabel = pmem->rlabel;
 	void *rpmem_addr = pmem->rvirt_addr;
-
-	if (label) {
-		if (unlikely(label->empty)) {
-			label->empty = 0;
-			if (rlabel)
-				rlabel->empty = 0;
-		}
-		if (!rpmem_addr && unlikely(!label->dirty)) {
-			label->dirty = 1;
-			arch_wb_cache_pmem(label, sizeof(struct pmem_label));
-		}
-	}
 
 	if (unlikely(is_bad_pmem(&pmem->bb, sector, len)))
 		bad_pmem = true;
@@ -258,6 +585,8 @@ static blk_qc_t pmem_submit_bio(struct bio *bio)
 	struct bvec_iter iter;
 	struct pmem_device *pmem = bio->bi_bdev->bd_disk->private_data;
 	struct nd_region *nd_region = to_region(pmem);
+	struct pmem_label *label = pmem->label;
+	struct pmem_label *rlabel = pmem->rlabel;
 
 	if (bio->bi_opf & REQ_PREFLUSH)
 		ret = nvdimm_flush(nd_region, bio);
@@ -265,6 +594,19 @@ static blk_qc_t pmem_submit_bio(struct bio *bio)
 	do_acct = blk_queue_io_stat(bio->bi_bdev->bd_disk->queue);
 	if (do_acct)
 		start = bio_start_io_acct(bio);
+	if (op_is_write(bio_op(bio)) && label) {
+		if (unlikely(label->empty)) {
+			label->empty = 0;
+			if (rlabel)
+				rlabel->empty = 0;
+		}
+		if (!rlabel && unlikely(!label->dirty)) {
+			label->dirty = 1;
+			arch_wb_cache_pmem(label, sizeof(struct pmem_label));
+		}
+	}
+	if (pmem_dma_submit_bio(pmem, bio, do_acct, start))
+		return BLK_QC_T_NONE;
 	bio_for_each_segment(bvec, bio, iter) {
 		if (op_is_write(bio_op(bio)))
 			rc = pmem_do_write(pmem, bvec.bv_page, bvec.bv_offset,
@@ -542,6 +884,7 @@ static int pmem_attach_disk(struct device *dev,
 		goto out;
 	}
 	pmem->virt_addr = addr;
+	pmem->rnode = pmem->node = dev_to_node(dev);
 
 	/* Register raw pmems for NTB mirroring. */
 	if (!is_nd_pfn(dev) && !is_nd_dax(dev) &&

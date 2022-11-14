@@ -6,6 +6,7 @@
 #include <linux/types.h>
 #include <linux/pfn_t.h>
 #include <linux/fs.h>
+#include <linux/dmaengine.h>
 
 #define PMEM_SIGN_SHORT	0x4e564430
 #define PMEM_SIGN_LONG	0x4e5644494d4d3030
@@ -50,7 +51,12 @@ struct pmem_device {
 	phys_addr_t		 rphys_addr;	/* Remote PMEM phys address */
 	uint8_t			*rvirt_addr;	/* Remote PMEM KVA address */
 	struct pmem_label	*rlabel;	/* Remote PMEM label */
+	int			 node;		/* Local PMEM NUMA node */
 	int			 rnode;		/* Remote PMEM (NTB) node */
+	int			 opened;	/* Number of device opens */
+	bool			 rdma_for_single; /* Prefer remote DMA */
+	struct dma_chan		*dma_chan;	/* Local PMEM DMA channel */
+	struct dma_chan		*rdma_chan;	/* Remote PMEM DMA channel */
 };
 
 long __pmem_direct_access(struct pmem_device *pmem, pgoff_t pgoff,
