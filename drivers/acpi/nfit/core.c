@@ -1915,7 +1915,7 @@ static int acpi_nfit_add_dimm(struct acpi_nfit_desc *acpi_desc,
 	 */
 	clear_bit(NVDIMM_FAMILY_INTEL, &nd_desc->dimm_family_mask);
 	for (i = 0; i <= NVDIMM_FAMILY_MAX; i++)
-		if (acpi_check_dsm(adev_dimm->handle, to_nfit_uuid(i), 1, 1)) {
+		if (acpi_check_dsm(adev_dimm->handle, to_nfit_uuid(i), 1, 0xfffffffe)) {
 			set_bit(i, &nd_desc->dimm_family_mask);
 			if (family < 0 || i == default_dsm_family)
 				family = i;
@@ -1972,8 +1972,17 @@ static int acpi_nfit_add_dimm(struct acpi_nfit_desc *acpi_desc,
 	else {
 		if (acpi_nvdimm_has_method(adev_dimm, "_LSI")
 				&& acpi_nvdimm_has_method(adev_dimm, "_LSR")) {
-			dev_dbg(dev, "%s: has _LSR\n", dev_name(&adev_dimm->dev));
-			set_bit(NFIT_MEM_LSR, &nfit_mem->flags);
+			union acpi_object *obj = acpi_label_info(adev_dimm->handle);
+			if (!obj || obj->type != ACPI_TYPE_BUFFER ||
+			    obj->buffer.length < 12 ||
+			    ((u32 *)obj->buffer.pointer)[0] != 0) {
+				dev_err(dev, "%s: has broken _LSI\n",
+				    dev_name(&adev_dimm->dev));
+			} else {
+				ACPI_FREE(obj);
+				dev_dbg(dev, "%s: has _LSR\n", dev_name(&adev_dimm->dev));
+				set_bit(NFIT_MEM_LSR, &nfit_mem->flags);
+			}
 		}
 
 		if (test_bit(NFIT_MEM_LSR, &nfit_mem->flags)
