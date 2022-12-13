@@ -1527,6 +1527,7 @@ static void ntb_transport_free(struct ntb_client *self, struct ntb_dev *ndev)
 			ntb_transport_free_queue(qp);
 		debugfs_remove_recursive(qp->debugfs_dir);
 	}
+	debugfs_remove_recursive(nt->debugfs_node_dir);
 
 	ntb_link_disable(ndev);
 	ntb_clear_ctx(ndev);
