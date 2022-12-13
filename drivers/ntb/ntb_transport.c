@@ -1512,6 +1512,8 @@ static void ntb_transport_free(struct ntb_client *self, struct ntb_dev *ndev)
 	u64 qp_bitmap_alloc;
 	int i;
 
+	ntb_bus_remove(nt);
+
 	ntb_transport_link_cleanup(nt);
 	cancel_work_sync(&nt->link_cleanup);
 	cancel_delayed_work_sync(&nt->link_work);
@@ -1528,8 +1530,6 @@ static void ntb_transport_free(struct ntb_client *self, struct ntb_dev *ndev)
 
 	ntb_link_disable(ndev);
 	ntb_clear_ctx(ndev);
-
-	ntb_bus_remove(nt);
 
 	for (i = nt->mw_count; i--; ) {
 		ntb_free_mw(nt, i);
