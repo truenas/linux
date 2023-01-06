@@ -311,7 +311,8 @@ int pciehp_check_link_status(struct controller *ctrl)
 
 	pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &lnk_status);
 	ctrl_dbg(ctrl, "%s: lnk_status = %x\n", __func__, lnk_status);
-	if ((lnk_status & PCI_EXP_LNKSTA_LT) ||
+	if (((lnk_status & PCI_EXP_LNKSTA_LT) &&
+	    !(lnk_status & PCI_EXP_LNKSTA_DLLLA)) ||
 	    !(lnk_status & PCI_EXP_LNKSTA_NLW)) {
 		ctrl_info(ctrl, "Slot(%s): Cannot train link: status %#06x\n",
 			  slot_name(ctrl), lnk_status);
