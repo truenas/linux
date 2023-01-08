@@ -19,6 +19,8 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#define BLURT pr_warn ("---> DEBUG: %s:%s:%d\n", __FILE__, __func__, __LINE__)
+
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/tty.h>
@@ -2632,13 +2634,19 @@ void console_unlock(void)
 	struct printk_record r;
 	u64 __maybe_unused next_seq;
 
+	pr_warn("---> DEBUG: %s is called, caller is %pS\n", __func__, __builtin_return_address(0));
+	BLURT;
+
 	if (console_suspended) {
 		up_console_sem();
 		return;
 	}
 
+	//BLURT;
+
 	prb_rec_init_rd(&r, &info, text, sizeof(text));
 
+	//BLURT;
 	/*
 	 * Console drivers are called with interrupts disabled, so
 	 * @console_may_schedule should be cleared before; however, we may
@@ -2657,6 +2665,7 @@ void console_unlock(void)
 again:
 	console_may_schedule = 0;
 
+	//BLURT;
 	/*
 	 * We released the console_sem lock, so we need to recheck if
 	 * cpu is online and (if not) is there at least one CON_ANYTIME
@@ -2667,12 +2676,12 @@ again:
 		up_console_sem();
 		return;
 	}
-
+	//BLURT;
 	for (;;) {
 		size_t ext_len = 0;
 		int handover;
 		size_t len;
-
+	//BLURT;
 skip:
 		if (!prb_read_valid(prb, console_seq, &r))
 			break;
@@ -2681,7 +2690,7 @@ skip:
 			console_dropped += r.info->seq - console_seq;
 			console_seq = r.info->seq;
 		}
-
+		//BLURT;
 		if (suppress_message_printing(r.info->level)) {
 			/*
 			 * Skip record we have buffered and already printed
@@ -2691,13 +2700,13 @@ skip:
 			console_seq++;
 			goto skip;
 		}
-
+		//BLURT;
 		/* Output to all consoles once old messages replayed. */
 		if (unlikely(exclusive_console &&
 			     console_seq >= exclusive_console_stop_seq)) {
 			exclusive_console = NULL;
 		}
-
+		//BLURT;
 		/*
 		 * Handle extended console text first because later
 		 * record_print_text() will modify the record buffer in-place.
@@ -2716,7 +2725,7 @@ skip:
 				console_msg_format & MSG_FORMAT_SYSLOG,
 				printk_time);
 		console_seq++;
-
+		//BLURT;
 		/*
 		 * While actively printing out messages, if another printk()
 		 * were to occur on another CPU, it may wait for this one to
@@ -2729,26 +2738,26 @@ skip:
 		 */
 		printk_safe_enter_irqsave(flags);
 		console_lock_spinning_enable();
-
+		//BLURT;
 		stop_critical_timings();	/* don't trace print latency */
 		call_console_drivers(ext_text, ext_len, text, len);
 		start_critical_timings();
-
+		//BLURT;
 		handover = console_lock_spinning_disable_and_check();
 		printk_safe_exit_irqrestore(flags);
 		if (handover)
 			return;
-
+		//BLURT;
 		if (do_cond_resched)
 			cond_resched();
 	}
 
 	/* Get consistent value of the next-to-be-used sequence number. */
 	next_seq = console_seq;
-
+	//BLURT;
 	console_locked = 0;
 	up_console_sem();
-
+	//BLURT;
 	/*
 	 * Someone could have filled up the buffer again, so re-check if there's
 	 * something to flush. In case we cannot trylock the console_sem again,
@@ -2758,6 +2767,7 @@ skip:
 	retry = prb_read_valid(prb, next_seq, NULL);
 	if (retry && console_trylock())
 		goto again;
+	//BLURT;
 }
 EXPORT_SYMBOL(console_unlock);
 
@@ -2953,6 +2963,8 @@ static int try_enable_new_console(struct console *newcon, bool user_specified)
  */
 void register_console(struct console *newcon)
 {
+	pr_warn("---> DEBUG: %s is called, caller is %pS\n", __func__, __builtin_return_address(0));
+
 	struct console *bcon = NULL;
 	int err;
 
@@ -2961,7 +2973,7 @@ void register_console(struct console *newcon)
 					 bcon->name, bcon->index))
 			return;
 	}
-
+	BLURT;
 	/*
 	 * before we register a new CON_BOOT console, make sure we don't
 	 * already have a valid console
@@ -2975,13 +2987,15 @@ void register_console(struct console *newcon)
 			}
 		}
 	}
+	BLURT;
 
 	if (console_drivers && console_drivers->flags & CON_BOOT)
 		bcon = console_drivers;
+	BLURT;
 
 	if (!has_preferred_console || bcon || !console_drivers)
 		has_preferred_console = preferred_console >= 0;
-
+	BLURT;
 	/*
 	 *	See if we want to use this console driver. If we
 	 *	didn't select a console we take the first one
@@ -2999,18 +3013,18 @@ void register_console(struct console *newcon)
 			}
 		}
 	}
-
+	BLURT;
 	/* See if this console matches one we selected on the command line */
 	err = try_enable_new_console(newcon, true);
-
+	BLURT;
 	/* If not, try to match against the platform default(s) */
 	if (err == -ENOENT)
 		err = try_enable_new_console(newcon, false);
-
+	BLURT;
 	/* printk() messages are not printed to the Braille console. */
 	if (err || newcon->flags & CON_BRL)
 		return;
-
+	BLURT;
 	/*
 	 * If we have a bootconsole, and are switching to a real console,
 	 * don't print everything out again, since when the boot console, and
@@ -3019,28 +3033,35 @@ void register_console(struct console *newcon)
 	 */
 	if (bcon && ((newcon->flags & (CON_CONSDEV | CON_BOOT)) == CON_CONSDEV))
 		newcon->flags &= ~CON_PRINTBUFFER;
-
+	BLURT;
 	/*
 	 *	Put this console in the list - keep the
 	 *	preferred driver at the head of the list.
 	 */
 	console_lock();
+	BLURT;
 	if ((newcon->flags & CON_CONSDEV) || console_drivers == NULL) {
+		BLURT;
 		newcon->next = console_drivers;
 		console_drivers = newcon;
 		if (newcon->next)
 			newcon->next->flags &= ~CON_CONSDEV;
 		/* Ensure this flag is always set for the head of the list */
 		newcon->flags |= CON_CONSDEV;
+		BLURT;
 	} else {
+		BLURT;
 		newcon->next = console_drivers->next;
 		console_drivers->next = newcon;
 	}
+	BLURT;
 
 	if (newcon->flags & CON_EXTENDED)
 		nr_ext_console_drivers++;
+	BLURT;
 
 	if (newcon->flags & CON_PRINTBUFFER) {
+		BLURT;
 		/*
 		 * console_unlock(); will print out the buffered messages
 		 * for us.
@@ -3055,15 +3076,20 @@ void register_console(struct console *newcon)
 		 */
 		exclusive_console = newcon;
 		exclusive_console_stop_seq = console_seq;
+		BLURT;
 
 		/* Get a consistent copy of @syslog_seq. */
 		mutex_lock(&syslog_lock);
+		BLURT;
 		console_seq = syslog_seq;
 		mutex_unlock(&syslog_lock);
+		BLURT;
 	}
+	BLURT;
 	console_unlock();
+	BLURT;
 	console_sysfs_notify();
-
+	BLURT;
 	/*
 	 * By unregistering the bootconsoles after we enable the real console
 	 * we get the "console xxx enabled" message on all the consoles -
