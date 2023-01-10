@@ -21,6 +21,8 @@
 
 #define BLURT pr_warn ("---> DEBUG: %s:%s:%d\n", __FILE__, __func__, __LINE__)
 
+int x = 0;
+
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/tty.h>
@@ -2634,19 +2636,24 @@ void console_unlock(void)
 	struct printk_record r;
 	u64 __maybe_unused next_seq;
 
-	pr_warn("---> DEBUG: %s is called, caller is %pS\n", __func__, __builtin_return_address(0));
-	BLURT;
+	if (x) {
+		pr_warn("---> DEBUG: %s is called, caller is %pS\n", __func__, __builtin_return_address(0));
+		BLURT;
+	}
 
 	if (console_suspended) {
 		up_console_sem();
+		x = 0;
 		return;
 	}
 
-	//BLURT;
+	if (x)
+		BLURT;
 
 	prb_rec_init_rd(&r, &info, text, sizeof(text));
 
-	//BLURT;
+	if (x)
+		BLURT;
 	/*
 	 * Console drivers are called with interrupts disabled, so
 	 * @console_may_schedule should be cleared before; however, we may
@@ -2674,6 +2681,7 @@ again:
 	if (!can_use_console()) {
 		console_locked = 0;
 		up_console_sem();
+		x = 0;
 		return;
 	}
 	//BLURT;
@@ -2745,8 +2753,10 @@ skip:
 		//BLURT;
 		handover = console_lock_spinning_disable_and_check();
 		printk_safe_exit_irqrestore(flags);
-		if (handover)
+		if (handover) {
+			x = 0;
 			return;
+		}
 		//BLURT;
 		if (do_cond_resched)
 			cond_resched();
@@ -2768,6 +2778,7 @@ skip:
 	if (retry && console_trylock())
 		goto again;
 	//BLURT;
+	x = 0;
 }
 EXPORT_SYMBOL(console_unlock);
 
@@ -2964,6 +2975,12 @@ static int try_enable_new_console(struct console *newcon, bool user_specified)
 void register_console(struct console *newcon)
 {
 	pr_warn("---> DEBUG: %s is called, caller is %pS\n", __func__, __builtin_return_address(0));
+
+	if(strcmp(newcon->name, "ttyS") == 0)
+	{
+		pr_warn("---> DEBUG: serial console is being registered!");
+		x = 1;
+	}
 
 	struct console *bcon = NULL;
 	int err;
