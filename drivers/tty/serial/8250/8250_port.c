@@ -3336,6 +3336,8 @@ static void serial8250_console_restore(struct uart_8250_port *up)
 	serial8250_out_MCR(up, up->mcr | UART_MCR_DTR | UART_MCR_RTS);
 }
 
+unsigned int sr_ier, sr_iir, sr_lcr, sr_mcr, sr_lsr, sr_msr, sr_scr, sr_dl, org_ier;
+unsigned long long c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12;
 /*
  *	Print a string to the serial port trying not to disturb
  *	any possible real use of the port...
@@ -3353,51 +3355,109 @@ void serial8250_console_write(struct uart_8250_port *up, const char *s,
 	unsigned long flags;
 	unsigned int ier;
 	int locked = 1;
+	static int first = 1;
+	unsigned long long t1;
 
+	if (first)
+		t1 = rdtsc_ordered();
 	touch_nmi_watchdog();
+	if (first)
+		c1 = rdtsc_ordered() - t1;
 
+	if (first)
+		t1 = rdtsc_ordered();
 	if (oops_in_progress)
 		locked = spin_trylock_irqsave(&port->lock, flags);
 	else
 		spin_lock_irqsave(&port->lock, flags);
+	if (first)
+		c2 = rdtsc_ordered() - t1;
 
 	/*
 	 *	First save the IER then disable the interrupts
 	 */
+	if (first)
+		t1 = rdtsc_ordered();
 	ier = serial_port_in(port, UART_IER);
+	if (first)
+		c3 = rdtsc_ordered() - t1;
 
+	if (first)
+		t1 = rdtsc_ordered();
 	if (up->capabilities & UART_CAP_UUE)
 		serial_port_out(port, UART_IER, UART_IER_UUE);
 	else
 		serial_port_out(port, UART_IER, 0);
+	if (first)
+		c4 = rdtsc_ordered() - t1;
 
 	/* check scratch reg to see if port powered off during system sleep */
+	if (first)
+		t1 = rdtsc_ordered();
 	if (up->canary && (up->canary != serial_port_in(port, UART_SCR))) {
 		serial8250_console_restore(up);
 		up->canary = 0;
 	}
+	if (first)
+		c5 = rdtsc_ordered() - t1;
 
+	if (first)
+		t1 = rdtsc_ordered();
 	if (em485) {
 		if (em485->tx_stopped)
 			up->rs485_start_tx(up);
 		mdelay(port->rs485.delay_rts_before_send);
 	}
+	if (first)
+		c6 = rdtsc_ordered() - t1;
 
+	if(first) {
+		t1 = rdtsc_ordered();
+		sr_ier = serial_port_in(port, UART_IER);
+		sr_iir = serial_port_in(port, UART_IIR);
+		sr_lcr = serial_port_in(port, UART_LCR);
+		sr_mcr = serial_port_in(port, UART_MCR);
+		sr_lsr = serial_port_in(port, UART_LSR);
+		sr_msr = serial_port_in(port, UART_MSR);
+		sr_scr = serial_port_in(port, UART_SCR);
+		org_ier = ier;
+		serial_port_out(port, UART_LCR, sr_lcr | UART_LCR_DLAB);
+		sr_dl = up->dl_read(up);
+		serial_port_out(port, UART_LCR, sr_lcr);
+		c7 = rdtsc_ordered() - t1;
+	}
+
+	if (first)
+		t1 = rdtsc_ordered();
 	uart_console_write(port, s, count, serial8250_console_putchar);
+	if (first)
+		c8 = rdtsc_ordered() - t1;
 
 	/*
 	 *	Finally, wait for transmitter to become empty
 	 *	and restore the IER
 	 */
+	if (first)
+		t1 = rdtsc_ordered();
 	wait_for_xmitr(up, BOTH_EMPTY);
+	if (first)
+		c9 = rdtsc_ordered() - t1;
 
+	if (first)
+		t1 = rdtsc_ordered();
 	if (em485) {
 		mdelay(port->rs485.delay_rts_after_send);
 		if (em485->tx_stopped)
 			up->rs485_stop_tx(up);
 	}
+	if (first)
+		c10 = rdtsc_ordered() - t1;
 
+	if (first)
+		t1 = rdtsc_ordered();
 	serial_port_out(port, UART_IER, ier);
+	if (first)
+		c11 = rdtsc_ordered() - t1;
 
 	/*
 	 *	The receive handling will happen properly because the
@@ -3406,11 +3466,17 @@ void serial8250_console_write(struct uart_8250_port *up, const char *s,
 	 *	call it if we have saved something in the saved flags
 	 *	while processing with interrupts off.
 	 */
+	if (first)
+		t1 = rdtsc_ordered();
 	if (up->msr_saved_flags)
 		serial8250_modem_status(up);
 
 	if (locked)
 		spin_unlock_irqrestore(&port->lock, flags);
+	if (first)
+		c12 = rdtsc_ordered() - t1;
+
+	first = 0;
 }
 
 static unsigned int probe_baud(struct uart_port *port)

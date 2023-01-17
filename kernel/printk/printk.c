@@ -47,6 +47,7 @@
 #include <linux/sched/clock.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/task_stack.h>
+#include <linux/serial_8250.h>
 
 #include <linux/uaccess.h>
 #include <asm/sections.h>
@@ -2932,6 +2933,8 @@ static int try_enable_new_console(struct console *newcon, bool user_specified)
 	return -ENOENT;
 }
 
+extern unsigned int sr_ier, sr_iir, sr_lcr, sr_mcr, sr_lsr, sr_msr, sr_scr, sr_dl, org_ier;
+extern unsigned long long c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12;
 /*
  * The console driver calls this routine during kernel initialization
  * to register the console printing procedure with printk() and to
@@ -3074,6 +3077,54 @@ void register_console(struct console *newcon)
 	pr_info("%sconsole [%s%d] enabled\n",
 		(newcon->flags & CON_BOOT) ? "boot" : "" ,
 		newcon->name, newcon->index);
+
+	if(strcmp(newcon->name, "ttyS") == 0)
+	{
+		unsigned int lcr = 0;
+		int dl;
+		struct uart_8250_port *up = serial8250_get_port(newcon->index);
+		pr_warn("---> DEBUG: serial console is registered!");
+		pr_warn("---> DEBUG: serial port iobase: 0x%lx", up->port.iobase);
+		pr_warn("---> DEBUG: Dumping serial port registers (Previous state, preserved just before first serial write):");
+		pr_warn("        ORG_IER: 0x%x", org_ier);
+		pr_warn("            IER: 0x%x", sr_ier);
+		pr_warn("            IIR: 0x%x", sr_iir);
+		pr_warn("            LCR: 0x%x", sr_lcr);
+		pr_warn("            MCR: 0x%x", sr_mcr);
+		pr_warn("            LSR: 0x%x", sr_lsr);
+		pr_warn("            MSR: 0x%x", sr_msr);
+		pr_warn("            SCR: 0x%x", sr_scr);
+		pr_warn("  Divisor Latch: 0x%x", sr_dl);
+
+		pr_warn("---> DEBUG: Dumping serial port registers (Current state, reading the registers now):");
+		pr_warn("            IER: 0x%x", up->port.serial_in(&up->port, UART_IER));
+		pr_warn("            IIR: 0x%x", up->port.serial_in(&up->port, UART_IIR));
+		pr_warn("            LCR: 0x%x", up->port.serial_in(&up->port, UART_LCR));
+		pr_warn("            MCR: 0x%x", up->port.serial_in(&up->port, UART_MCR));
+		pr_warn("            LSR: 0x%x", up->port.serial_in(&up->port, UART_LSR));
+		pr_warn("            MSR: 0x%x", up->port.serial_in(&up->port, UART_MSR));
+		pr_warn("            SCR: 0x%x", up->port.serial_in(&up->port, UART_SCR));
+		lcr = up->port.serial_in(&up->port, UART_LCR);
+		up->port.serial_out(&up->port, UART_LCR, lcr | UART_LCR_DLAB);
+		dl = up->dl_read(up);
+		up->port.serial_out(&up->port, UART_LCR, lcr);
+		pr_warn("  Divisor Latch: 0x%x", dl);
+
+		pr_warn("Now dumping the cpu cycles taken by all ops in serial8250_console_write");
+		pr_warn("    CPU Cycles taken by C1:  0x%llx", c1);
+		pr_warn("    CPU Cycles taken by C2:  0x%llx", c2);
+		pr_warn("    CPU Cycles taken by C3:  0x%llx", c3);
+		pr_warn("    CPU Cycles taken by C4:  0x%llx", c4);
+		pr_warn("    CPU Cycles taken by C5:  0x%llx", c5);
+		pr_warn("    CPU Cycles taken by C6:  0x%llx", c6);
+		pr_warn("    CPU Cycles taken by C7:  0x%llx", c7);
+		pr_warn("    CPU Cycles taken by C8:  0x%llx", c8);
+		pr_warn("    CPU Cycles taken by C9:  0x%llx", c9);
+		pr_warn("    CPU Cycles taken by C10: 0x%llx", c10);
+		pr_warn("    CPU Cycles taken by C11: 0x%llx", c11);
+		pr_warn("    CPU Cycles taken by C12: 0x%llx", c12);
+	}
+
 	if (bcon &&
 	    ((newcon->flags & (CON_CONSDEV | CON_BOOT)) == CON_CONSDEV) &&
 	    !keep_bootcon) {
