@@ -3439,7 +3439,7 @@ void serial8250_console_write(struct uart_8250_port *up, const char *s,
 	 */
 	if (first)
 		t1 = rdtsc_ordered();
-	wait_for_xmitr(up, BOTH_EMPTY);
+	//wait_for_xmitr(up, BOTH_EMPTY);
 	if (first)
 		c9 = rdtsc_ordered() - t1;
 
