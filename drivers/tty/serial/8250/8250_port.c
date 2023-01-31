@@ -2067,6 +2067,10 @@ static void serial8250_break_ctl(struct uart_port *port, int break_state)
 static void wait_for_xmitr(struct uart_8250_port *up, int bits)
 {
 	unsigned int status, tmout = 10000;
+	static int giveup = 0;
+
+	if (giveup == 5)
+		return;
 
 	/* Wait up to 10ms for the character(s) to be sent. */
 	for (;;) {
@@ -2081,6 +2085,11 @@ static void wait_for_xmitr(struct uart_8250_port *up, int bits)
 		udelay(1);
 		touch_nmi_watchdog();
 	}
+
+	if (tmout == 0)
+		++giveup;
+	else
+		giveup = 0;
 
 	/* Wait up to 1s for flow control if necessary */
 	if (up->port.flags & UPF_CONS_FLOW) {
