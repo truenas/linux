@@ -2611,6 +2611,7 @@ int uart_register_driver(struct uart_driver *drv)
 	normal->type		= TTY_DRIVER_TYPE_SERIAL;
 	normal->subtype		= SERIAL_TYPE_NORMAL;
 	normal->init_termios	= tty_std_termios;
+	normal->init_termios.c_iflag &= ~(IXON | IXOFF | IXANY);
 	normal->init_termios.c_cflag = B9600 | CS8 | CREAD | HUPCL | CLOCAL;
 	normal->init_termios.c_ispeed = normal->init_termios.c_ospeed = 9600;
 	normal->driver_state    = drv;
