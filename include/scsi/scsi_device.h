@@ -207,6 +207,7 @@ struct scsi_device {
 					 * creation time */
 	unsigned ignore_media_change:1; /* Ignore MEDIA CHANGE on resume */
 	unsigned silence_suspend:1;	/* Do not print runtime PM related messages */
+	unsigned genhd_hidden:1;	/* Set GENHD_FL_HIDDEN flag when creating gendisk */
 
 	bool offline_already;		/* Device offline message logged */
 
