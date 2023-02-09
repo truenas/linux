@@ -1051,6 +1051,12 @@ static int iscsi_sw_tcp_slave_configure(struct scsi_device *sdev)
 	struct iscsi_session *session = tcp_sw_host->session;
 	struct iscsi_conn *conn = session->leadconn;
 
+	if (conn && conn->persistent_address) {
+		if ((strcmp(conn->persistent_address, "169.254.10.1") == 0) ||
+		    (strcmp(conn->persistent_address, "169.254.10.2") == 0))
+			sdev->genhd_hidden = 1;
+	}
+
 	if (conn->datadgst_en)
 		blk_queue_flag_set(QUEUE_FLAG_STABLE_WRITES,
 				   sdev->request_queue);
