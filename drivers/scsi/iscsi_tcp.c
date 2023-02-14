@@ -63,6 +63,13 @@ module_param_named(debug_iscsi_tcp, iscsi_sw_tcp_dbg, int,
 MODULE_PARM_DESC(debug_iscsi_tcp, "Turn on debugging for iscsi_tcp module "
 		 "Set to 1 to turn on, and zero to turn off. Default is off.");
 
+#ifdef CONFIG_TRUENAS
+static char *iscsi_genhd_hidden_ips;
+module_param_named(genhd_hidden_ips, iscsi_genhd_hidden_ips, charp, 0644);
+MODULE_PARM_DESC(genhd_hidden_ips, "Comma separated list of IP addresses from "
+		 "which logged in targets should be hidden.");
+#endif
+
 #define ISCSI_SW_TCP_DBG(_conn, dbg_fmt, arg...)		\
 	do {							\
 		if (iscsi_sw_tcp_dbg)				\
@@ -1063,6 +1070,31 @@ static int iscsi_sw_tcp_device_configure(struct scsi_device *sdev,
 	struct iscsi_sw_tcp_host *tcp_sw_host = iscsi_host_priv(sdev->host);
 	struct iscsi_session *session = tcp_sw_host->session;
 	struct iscsi_conn *conn = session->leadconn;
+
+#ifdef CONFIG_TRUENAS
+	if (conn && conn->persistent_address && iscsi_genhd_hidden_ips) {
+		char *str;
+
+		str = kstrdup(iscsi_genhd_hidden_ips, GFP_KERNEL);
+		if (str) {
+			char *tok, *sep=str;
+
+			while ((tok = strsep(&sep, ",")) != NULL) {
+
+				/* Be tolerant of leading/trailing whitespace */
+				tok = strim(tok);
+				if (strcmp(conn->persistent_address, tok) == 0) {
+					sdev->genhd_hidden = 1;
+					break;
+				}
+			}
+			kfree(str);
+		} else {
+			iscsi_conn_printk(KERN_ERR, conn,
+					  "Memory allocation failed; could not check genhd_hidden\n");
+		}
+	}
+#endif
 
 	if (conn->datadgst_en)
 		lim->features |= BLK_FEAT_STABLE_WRITES;
