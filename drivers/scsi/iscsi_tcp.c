@@ -62,6 +62,11 @@ module_param_named(debug_iscsi_tcp, iscsi_sw_tcp_dbg, int,
 MODULE_PARM_DESC(debug_iscsi_tcp, "Turn on debugging for iscsi_tcp module "
 		 "Set to 1 to turn on, and zero to turn off. Default is off.");
 
+#ifdef CONFIG_TRUENAS
+#define HA_PRIVATE_CHANNEL_CONTROLLER_A_IP "169.254.10.1"
+#define HA_PRIVATE_CHANNEL_CONTROLLER_B_IP "169.254.10.2"
+#endif
+
 #define ISCSI_SW_TCP_DBG(_conn, dbg_fmt, arg...)		\
 	do {							\
 		if (iscsi_sw_tcp_dbg)				\
@@ -1050,6 +1055,14 @@ static int iscsi_sw_tcp_slave_configure(struct scsi_device *sdev)
 	struct iscsi_sw_tcp_host *tcp_sw_host = iscsi_host_priv(sdev->host);
 	struct iscsi_session *session = tcp_sw_host->session;
 	struct iscsi_conn *conn = session->leadconn;
+
+#ifdef CONFIG_TRUENAS
+	if (conn && conn->persistent_address) {
+		if ((strcmp(conn->persistent_address, HA_PRIVATE_CHANNEL_CONTROLLER_A_IP) == 0) ||
+		    (strcmp(conn->persistent_address, HA_PRIVATE_CHANNEL_CONTROLLER_B_IP) == 0))
+			sdev->genhd_hidden = 1;
+	}
+#endif
 
 	if (conn->datadgst_en)
 		blk_queue_flag_set(QUEUE_FLAG_STABLE_WRITES,
