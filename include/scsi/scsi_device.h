@@ -240,6 +240,9 @@ struct scsi_device {
 	unsigned ignore_media_change:1; /* Ignore MEDIA CHANGE on resume */
 	unsigned silence_suspend:1;	/* Do not print runtime PM related messages */
 	unsigned no_vpd_size:1;		/* No VPD size reported in header */
+#ifdef CONFIG_TRUENAS
+	unsigned genhd_hidden:1;	/* Set GENHD_FL_HIDDEN flag when creating gendisk */
+#endif
 
 	unsigned cdl_supported:1;	/* Command duration limits supported */
 	unsigned cdl_enable:1;		/* Enable/disable Command duration limits */
