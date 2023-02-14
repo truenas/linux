@@ -3452,8 +3452,10 @@ static int sd_probe(struct device *dev)
 		gd->events |= DISK_EVENT_MEDIA_CHANGE;
 		gd->event_flags = DISK_EVENT_FLAG_POLL | DISK_EVENT_FLAG_UEVENT;
 	}
+#ifdef CONFIG_TRUENAS
 	if (sdp->genhd_hidden)
 		gd->flags |= GENHD_FL_HIDDEN;
+#endif
 
 	blk_pm_runtime_init(sdp->request_queue, dev);
 	if (sdp->rpm_autosuspend) {
