@@ -60,8 +60,9 @@ static int ses_probe(struct device *dev)
 	return err;
 }
 
-#define SES_TIMEOUT (30 * HZ)
-#define SES_RETRIES 3
+#define SES_TIMEOUT		(30 * HZ)
+#define SES_RETRIES		3
+#define SES_POLL_PERIOD_S	60
 
 static void init_device_slot_control(unsigned char *dest_desc,
 				     struct enclosure_component *ecomp,
@@ -479,8 +480,10 @@ static int ses_process_descriptor(struct enclosure_component *ecomp,
 	struct ses_component *scomp = ecomp->scratch;
 	unsigned char *d;
 
-	if (invalid)
+	if (invalid) {
+		scomp->addr = 0;
 		return 0;
+	}
 
 	switch (proto) {
 	case SCSI_PROTOCOL_ATA:
@@ -601,6 +604,8 @@ static void ses_enclosure_data_process(struct enclosure_device *edev,
 		/* skip past overall descriptor */
 		desc_ptr += len + 4;
 	}
+	if (!create)
+		spin_lock(&edev->enc_lock);
 	if (ses_dev->page10 && ses_dev->page10_len > 9)
 		addl_desc_ptr = ses_dev->page10 + 8;
 	type_ptr = ses_dev->page1_types;
@@ -673,6 +678,8 @@ static void ses_enclosure_data_process(struct enclosure_device *edev,
 			}
 		}
 	}
+	if (!create)
+		spin_unlock(&edev->enc_lock);
 	kfree(buf);
 	kfree(hdr_buf);
 }
@@ -699,6 +706,26 @@ static void ses_match_to_enclosure(struct enclosure_device *edev,
 
 		enclosure_for_each_device(ses_enclosure_find_by_addr, &efd);
 	}
+}
+
+static int poll_task_cb(void *arg)
+{
+	struct enclosure_device *edev = (struct enclosure_device*) arg;
+	struct scsi_device *sdev = to_scsi_device(edev->edev.parent);
+	struct scsi_device *tmp_sdev;
+
+	while (!kthread_should_stop()) {
+		shost_for_each_device(tmp_sdev, sdev->host) {
+			if (tmp_sdev->lun != 0 || scsi_device_enclosure(tmp_sdev))
+				continue;
+			ses_match_to_enclosure(edev, tmp_sdev, 1);
+		}
+		if (!kthread_should_stop()) {
+			schedule_timeout_interruptible(
+				    msecs_to_jiffies(SES_POLL_PERIOD_S * 1000));
+		}
+	}
+	return (0);
 }
 
 static int ses_intf_add(struct device *cdev)
@@ -837,6 +864,7 @@ page2_not_supported:
 
 	kfree(hdr_buf);
 
+	spin_lock_init(&edev->enc_lock);
 	edev->scratch = ses_dev;
 	for (i = 0; i < components; i++)
 		edev->component[i].scratch = scomp + i;
@@ -863,12 +891,14 @@ page2_not_supported:
 			}
 			scsi_host_put(tmp_shost);
 		}
+		edev->poll_task = NULL;
 	} else {
-		shost_for_each_device(tmp_sdev, sdev->host) {
-			if (tmp_sdev->lun != 0 || scsi_device_enclosure(tmp_sdev))
-				continue;
-			ses_match_to_enclosure(edev, tmp_sdev, 0);
-		}
+		edev->poll_task = kthread_create(poll_task_cb, (void *)edev,
+			    dev_name(&sdev->sdev_gendev));
+		if (!IS_ERR(edev->poll_task))
+			wake_up_process(edev->poll_task);
+		else
+			edev->poll_task = NULL;
 	}
 
 	return 0;
@@ -926,6 +956,11 @@ static void ses_intf_remove_enclosure(struct scsi_device *sdev)
 	edev = enclosure_find(&sdev->sdev_gendev, NULL);
 	if (!edev)
 		return;
+
+	if (edev->poll_task) {
+		kthread_stop(edev->poll_task);
+		edev->poll_task = NULL;
+	}
 
 	ses_dev = edev->scratch;
 	edev->scratch = NULL;
