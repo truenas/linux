@@ -63,8 +63,9 @@ MODULE_PARM_DESC(debug_iscsi_tcp, "Turn on debugging for iscsi_tcp module "
 		 "Set to 1 to turn on, and zero to turn off. Default is off.");
 
 #ifdef CONFIG_TRUENAS
-#define HA_PRIVATE_CHANNEL_CONTROLLER_A_IP "169.254.10.1"
-#define HA_PRIVATE_CHANNEL_CONTROLLER_B_IP "169.254.10.2"
+static char *iscsi_genhd_hidden_ips;
+module_param_named(genhd_hidden_ips, iscsi_genhd_hidden_ips, charp, 0644);
+MODULE_PARM_DESC(recv_from_iscsi_q, "Comma separated list of IP addresses from which logged in targets should be hidden.");
 #endif
 
 #define ISCSI_SW_TCP_DBG(_conn, dbg_fmt, arg...)		\
@@ -1057,10 +1058,27 @@ static int iscsi_sw_tcp_slave_configure(struct scsi_device *sdev)
 	struct iscsi_conn *conn = session->leadconn;
 
 #ifdef CONFIG_TRUENAS
-	if (conn && conn->persistent_address) {
-		if ((strcmp(conn->persistent_address, HA_PRIVATE_CHANNEL_CONTROLLER_A_IP) == 0) ||
-		    (strcmp(conn->persistent_address, HA_PRIVATE_CHANNEL_CONTROLLER_B_IP) == 0))
-			sdev->genhd_hidden = 1;
+	if (conn && conn->persistent_address && iscsi_genhd_hidden_ips) {
+		char *str;
+
+		str = kstrdup(iscsi_genhd_hidden_ips, GFP_KERNEL);
+		if (str) {
+			char *tok, *sep=str;
+
+			while ((tok = strsep(&sep, ",")) != NULL) {
+
+				/* Be tolerant of leading/trailing whitespace */
+				tok = strim(tok);
+				if (strcmp(conn->persistent_address, tok) == 0) {
+					sdev->genhd_hidden = 1;
+					break;
+				}
+			}
+			kfree(str);
+		} else {
+			iscsi_conn_printk(KERN_ERR, conn,
+					  "Memory allocation failed; could not check genhd_hidden\n");
+		}
 	}
 #endif
 
