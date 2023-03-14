@@ -1660,6 +1660,17 @@ static void ata_qc_done(struct ata_queued_cmd *qc)
 {
 	struct scsi_cmnd *cmd = qc->scsicmd;
 	void (*done)(struct scsi_cmnd *) = qc->scsidone;
+	struct ata_taskfile *tf = &(qc->tf);
+	struct ata_eh_info *ehi = &qc->ap->link.eh_info;
+
+	if (tf->command == ATA_CMD_SET_MAX || tf->command == ATA_CMD_SET_MAX_EXT
+	    || (tf->command == ATA_CMD_MAX_ADDR_EXT &&
+	    tf->feature == ATA_SUBCMD_MAX_ADDR_SET_EXT)) {
+		ehi->probe_mask |= 1 << qc->dev->devno;
+		ehi->action |= ATA_EH_REVALIDATE;
+		ehi->flags |= ATA_EHI_UPDATE_SECTORS;
+		ata_port_schedule_eh(qc->ap);
+	}
 
 	ata_qc_free(qc);
 	done(cmd);
