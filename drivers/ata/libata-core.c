@@ -3796,6 +3796,7 @@ int ata_dev_revalidate(struct ata_device *dev, unsigned int new_class,
 {
 	u64 n_sectors = dev->n_sectors;
 	u64 n_native_sectors = dev->n_native_sectors;
+	struct ata_eh_context *ehc = &dev->link->eh_context;
 	int rc;
 
 	if (!ata_dev_enabled(dev))
@@ -3818,6 +3819,14 @@ int ata_dev_revalidate(struct ata_device *dev, unsigned int new_class,
 	rc = ata_dev_configure(dev);
 	if (rc)
 		goto fail;
+
+	/*
+	 * Just need to update the sector count
+	 */
+	if (ehc->i.flags & ATA_EHI_UPDATE_SECTORS) {
+		dev->n_sectors = ata_id_n_sectors(dev->id);
+		return 0;
+	}
 
 	/* verify n_sectors hasn't changed */
 	if (dev->class != ATA_DEV_ATA || !n_sectors ||
