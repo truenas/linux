@@ -65,7 +65,8 @@ MODULE_PARM_DESC(debug_iscsi_tcp, "Turn on debugging for iscsi_tcp module "
 #ifdef CONFIG_TRUENAS
 static char *iscsi_genhd_hidden_ips;
 module_param_named(genhd_hidden_ips, iscsi_genhd_hidden_ips, charp, 0644);
-MODULE_PARM_DESC(recv_from_iscsi_q, "Comma separated list of IP addresses from which logged in targets should be hidden.");
+MODULE_PARM_DESC(genhd_hidden_ips, "Comma separated list of IP addresses from "
+		 "which logged in targets should be hidden.");
 #endif
 
 #define ISCSI_SW_TCP_DBG(_conn, dbg_fmt, arg...)		\
