@@ -2199,16 +2199,27 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	/* allow moving tasks into an empty cpuset if on default hierarchy */
 	ret = -ENOSPC;
 	if (!is_in_v2_mode() &&
-	    (cpumask_empty(cs->cpus_allowed) || nodes_empty(cs->mems_allowed)))
+	    (cpumask_empty(cs->cpus_allowed) || nodes_empty(cs->mems_allowed))) {
+		pr_info("%s: Going out_unlock with ret %d from Line %d", __func__, ret, __LINE__);
 		goto out_unlock;
+	}
 
 	cgroup_taskset_for_each(task, css, tset) {
 		ret = task_can_attach(task, cs->effective_cpus);
-		if (ret)
+		if (ret) {
+			pr_info("%s: Going out_unlock with ret %d from Line %d", __func__, ret, __LINE__);
+			pr_info("%s: Cannot attach Process PID %d command %s", __func__, task->pid, task->comm);
+			pr_info("%s:	%u %u %u", __func__, task->flags, task->rt_priority, task->policy);
+			pr_info("%s:	%d %d %d %d %d %d %d %d", __func__, task->prio, task->static_prio, task->normal_prio,
+					task->pdeath_signal, task->nr_cpus_allowed, task->exit_code, task->exit_signal, task->exit_state);
+			pr_info("%s:	%lu %llu %llu", __func__, task->atomic_flags, task->start_time, task->start_boottime);
 			goto out_unlock;
+		}
 		ret = security_task_setscheduler(task);
-		if (ret)
+		if (ret) {
+			pr_info("%s: Going out_unlock with ret %d from Line %d", __func__, ret, __LINE__);
 			goto out_unlock;
+		}
 	}
 
 	/*
@@ -2219,6 +2230,7 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 	ret = 0;
 out_unlock:
 	percpu_up_write(&cpuset_rwsem);
+	pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
 	return ret;
 }
 

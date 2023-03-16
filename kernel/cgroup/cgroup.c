@@ -165,6 +165,8 @@ static DEFINE_PER_CPU(struct cgroup_rstat_cpu, cgrp_dfl_root_rstat_cpu);
 struct cgroup_root cgrp_dfl_root = { .cgrp.rstat_cpu = &cgrp_dfl_root_rstat_cpu };
 EXPORT_SYMBOL_GPL(cgrp_dfl_root);
 
+int x_cpuset = 0;
+
 /*
  * The default hierarchy always exists but is hidden until mounted for the
  * first time.  This is for backward compatibility.
@@ -2512,6 +2514,8 @@ static int cgroup_migrate_execute(struct cgroup_mgctx *mgctx)
 				ret = ss->can_attach(tset);
 				if (ret) {
 					failed_ssid = ssid;
+					if (x_cpuset == 1)
+						pr_info("%s: Going out_cancel_attach with ret %d from Line %d Failed SSID %d", __func__, ret, __LINE__, failed_ssid);
 					goto out_cancel_attach;
 				}
 			}
@@ -2562,6 +2566,8 @@ static int cgroup_migrate_execute(struct cgroup_mgctx *mgctx)
 	}
 
 	ret = 0;
+	if (x_cpuset == 1)
+		pr_info("%s: Going out_release_tset with ret %d from Line %d", __func__, ret, __LINE__);
 	goto out_release_tset;
 
 out_cancel_attach:
@@ -2591,6 +2597,8 @@ out_release_tset:
 	 */
 	tset->nr_tasks = 0;
 	tset->csets    = &tset->src_csets;
+	if (x_cpuset == 1)
+		pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
 	return ret;
 }
 
@@ -3008,8 +3016,12 @@ static int cgroup_update_dfl_csses(struct cgroup *cgrp)
 
 	/* NULL dst indicates self on default hierarchy */
 	ret = cgroup_migrate_prepare_dst(&mgctx);
-	if (ret)
+	if (ret) {
+		if (x_cpuset == 1) {
+			pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
+		}
 		goto out_finish;
+	}
 
 	spin_lock_irq(&css_set_lock);
 	list_for_each_entry(src_cset, &mgctx.preloaded_src_csets,
@@ -3023,6 +3035,11 @@ static int cgroup_update_dfl_csses(struct cgroup *cgrp)
 	spin_unlock_irq(&css_set_lock);
 
 	ret = cgroup_migrate_execute(&mgctx);
+	if (ret) {
+		if (x_cpuset == 1) {
+			pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
+		}
+	}
 out_finish:
 	cgroup_migrate_finish(&mgctx);
 	cgroup_attach_unlock(has_tasks);
@@ -3254,8 +3271,12 @@ static int cgroup_apply_control(struct cgroup *cgrp)
 	cgroup_propagate_control(cgrp);
 
 	ret = cgroup_apply_control_enable(cgrp);
-	if (ret)
+	if (ret) {
+		if (x_cpuset == 1) {
+			pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
+		}
 		return ret;
+	}
 
 	/*
 	 * At this point, cgroup_e_css_by_mask() results reflect the new csses
@@ -3263,8 +3284,12 @@ static int cgroup_apply_control(struct cgroup *cgrp)
 	 * css associations of all tasks in the subtree.
 	 */
 	ret = cgroup_update_dfl_csses(cgrp);
-	if (ret)
+	if (ret) {
+		if (x_cpuset == 1) {
+			pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
+		}
 		return ret;
+	}
 
 	return 0;
 }
@@ -3337,6 +3362,15 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 	char *tok;
 	int ssid, ret;
 
+	if (strstr(buf, "cpuset")) {
+		x_cpuset = 1;
+		char name[1024];
+		char path[2*1024];
+		kernfs_name(of->kn, name, sizeof(name));
+		kernfs_path(of->kn, path, sizeof(path));
+		pr_info("%s: Input buf: %s | path: %s | name : %s", __func__, buf, path, name);
+	}
+
 	/*
 	 * Parse input - space separated list of subsystem names prefixed
 	 * with either + or -.
@@ -3357,17 +3391,28 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 				disable |= 1 << ssid;
 				enable &= ~(1 << ssid);
 			} else {
+				if (x_cpuset == 1)
+					pr_info("%s: Returning EINVAL from Line %d", __func__, __LINE__);
+				x_cpuset = 0;
 				return -EINVAL;
 			}
 			break;
 		} while_each_subsys_mask();
-		if (ssid == CGROUP_SUBSYS_COUNT)
+		if (ssid == CGROUP_SUBSYS_COUNT) {
+			if (x_cpuset == 1)
+				pr_info("%s: Returning EINVAL from Line %d", __func__, __LINE__);
+			x_cpuset = 0;
 			return -EINVAL;
+		}
 	}
 
 	cgrp = cgroup_kn_lock_live(of->kn, true);
-	if (!cgrp)
+	if (!cgrp) {
+		if (x_cpuset == 1)
+			pr_info("%s: Returning ENODEV from Line %d", __func__, __LINE__);
+		x_cpuset = 0;
 		return -ENODEV;
+	}
 
 	for_each_subsys(ss, ssid) {
 		if (enable & (1 << ssid)) {
@@ -3377,6 +3422,8 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 			}
 
 			if (!(cgroup_control(cgrp) & (1 << ssid))) {
+				if (x_cpuset == 1)
+					pr_info("%s: Returning ENOENT from Line %d", __func__, __LINE__);
 				ret = -ENOENT;
 				goto out_unlock;
 			}
@@ -3389,6 +3436,8 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 			/* a child has it enabled? */
 			cgroup_for_each_live_child(child, cgrp) {
 				if (child->subtree_control & (1 << ssid)) {
+					if (x_cpuset == 1)
+						pr_info("%s: Returning EBUSY from Line %d", __func__, __LINE__);
 					ret = -EBUSY;
 					goto out_unlock;
 				}
@@ -3397,13 +3446,20 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 	}
 
 	if (!enable && !disable) {
+		if (x_cpuset == 1)
+			pr_info("%s: Returning 0 from Line %d", __func__, __LINE__);
 		ret = 0;
 		goto out_unlock;
 	}
 
+	if (x_cpuset == 1)
+		pr_info("%s: Line %d Enable %d SSID %d", __func__, __LINE__, enable, ssid);
 	ret = cgroup_vet_subtree_control_enable(cgrp, enable);
-	if (ret)
+	if (ret) {
+		if (x_cpuset == 1)
+			pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
 		goto out_unlock;
+	}
 
 	/* save and update control masks and prepare csses */
 	cgroup_save_control(cgrp);
@@ -3413,12 +3469,18 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 
 	ret = cgroup_apply_control(cgrp);
 	cgroup_finalize_control(cgrp, ret);
-	if (ret)
+	if (ret) {
+		if (x_cpuset == 1)
+			pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
 		goto out_unlock;
+	}
 
 	kernfs_activate(cgrp->kn);
 out_unlock:
 	cgroup_kn_unlock(of->kn);
+	if (x_cpuset == 1)
+		pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
+	x_cpuset = 0;
 	return ret ?: nbytes;
 }
 
@@ -5789,7 +5851,8 @@ static void __init cgroup_init_subsys(struct cgroup_subsys *ss, bool early)
 {
 	struct cgroup_subsys_state *css;
 
-	pr_debug("Initializing cgroup subsys %s\n", ss->name);
+	pr_info("Initializing cgroup subsys %s, early_init %d", ss->name,
+		ss->early_init);
 
 	mutex_lock(&cgroup_mutex);
 

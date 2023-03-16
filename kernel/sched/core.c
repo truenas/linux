@@ -45,6 +45,8 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_update_nr_running_tp);
 
 DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
 
+extern int x_cpuset;
+
 #ifdef CONFIG_SCHED_DEBUG
 /*
  * Debugging: various feature bits
@@ -8766,6 +8768,8 @@ int task_can_attach(struct task_struct *p,
 	 */
 	if (p->flags & PF_NO_SETAFFINITY) {
 		ret = -EINVAL;
+		if (x_cpuset == 1)
+			pr_info("%s: Returning EINVAL from Line %d", __func__, __LINE__);
 		goto out;
 	}
 
@@ -8773,12 +8777,17 @@ int task_can_attach(struct task_struct *p,
 					      cs_effective_cpus)) {
 		int cpu = cpumask_any_and(cpu_active_mask, cs_effective_cpus);
 
-		if (unlikely(cpu >= nr_cpu_ids))
+		if (unlikely(cpu >= nr_cpu_ids)) {
+			if (x_cpuset == 1)
+				pr_info("%s: Returning EINVAL from Line %d", __func__, __LINE__);
 			return -EINVAL;
+		}
 		ret = dl_cpu_busy(cpu, p);
 	}
 
 out:
+	if (x_cpuset == 1)
+		pr_info("%s: Returning %d from Line %d", __func__, ret, __LINE__);
 	return ret;
 }
 
