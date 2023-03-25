@@ -1996,9 +1996,11 @@ static int cxgb4_get_module_info(struct net_device *dev,
 	u8 sff8472_comp, sff_diag_type, sff_rev;
 	struct adapter *adapter = pi->adapter;
 	int ret;
-
-	if (!t4_is_inserted_mod_type(pi->mod_type))
+	printk(KERN_ALERT "%s()--1, port_type:%d, pi->port_type:%d\n", __func__, pi->port_type);
+	if (!t4_is_inserted_mod_type(pi->mod_type)) {
+		printk(KERN_ALERT "%s()--2 , ret:-EINVAL\n", __func__);
 		return -EINVAL;
+	}
 
 	switch (pi->port_type) {
 	case FW_PORT_TYPE_SFP:
@@ -2007,13 +2009,17 @@ static int cxgb4_get_module_info(struct net_device *dev,
 		ret = t4_i2c_rd(adapter, adapter->mbox, pi->tx_chan,
 				I2C_DEV_ADDR_A0, SFF_8472_COMP_ADDR,
 				SFF_8472_COMP_LEN, &sff8472_comp);
-		if (ret)
+		if (ret) {
+			printk(KERN_ALERT "%s()--3 ret:%d\n", __func__, ret);
 			return ret;
+		}
 		ret = t4_i2c_rd(adapter, adapter->mbox, pi->tx_chan,
 				I2C_DEV_ADDR_A0, SFP_DIAG_TYPE_ADDR,
 				SFP_DIAG_TYPE_LEN, &sff_diag_type);
-		if (ret)
+		if (ret) {
+			printk(KERN_ALERT "%s()--4 ret:%d\n", __func__, ret);
 			return ret;
+		}
 
 		if (!sff8472_comp || (sff_diag_type & SFP_DIAG_ADDRMODE)) {
 			modinfo->type = ETH_MODULE_SFF_8079;
@@ -2038,8 +2044,10 @@ static int cxgb4_get_module_info(struct net_device *dev,
 		/* For QSFP type ports, revision value >= 3
 		 * means the SFP is 8636 compliant.
 		 */
-		if (ret)
+		if (ret) {
+			printk(KERN_ALERT "%s()--5 ret:%d\n", __func__, ret);
 			return ret;
+		}
 		if (sff_rev >= 0x3) {
 			modinfo->type = ETH_MODULE_SFF_8636;
 			modinfo->eeprom_len = ETH_MODULE_SFF_8636_LEN;
@@ -2050,9 +2058,11 @@ static int cxgb4_get_module_info(struct net_device *dev,
 		break;
 
 	default:
+		printk(KERN_ALERT "%s()--6 ret:%d\n", __func__, ret);
 		return -EINVAL;
 	}
 
+	printk(KERN_ALERT "%s()--7 ret:%d\n", __func__, ret);
 	return 0;
 }
 
@@ -2062,11 +2072,15 @@ static int cxgb4_get_module_eeprom(struct net_device *dev,
 	int ret = 0, offset = eprom->offset, len = eprom->len;
 	struct port_info *pi = netdev_priv(dev);
 	struct adapter *adapter = pi->adapter;
+	printk(KERN_ALERT "%s()--1, --enter\n", __func__);
 
 	memset(data, 0, eprom->len);
-	if (offset + len <= I2C_PAGE_SIZE)
-		return t4_i2c_rd(adapter, adapter->mbox, pi->tx_chan,
+	if (offset + len <= I2C_PAGE_SIZE) {
+		ret = t4_i2c_rd(adapter, adapter->mbox, pi->tx_chan,
 				 I2C_DEV_ADDR_A0, offset, len, data);
+		printk(KERN_ALERT "%s()--2, ret:%d\n", __func__, ret);
+		return (ret);
+	}
 
 	/* offset + len spans 0xa0 and 0xa1 pages */
 	if (offset <= I2C_PAGE_SIZE) {
@@ -2074,8 +2088,10 @@ static int cxgb4_get_module_eeprom(struct net_device *dev,
 		len = I2C_PAGE_SIZE - offset;
 		ret =  t4_i2c_rd(adapter, adapter->mbox, pi->tx_chan,
 				 I2C_DEV_ADDR_A0, offset, len, data);
-		if (ret)
+		if (ret) {
+			printk(KERN_ALERT "%s()--3, ret:%d\n", __func__, ret);
 			return ret;
+		}
 		offset = I2C_PAGE_SIZE;
 		/* Remaining bytes to be read from second page =
 		 * Total length - bytes read from first page
@@ -2083,10 +2099,11 @@ static int cxgb4_get_module_eeprom(struct net_device *dev,
 		len = eprom->len - len;
 	}
 	/* Read additional optical diagnostics from page 0xa2 if supported */
-	return t4_i2c_rd(adapter, adapter->mbox, pi->tx_chan, I2C_DEV_ADDR_A2,
+	ret = t4_i2c_rd(adapter, adapter->mbox, pi->tx_chan, I2C_DEV_ADDR_A2,
 			 offset, len, &data[eprom->len - len]);
+	printk(KERN_ALERT "%s()--4, ret:%d\n", __func__, ret);
+	return (ret);
 }
-
 static u32 cxgb4_get_priv_flags(struct net_device *netdev)
 {
 	struct port_info *pi = netdev_priv(netdev);
