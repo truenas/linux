@@ -737,6 +737,7 @@ struct ixgbe_adapter {
 	bool link_up;
 	unsigned long sfp_poll_time;
 	unsigned long link_check_timeout;
+	bool fw_error_msg;
 
 	struct timer_list service_timer;
 	struct work_struct service_task;
