@@ -758,6 +758,7 @@ struct ixgbe_adapter {
 	unsigned long sfp_poll_time;
 	unsigned long link_check_timeout;
 	u32 link_down_events;
+	bool fw_error_msg;
 
 	struct timer_list service_timer;
 	struct work_struct service_task;
