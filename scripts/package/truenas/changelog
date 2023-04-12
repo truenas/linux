@@ -1,3 +1,9 @@
+linux-6.1.23+truenas (6.1.23+truenas-1) sid; urgency=low
+
+  * Rebase local commits onto upstream v6.1.23
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Thu, 13 Apr 2023 12:05:00 -0500
+
 linux-5.10.18+truenas (5.10.18+truenas-2) sid; urgency=low
 
   * Implement NFS4 ACL support
