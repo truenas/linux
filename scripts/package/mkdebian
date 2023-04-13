@@ -96,6 +96,7 @@ if [ -n "$KDEB_PKGVERSION" ]; then
 	packageversion=$KDEB_PKGVERSION
 	revision=${packageversion##*-}
 else
+	srctree=.
 	revision=$($srctree/init/build-version)
 	packageversion=$version-$revision
 fi
@@ -214,7 +215,7 @@ binary: binary-arch
 EOF
 
 chmod +x debian/rules
-mkdir debian/certs
+mkdir -p debian/certs
 cp scripts/package/truenas/debian-uefi-certs.pem debian/certs
 cp scripts/package/truenas/changelog debian/changelog
 cp scripts/package/truenas/copyright debian/copyright

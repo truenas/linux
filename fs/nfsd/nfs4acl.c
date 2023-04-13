@@ -906,24 +906,43 @@ out_estate:
 	return ret;
 }
 
-__be32 nfsd4_acl_to_attr(enum nfs_ftype4 type, struct nfs4_acl *acl,
-			 struct nfsd_attrs *attr)
+static int
+nfsv4_set_posix_acl(struct svc_fh *fhp, struct nfs4_acl *acl)
 {
 	int host_error;
 	unsigned int flags = 0;
+	struct posix_acl *pacl = NULL, *dpacl = NULL;
+	struct dentry *dentry;
+	struct inode *inode;
 
-	if (!acl)
-		return nfs_ok;
+	dentry = fhp->fh_dentry;
+	inode = d_inode(dentry);
 
-	if (type == NF4DIR)
+	if (S_ISDIR(inode->i_mode))
 		flags = NFS4_ACL_DIR;
 
-	host_error = nfs4_acl_nfsv4_to_posix(acl, &attr->na_pacl,
-					     &attr->na_dpacl, flags);
+	host_error = nfs4_acl_nfsv4_to_posix(acl, &pacl, &dpacl, flags);
 	if (host_error == -EINVAL)
 		return (-EOPNOTSUPP);
 	if (host_error < 0)
 		return host_error;
+
+	//fh_lock(fhp);
+
+	host_error = set_posix_acl(&init_user_ns, inode, ACL_TYPE_ACCESS, pacl);
+	if (host_error < 0)
+		goto out;
+
+	if (S_ISDIR(inode->i_mode)) {
+		host_error = set_posix_acl(&init_user_ns, inode,
+					   ACL_TYPE_DEFAULT, dpacl);
+	}
+
+out:
+	//fh_unlock(fhp);
+	posix_acl_release(pacl);
+	posix_acl_release(dpacl);
+	return host_error;
 }
 
 static int
@@ -1041,19 +1060,21 @@ nfs4_acl_nfsv4_set_native(struct svc_fh *fhp, struct nfs4_acl *acl)
 		return nfsv4_set_posix_acl(fhp, acl);
 }
 
-__be32
-nfsd4_set_nfs4_acl(struct svc_rqst *rqstp, struct svc_fh *fhp,
-		struct nfs4_acl *acl)
+__be32 nfsd4_acl_to_attr(enum nfs_ftype4 type, struct nfs4_acl *acl,
+			 struct nfsd_attrs *attr)
 {
-	__be32 error;
 	int host_error;
+	unsigned int flags = 0;
 
-	error = fh_verify(rqstp, fhp, 0, NFSD_MAY_SATTR);
-	if (error)
-		return error;
+	if (!acl)
+		return nfs_ok;
 
-	host_error = nfs4_acl_nfsv4_set_native(fhp, acl);
-	if (host_error == -EOPNOTSUPP)
+	if (type == NF4DIR)
+		flags = NFS4_ACL_DIR;
+
+	host_error = nfs4_acl_nfsv4_to_posix(acl, &attr->na_pacl,
+					     &attr->na_dpacl, flags);
+	if (host_error == -EINVAL)
 		return nfserr_attrnotsupp;
 	else
 		return nfserrno(host_error);

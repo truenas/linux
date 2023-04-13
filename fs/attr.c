@@ -189,7 +189,7 @@ int setattr_prepare(struct user_namespace *mnt_userns, struct dentry *dentry,
 	 * chgrp().
 	 */
 	if ((ia_valid & ATTR_UID) &&
-	    !chown_ok(mnt_userns, inode, attr->ia_uid)) {
+	    !chown_ok(mnt_userns, inode, attr->ia_vfsuid)) {
 		if (!IS_NFSV4ACL(inode)) {
 			return -EPERM;
 		}
@@ -206,7 +206,7 @@ int setattr_prepare(struct user_namespace *mnt_userns, struct dentry *dentry,
 	/* Make sure caller can chgrp. */
 #if CONFIG_TRUENAS
 	if ((ia_valid & ATTR_GID) &&
-	    !chgrp_ok(mnt_userns, inode, attr->ia_gid)) {
+	    !chgrp_ok(mnt_userns, inode, attr->ia_vfsgid)) {
 		if (!IS_NFSV4ACL(inode)) {
 			return -EPERM;
 		}

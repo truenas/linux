@@ -744,13 +744,13 @@ do_getxattr(struct user_namespace *mnt_userns, struct dentry *d,
 
 	if (ctx->size) {
 #ifdef CONFIG_TRUENAS
-		if ((size > XATTR_LARGE_SIZE_MAX) &&
+		if ((ctx->size > XATTR_LARGE_SIZE_MAX) &&
 		    IS_LARGE_XATTR(d->d_inode)) {
-			size = XATTR_LARGE_SIZE_MAX;
+			ctx->size = XATTR_LARGE_SIZE_MAX;
 		}
-		else if ((size > XATTR_SIZE_MAX) &&
+		else if ((ctx->size > XATTR_SIZE_MAX) &&
 			 (IS_LARGE_XATTR(d->d_inode) == 0)) {
-			size = XATTR_SIZE_MAX;
+			ctx->size = XATTR_SIZE_MAX;
 		}
 #else
 		if (ctx->size > XATTR_SIZE_MAX)
