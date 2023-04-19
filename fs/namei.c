@@ -3699,6 +3699,22 @@ struct file *vfs_tmpfile_open(struct user_namespace *mnt_userns,
 }
 EXPORT_SYMBOL(vfs_tmpfile_open);
 
+static int do_emptypath(struct nameidata *nd, const struct open_flags *op,
+			struct file *file)
+{
+	int error;
+	struct fd f = fdget_raw(nd->dfd);
+	if (!f.file)
+		return -EBADF;
+	struct user_namespace *mnt_userns;
+	mnt_userns = mnt_user_ns(f.file->f_path.mnt);
+	error = may_open(mnt_userns, &f.file->f_path, op->acc_mode, op->open_flag);
+	if (!error)
+		error = vfs_open(&f.file->f_path, file);
+	fdput(f);
+	return error;
+}
+
 static int do_tmpfile(struct nameidata *nd, unsigned flags,
 		const struct open_flags *op,
 		struct file *file)
@@ -3748,6 +3764,8 @@ static struct file *path_openat(struct nameidata *nd,
 
 	if (unlikely(file->f_flags & __O_TMPFILE)) {
 		error = do_tmpfile(nd, flags, op, file);
+	} else if (unlikely(file->f_flags & O_EMPTYPATH)) {
+		error = do_emptypath(nd, op, file);
 	} else if (unlikely(file->f_flags & O_PATH)) {
 		error = do_o_path(nd, flags, file);
 	} else {
