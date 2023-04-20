@@ -2,8 +2,11 @@
 VERSION = 6
 PATCHLEVEL = 1
 SUBLEVEL = 24
-EXTRAVERSION =
 NAME = Hurr durr I'ma ninja sloth
+
+ifndef EXTRAVERSION
+EXTRAVERSION =
+endif
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"

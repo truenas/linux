@@ -15,6 +15,7 @@
 #define XATTR_NAME_MAX   255	/* # chars in an extended attribute name */
 #define XATTR_SIZE_MAX 65536	/* size of an extended attribute value (64k) */
 #define XATTR_LIST_MAX 65536	/* size of extended attribute namelist (64k) */
+#define XATTR_LARGE_SIZE_MAX 2097152 /* max size of extended attribute on fs supporting large xattrs */
 
 #define RTSIG_MAX	  32
 
