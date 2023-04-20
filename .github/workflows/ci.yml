@@ -14,7 +14,7 @@ jobs:
     steps:
       - name: Skip Duplicate Actions
         id: skip_check
-        uses: fkirc/skip-duplicate-actions@v3.4.1
+        uses: fkirc/skip-duplicate-actions@v5
         with:
           concurrent_skipping: 'same_content_newer'
 
@@ -28,7 +28,7 @@ jobs:
     steps:
 
       - name: Check out repository code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Install dependencies
         run: |
@@ -70,7 +70,7 @@ jobs:
           cp .config ./artifacts/
 
       - name: Export artifacts
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: ${{github.sha}}
           path: ./artifacts
