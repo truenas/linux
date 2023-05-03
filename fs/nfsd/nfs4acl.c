@@ -262,8 +262,10 @@ get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 		return -ENOMEM;
 
 	len = vfs_getxattr(&init_user_ns, dentry, NA41_NAME, xdr_buf, xdr_buf_sz);
-	if (len == 0)
-		return -EOPNOTSUPP;
+	if (len == 0) {
+		error = -EOPNOTSUPP;
+		goto out;
+	}
 
 	if (len < 0) {
 		switch (len) {
@@ -958,11 +960,11 @@ convert_ace_to_nfs41(u32 *p, const struct nfs4_ace *ace)
 		break;
 	case NFS4_ACL_WHO_NAMED:
 		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP)
-			nace.who = (int)__kgid_val(ace->who_gid);
+			nace.who = (u_int)__kgid_val(ace->who_gid);
 		else
-			nace.who = (int)__kuid_val(ace->who_uid);
+			nace.who = (u_int)__kuid_val(ace->who_uid);
 
-		BUG_ON(nace.who == -1);
+		BUG_ON((nace.who == -1) || (nace.who > U32_MAX));
 		break;
 	default:
 		error = -EINVAL;
@@ -1024,7 +1026,6 @@ nfsd4_acl_to_attr_zfsacl(enum nfs_ftype4 type, struct nfs4_acl *acl,
 	if (error) {
 		kfree(xdr_buf);
 		return nfserrno(error);
-		return error;
 	}
 
 	fsaclp->zfsacl.aclbuf = xdr_buf;
