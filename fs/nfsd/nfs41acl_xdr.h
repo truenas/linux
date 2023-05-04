@@ -3,7 +3,6 @@
 
 #define NA41_NAME "system.nfs4_acl_xdr"
 
-typedef u_int acetype4;
 #define ACE4_FILE_INHERIT_ACE 0x00000001
 #define ACE4_DIRECTORY_INHERIT_ACE 0x00000002
 #define ACE4_NO_PROPAGATE_INHERIT_ACE 0x00000004
@@ -19,36 +18,21 @@ typedef u_int acetype4;
 			 ACE4_INHERITED_ACE| \
 			 ACE4_IDENTIFIER_GROUP)
 
-typedef u_int aceflag4;
 #define ACEI4_SPECIAL_WHO 0x00000001
-
-typedef u_int aceiflag4;
 #define ACE4_SPECIAL_OWNER 1
 #define ACE4_SPECIAL_GROUP 2
 #define ACE4_SPECIAL_EVERYONE 3
-
-typedef u_int acemask4;
-
-struct nfsace4i {
-	acetype4 type;
-	aceflag4 flag;
-	aceiflag4 iflag;
-	acemask4 access_mask;
-	u_int who;
-};
-typedef struct nfsace4i nfsace4i;
 #define NACE41_LEN 5
+
 #define ACL4_AUTO_INHERIT 0x00000001
 #define ACL4_PROTECTED 0x00000002
 #define ACL4_DEFAULTED 0x00000004
-
-typedef u_int aclflag4;
 
 /*
  * Macros for sanity checks related to XDR and ACL buffer sizes
  */
 #define NFS41ACL_MAX_ENTRIES	128
-#define ACE4SIZE                (sizeof (nfsace4i))
+#define ACE4SIZE                (NACE41_LEN * sizeof(u32))
 #define XDRBASE                 (2 * sizeof (u32))
 
 #define ACES_TO_SIZE(x, y)      (x + (y * ACE4SIZE))

@@ -242,7 +242,6 @@ convert_nfs41xdr_to_nfs40_acl(u32 *xdrbuf, size_t remaining, struct nfs4_acl *ac
 		remaining -= (NACE41_LEN * sizeof(u32));
 	}
 
-	BUG_ON(remaining != 0);
 	return error;
 }
 
@@ -932,50 +931,40 @@ static int
 convert_ace_to_nfs41(u32 *p, const struct nfs4_ace *ace)
 {
 	int error = 0;
-	nfsace4i nace;
-
-	nace = (nfsace4i) {
-		.type = (acetype4)ace->type,
-		.flag = (aceflag4)ace->flag & NFS41_FLAGS,
-		.access_mask = ace->access_mask & NFS4_ACE_MASK_ALL,
-		.who = -1,
-	};
+	u32 iflag = 0, who = -1;
 
 	/* Audit and Alarm are not currently supported */
-	if (nace.type > NFS4_ACE_ACCESS_DENIED_ACE_TYPE)
+	if (ace->type > NFS4_ACE_ACCESS_DENIED_ACE_TYPE)
 		return -EINVAL;
 
 	switch (ace->whotype) {
 	case NFS4_ACL_WHO_OWNER:
-		nace.iflag = ACEI4_SPECIAL_WHO;
-		nace.who = ACE4_SPECIAL_OWNER;
+		iflag = ACEI4_SPECIAL_WHO;
+		who = ACE4_SPECIAL_OWNER;
 		break;
 	case NFS4_ACL_WHO_GROUP:
-		nace.iflag = ACEI4_SPECIAL_WHO;
-		nace.who = ACE4_SPECIAL_GROUP;
+		iflag = ACEI4_SPECIAL_WHO;
+		who = ACE4_SPECIAL_GROUP;
 		break;
 	case NFS4_ACL_WHO_EVERYONE:
-		nace.iflag = ACEI4_SPECIAL_WHO;
-		nace.who = ACE4_SPECIAL_EVERYONE;
+		iflag = ACEI4_SPECIAL_WHO;
+		who = ACE4_SPECIAL_EVERYONE;
 		break;
 	case NFS4_ACL_WHO_NAMED:
 		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP)
-			nace.who = (u_int)__kgid_val(ace->who_gid);
+			who = (u32)__kgid_val(ace->who_gid);
 		else
-			nace.who = (u_int)__kuid_val(ace->who_uid);
-
-		BUG_ON((nace.who == -1) || (nace.who > U32_MAX));
+			who = (u32)__kuid_val(ace->who_uid);
 		break;
 	default:
 		error = -EINVAL;
-		break;
 	}
 
-	*p++ = htonl(nace.type);
-	*p++ = htonl(nace.flag);
-	*p++ = htonl(nace.iflag);
-	*p++ = htonl(nace.access_mask);
-	*p++ = htonl(nace.who);
+	*p++ = htonl(ace->type);
+	*p++ = htonl(ace->flag & NFS41_FLAGS);
+	*p++ = htonl(iflag);
+	*p++ = htonl(ace->access_mask & NFS4_ACE_MASK_ALL);
+	*p++ = htonl(who);
 
 	return error;
 }
