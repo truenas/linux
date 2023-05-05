@@ -1,6 +1,28 @@
 #ifndef _NFS41ACL_H_RPCGEN
 #define _NFS41ACL_H_RPCGEN
 
+/*
+ * Native ZFS NFSv41-style ACL is packed in xattr as
+ * follows:
+ *
+ * struct nfsace4i {
+ *    uint32_t type; RFC 5661 Section 6.2.1.1
+ *    uint32_t flag; RFC 5661 Section 6.2.1.4
+ *    uint32_t iflag;
+ *    uint32_t access_mask; RFC 5661 Section 6.2.1.3
+ *    uint32_t who_id;
+ * };
+ *
+ * struct nfsacl4 {
+ *     uint32_t acl_flags; RFC 5661 Section 6.4.3.2
+ *     uint32_t ace_count;
+ *     struct nfsace4i aces<>;
+ * };
+ *
+ * iflag and who_id combined are sufficent for NFS server to convert into ACE
+ * who (RFC 5661 Section 6.2.1.5).
+ */
+
 #define NA41_NAME "system.nfs4_acl_xdr"
 
 #define ACE4_FILE_INHERIT_ACE 0x00000001

@@ -293,8 +293,9 @@ get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 	BUG_ON(!(XDRSIZE_IS_VALID(len)));
 
 	/*
-	 * skip first byte since it contains ACL flags that
-	 * aren't used in NFSv4.0 ACLs
+	 * At preset only NFS 4.0 (RFC 3530) ACLs are exported by the NFS
+	 * server, and so the ACL-wide flags are ignored when generating the
+	 * internal NFS server ACL.
 	 */
 	p = xdr_buf + 1;
 	ace_cnt = ntohl(*(p++));
