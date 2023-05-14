@@ -2967,7 +2967,8 @@ static __be32 nfsd4_encode_fattr4_supported_attrs(struct xdr_stream *xdr,
 	u32 supp[3];
 
 	memcpy(supp, nfsd_suppattrs[minorversion], sizeof(supp));
-	if (!IS_POSIXACL(d_inode(args->dentry)))
+	if (!IS_POSIXACL(d_inode(args->dentry)) &&
+		!IS_NFSV4ACL(d_inode(args->dentry)))
 		supp[0] &= ~FATTR4_WORD0_ACL;
 	if (!args->contextsupport)
 		supp[2] &= ~FATTR4_WORD2_SECURITY_LABEL;

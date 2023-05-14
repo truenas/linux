@@ -337,7 +337,7 @@ nfsd3_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		goto out;
 	}
 
-	if (!IS_POSIXACL(inode))
+	if (!IS_POSIXACL(inode) && !IS_NFSV4ACL(inode))
 		iap->ia_mode &= ~current_umask();
 
 	status = fh_fill_pre_attrs(fhp);
