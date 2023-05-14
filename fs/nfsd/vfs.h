@@ -45,21 +45,43 @@ struct nfsd_file;
  */
 typedef int (*nfsd_filldir_t)(void *, const char *, int, loff_t, u64, unsigned);
 
+enum acltype { ACL_TYPE_NONE, ACL_TYPE_POSIX, ACL_TYPE_ZFS };
+typedef struct zacl { u32 *aclbuf; size_t sz; } zacl_t;
+typedef struct pacl { struct posix_acl *na_pacl; struct posix_acl *na_dpacl;} pacl_t;
+typedef union fsacl { zacl_t zfsacl; pacl_t posixacl; } fsacl_t;
+typedef __be32(*aclconv_t)(enum nfs_ftype4, struct nfs4_acl *, fsacl_t *);
+
 /* nfsd/vfs.c */
 struct nfsd_attrs {
 	struct iattr		*na_iattr;	/* input */
 	struct xdr_netobj	*na_seclabel;	/* input */
-	struct posix_acl	*na_pacl;	/* input */
-	struct posix_acl	*na_dpacl;	/* input */
+	fsacl_t			na_fsacl;
+	enum acltype		na_acltype;
 
 	int			na_labelerr;	/* output */
 	int			na_aclerr;	/* output */
+	aclconv_t		na_conv_fn;
 };
 
 static inline void nfsd_attrs_free(struct nfsd_attrs *attrs)
 {
-	posix_acl_release(attrs->na_pacl);
-	posix_acl_release(attrs->na_dpacl);
+	switch(attrs->na_acltype) {
+	case ACL_TYPE_POSIX:
+		posix_acl_release(attrs->na_fsacl.posixacl.na_pacl);
+		posix_acl_release(attrs->na_fsacl.posixacl.na_dpacl);
+		break;
+	case ACL_TYPE_ZFS:
+		kfree(attrs->na_fsacl.zfsacl.aclbuf);
+		attrs->na_fsacl.zfsacl.aclbuf = NULL;
+		attrs->na_fsacl.zfsacl.sz = 0;
+		break;
+	case ACL_TYPE_NONE:
+		break;
+	default:
+		BUG();
+	};
+
+	attrs->na_acltype = ACL_TYPE_NONE;
 }
 
 static inline bool nfsd_attrs_valid(struct nfsd_attrs *attrs)

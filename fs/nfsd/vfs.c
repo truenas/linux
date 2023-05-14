@@ -582,15 +582,30 @@ nfsd_setattr(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	if (attr->na_seclabel && attr->na_seclabel->len)
 		attr->na_labelerr = security_inode_setsecctx(dentry,
 			attr->na_seclabel->data, attr->na_seclabel->len);
-	if (IS_ENABLED(CONFIG_FS_POSIX_ACL) && attr->na_pacl)
-		attr->na_aclerr = set_posix_acl(&nop_mnt_idmap,
-						dentry, ACL_TYPE_ACCESS,
-						attr->na_pacl);
-	if (IS_ENABLED(CONFIG_FS_POSIX_ACL) &&
-	    !attr->na_aclerr && attr->na_dpacl && S_ISDIR(inode->i_mode))
-		attr->na_aclerr = set_posix_acl(&nop_mnt_idmap,
-						dentry, ACL_TYPE_DEFAULT,
-						attr->na_dpacl);
+
+	switch(attr->na_acltype) {
+	case ACL_TYPE_POSIX:
+		if (IS_ENABLED(CONFIG_FS_POSIX_ACL) && attr->na_fsacl.posixacl.na_pacl)
+			attr->na_aclerr = set_posix_acl(&nop_mnt_idmap,
+							dentry, ACL_TYPE_ACCESS,
+							attr->na_fsacl.posixacl.na_pacl);
+		if (IS_ENABLED(CONFIG_FS_POSIX_ACL) &&
+		    !attr->na_aclerr && attr->na_fsacl.posixacl.na_dpacl &&
+			S_ISDIR(inode->i_mode))
+			attr->na_aclerr = set_posix_acl(&nop_mnt_idmap,
+							dentry, ACL_TYPE_DEFAULT,
+							attr->na_fsacl.posixacl.na_dpacl);
+		break;
+	case ACL_TYPE_ZFS:
+		if (attr->na_fsacl.zfsacl.aclbuf)
+			attr->na_aclerr = nfsv4_set_zfacl_from_attr(dentry, attr);
+		break;
+	case ACL_TYPE_NONE:
+		break;
+	default:
+		BUG();
+	};
+
 out_fill_attrs:
 	/*
 	 * RFC 1813 Section 3.3.2 does not mandate that an NFS server
@@ -1480,7 +1495,7 @@ nfsd_create_locked(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		iap->ia_mode = 0;
 	iap->ia_mode = (iap->ia_mode & S_IALLUGO) | type;
 
-	if (!IS_POSIXACL(dirp))
+	if (!IS_POSIXACL(dirp) && !IS_NFSV4ACL(dirp))
 		iap->ia_mode &= ~current_umask();
 
 	err = 0;
@@ -2565,6 +2580,20 @@ nfsd_permission(struct svc_cred *cred, struct svc_export *exp,
 	/* This assumes  NFSD_MAY_{READ,WRITE,EXEC} == MAY_{READ,WRITE,EXEC} */
 	err = inode_permission(&nop_mnt_idmap, inode,
 			       acc & (MAY_READ | MAY_WRITE | MAY_EXEC));
+
+	/*
+	 * See RFC 5661 Section 6.2.1.3.2
+	 * Allow NFSv4 ACL to override normal delete permission
+	 * In this case REMOVE is granted if DELETE is granted on file
+	 * or DELETE_CHILD is granted on parent.
+	 */
+	if ((err == -EACCES) && IS_NFSV4ACL(inode) &&
+	    (acc == NFSD_MAY_REMOVE)) {
+		err = inode_permission(&nop_mnt_idmap, inode, MAY_DELETE);
+		if (err == -EACCES)
+			err = inode_permission(&nop_mnt_idmap, d_inode(dentry->d_parent),
+			    MAY_DELETE_CHILD);
+	}
 
 	/* Allow read access to binaries even when mode 111 */
 	if (err == -EACCES && S_ISREG(inode->i_mode) &&
