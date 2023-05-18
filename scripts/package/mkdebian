@@ -255,6 +255,19 @@ Description: Linux kernel debugging symbols for $version
 EOF
 fi
 
+if is_enabled CONFIG_PERF_EVENTS && [ "$exversion" = "production" ]; then
+cat <<EOF >> debian/control
+
+Package: linux-perf-truenas
+Architecture: $debarch
+Replaces: linux-base, linux-tools-common, linux-perf
+Depends: \${shlibs:Depends}
+Description: Performance analysis tools for Linux $version
+ This package contains the 'perf' performance analysis tools for Linux
+ kernel version $version .
+EOF
+fi
+
 if [ ! -f debian/changelog ]; then
 	dch --no-conf -b --package $sourcename --newversion $version-1 \
 		--distribution sid --urgency low \
