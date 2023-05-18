@@ -98,7 +98,12 @@ jobs:
           sudo apt update
           sudo apt install -y build-essential gawk flex bison openssl dkms \
           libelf-dev libudev-dev libpci-dev libiberty-dev autoconf dwarves \
-          libncurses-dev libssl-dev devscripts debhelper-compat
+          libncurses-dev libssl-dev libelf-dev libdw-dev systemtap-sdt-dev \
+          libunwind-dev libslang2-dev libperl-dev binutils-dev libiberty-dev \
+          python3-dev liblzma-dev libzstd-dev libcap-dev libnuma-dev \
+          libbabeltrace-dev openjdk-11-jdk devscripts libncurses-dev \
+          libssl-dev debhelper-compat libpfm4-dev libtraceevent-dev \
+          libcapstone-dev llvm-dev
 
       - name: Generate .config
         run: |
