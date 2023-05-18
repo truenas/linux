@@ -169,6 +169,20 @@ install_libc_headers () {
 	mv $pdir/usr/include/asm $pdir/usr/include/$host_arch/
 }
 
+install_perf () {
+	tools_dir=$1
+	rm -rf $tools_dir
+	mkdir -p $tools_dir
+	tools_dest=`readlink -f $tools_dir`
+	if [ -n "$O" ] ; then
+		output=$(readlink -f $objtree)
+		mkdir -p $output/tools/perf
+		output="O=$output/tools/perf"
+	fi
+	$MAKE -C $srctree/tools/perf $output LDFLAGS= srctree=$KBUILD_SRC prefix=$tools_dest/usr NO_LIBTRACEEVENT=1 install
+	dpkg-shlibdeps $tools_dest/usr/bin/*
+}
+
 rm -f debian/files
 
 packages_enabled=$(dh_listpackages)
@@ -188,6 +202,10 @@ do
 		install_libc_headers debian/linux-libc-dev;;
 	linux-headers-*)
 		install_kernel_headers debian/linux-headers ${KERNELRELEASE};;
+	linux-perf-truenas)
+		if is_enabled CONFIG_PERF_EVENTS && echo "${version}" | grep -q "production"; then
+			install_perf debian/linux-perf
+		fi
 	esac
 done
 
@@ -202,6 +220,10 @@ do
 		create_package ${package} debian/linux-libc-dev;;
 	linux-headers-*)
 		create_package ${package} debian/linux-headers;;
+	linux-perf-truenas)
+		if is_enabled CONFIG_PERF_EVENTS && echo "${version}" | grep -q "production"; then
+			create_package ${package} debian/linux-perf
+		fi
 	esac
 done
 
