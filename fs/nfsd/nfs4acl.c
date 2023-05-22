@@ -262,8 +262,10 @@ get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 		return -ENOMEM;
 
 	len = vfs_getxattr(&init_user_ns, dentry, NA41_NAME, xdr_buf, xdr_buf_sz);
-	if (len == 0)
-		return -EOPNOTSUPP;
+	if (len == 0) {
+		error = -EOPNOTSUPP;
+		goto out;
+	}
 
 	if (len < 0) {
 		switch (len) {
