@@ -111,8 +111,10 @@ version=$KERNELRELEASE
 echo "XXX: Kernel_release: ${version}"
 tmpdir=debian/linux-image
 dbg_dir=debian/linux-image-dbg
+tools_dir=debian/linux-perf
 packagename=linux-image-truenas-amd64
 dbg_packagename=$packagename-dbg
+tools_packagename=linux-perf-truenas
 
 if [ "$ARCH" = "um" ] ; then
 	packagename=user-mode-linux-$version
@@ -135,7 +137,7 @@ esac
 BUILD_DEBUG=$(if_enabled_echo CONFIG_DEBUG_INFO Yes)
 
 # Setup the directory structure
-rm -rf "$tmpdir" "$dbg_dir" debian/files
+rm -rf "$tmpdir" "$dbg_dir" "$tools_dir" debian/files
 mkdir -m 755 -p "$tmpdir/DEBIAN"
 mkdir -p "$tmpdir/lib" "$tmpdir/boot"
 
@@ -222,6 +224,19 @@ if [ -n "$BUILD_DEBUG" ] ; then
 	# kdump-tools
 	ln -s lib/modules/$version/vmlinux $dbg_dir/usr/lib/debug/vmlinux-$version
 	create_package "$dbg_packagename" "$dbg_dir"
+fi
+
+if is_enabled CONFIG_PERF_EVENTS; then
+	mkdir -p $tools_dir
+	tools_dest=`readlink -f $tools_dir`
+	if [ -n "$O" ] ; then
+		output=$(readlink -f $objtree)
+		mkdir -p $output/tools/perf
+		output="O=$output/tools/perf"
+	fi
+	$MAKE -C $srctree/tools/perf $output LDFLAGS= srctree=$KBUILD_SRC prefix=$tools_dest/usr install
+	dpkg-shlibdeps $tools_dest/usr/bin/* $tools_dest/usr/lib64/traceevent/plugins/*
+	create_package "$tools_packagename" "$tools_dir"
 fi
 
 exit 0
