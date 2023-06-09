@@ -657,6 +657,18 @@ int cifs_update_super_prepath(struct cifs_sb_info *cifs_sb, char *prefix);
 char *extract_hostname(const char *unc);
 char *extract_sharename(const char *unc);
 
+#ifdef CONFIG_TRUENAS
+int ntsd_to_zfsacl_xattr(struct cifs_ntsd *pacl,
+			 u32 acllen,
+			 struct inode *inode,
+			 char **buf_out);
+int zfsacl_xattr_to_ntsd(char *aclbuf,
+			 size_t size,
+			 struct inode *inode,
+			 struct cifs_ntsd **ppntsd_out,
+			 u32 *acllen_out);
+#endif
+
 #ifdef CONFIG_CIFS_DFS_UPCALL
 static inline int get_dfs_path(const unsigned int xid, struct cifs_ses *ses,
 			       const char *old_path,

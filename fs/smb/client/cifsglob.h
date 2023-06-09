@@ -2022,6 +2022,10 @@ extern unsigned int dir_cache_timeout; /* max time for directory lease caching o
 extern bool disable_legacy_dialects;  /* forbid vers=1.0 and vers=2.0 mounts */
 extern atomic_t mid_count;
 
+#ifdef CONFIG_TRUENAS
+extern unsigned int global_zfsaclflags;
+#endif
+
 void cifs_oplock_break(struct work_struct *work);
 void cifs_queue_oplock_break(struct cifsFileInfo *cfile);
 void smb2_deferred_work_close(struct work_struct *work);
