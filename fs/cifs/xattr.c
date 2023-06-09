@@ -18,6 +18,9 @@
 #include "cifs_fs_sb.h"
 #include "cifs_unicode.h"
 #include "cifs_ioctl.h"
+#ifdef CONFIG_TRUENAS
+#include "nfs41acl_xdr.h"
+#endif
 
 #define MAX_EA_VALUE_SIZE CIFSMaxBufSize
 #define CIFS_XATTR_CIFS_ACL "system.cifs_acl" /* DACL only */
@@ -25,6 +28,7 @@
 #define CIFS_XATTR_CIFS_NTSD_FULL "system.cifs_ntsd_full" /* owner/DACL/SACL */
 #define CIFS_XATTR_ATTRIB "cifs.dosattrib"  /* full name: user.cifs.dosattrib */
 #define CIFS_XATTR_CREATETIME "cifs.creationtime"  /* user.cifs.creationtime */
+#define CIFS_XATTR_ZFS_ACL "system.nfs4_acl_xdr" /* DACL only */
 /*
  * Although these three are just aliases for the above, need to move away from
  * confusing users and using the 20+ year old term 'cifs' when it is no longer
@@ -38,7 +42,7 @@
 /* BB need to add server (Samba e.g) support for security and trusted prefix */
 
 enum { XATTR_USER, XATTR_CIFS_ACL, XATTR_ACL_ACCESS, XATTR_ACL_DEFAULT,
-	XATTR_CIFS_NTSD, XATTR_CIFS_NTSD_FULL };
+	XATTR_CIFS_NTSD, XATTR_CIFS_NTSD_FULL, XATTR_ZFSACL };
 
 static int cifs_attrib_set(unsigned int xid, struct cifs_tcon *pTcon,
 			   struct inode *inode, const char *full_path,
@@ -200,6 +204,44 @@ static int cifs_xattr_set(const struct xattr_handler *handler,
 		}
 		break;
 	}
+
+#ifdef CONFIG_TRUENAS
+	case XATTR_ZFSACL: {
+		u32 final;
+		struct cifs_ntsd *pacl = NULL;
+
+		if (pTcon->ses->server->ops->set_acl == NULL)
+			goto out; /* rc already EOPNOTSUPP */
+
+		if ((global_zfsaclflags & MODFLAG_ALLOW_ACL_WRITE) == 0) {
+			cifs_dbg(VFS, "ZFSACL write support is disabled\n");
+			rc = -EPERM;
+			goto out;
+		}
+
+		/*
+		 * Force SMB3 so that we have support for DACL control bit
+		 */
+		if (pTcon->ses->server->dialect < SMB30_PROT_ID) {
+			cifs_dbg(VFS, "ZFS ACL is not supported on this protocol version, "
+				 "use 3.0 or above\n");
+			goto out; /* rc already EOPNOTSUPP */
+		}
+
+		rc = zfsacl_xattr_to_ntsd((char *)value, size, inode, &pacl, &final);
+		if (rc == 0) {
+			rc = pTcon->ses->server->ops->set_acl(pacl,
+				final, inode, full_path, CIFS_ACL_DACL);
+
+			if (rc == 0) /* force revalidate of the inode */
+				CIFS_I(inode)->time = 0;
+
+			kfree(pacl);
+		}
+
+		break;
+	}
+#endif /* CONFIG_TRUENASE */
 
 #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 	case XATTR_ACL_ACCESS:
@@ -366,6 +408,50 @@ static int cifs_xattr_get(const struct xattr_handler *handler,
 		}
 		break;
 	}
+#ifdef CONFIG_TRUENAS
+	case XATTR_ZFSACL: {
+		struct cifs_ntsd *pacl;
+		char *zfsacl;
+		u32 acllen;
+
+		if (pTcon->ses->server->ops->get_acl == NULL) {
+			goto out; /* rc already EOPNOTSUPP */
+		}
+
+		/*
+		 * Force SMB3 so that we have support for DACL control bit
+		 */
+		if (pTcon->ses->server->dialect < SMB30_PROT_ID) {
+			cifs_dbg(VFS, "ZFS ACL is not supported on this "
+				 "protocol version, use 3.0 or above\n");
+			goto out; /* rc already EOPNOTSUPP */
+		}
+
+		pacl = pTcon->ses->server->ops->get_acl(cifs_sb,
+				inode, full_path, &acllen, 0);
+		if (IS_ERR(pacl)) {
+			rc = PTR_ERR(pacl);
+			cifs_dbg(VFS, "%s: error %zd getting sec desc\n",
+				 __func__, rc);
+		} else {
+			rc = ntsd_to_zfsacl_xattr(pacl, acllen, inode, &zfsacl);
+			kfree(pacl);
+		}
+
+		if (rc > 0) {
+			// zero size means return size of buffer needed to get xattr
+			if (size != 0) {
+				if (rc > size)
+					rc = -ERANGE;
+				else
+					memcpy(value, zfsacl, rc);
+			}
+
+			kfree(zfsacl);
+		}
+		break;
+	}
+#endif /* CONFIG_TRUENAS */
 #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 	case XATTR_ACL_ACCESS:
 #ifdef CONFIG_CIFS_POSIX
@@ -492,6 +578,15 @@ static const struct xattr_handler cifs_cifs_ntsd_xattr_handler = {
 	.set = cifs_xattr_set,
 };
 
+#ifdef CONFIG_TRUENAS
+static const struct xattr_handler zfsacl_xattr_handler = {
+	.name = CIFS_XATTR_ZFS_ACL,
+	.flags = XATTR_ZFSACL,
+	.get = cifs_xattr_get,
+	.set = cifs_xattr_set,
+};
+#endif
+
 /*
  * Although this is just an alias for the above, need to move away from
  * confusing users and using the 20 year old term 'cifs' when it is no
@@ -551,5 +646,8 @@ const struct xattr_handler *cifs_xattr_handlers[] = {
 	&smb3_ntsd_full_xattr_handler, /* alias for above since avoiding "cifs" */
 	&cifs_posix_acl_access_xattr_handler,
 	&cifs_posix_acl_default_xattr_handler,
+#ifdef CONFIG_TRUENAS
+	&zfsacl_xattr_handler,
+#endif
 	NULL
 };
