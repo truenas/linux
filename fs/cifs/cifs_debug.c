@@ -769,7 +769,7 @@ cifs_proc_clean(void)
 	remove_proc_entry("mount_params", proc_fs_cifs);
 
 #ifdef CONFIG_TRUENAS
-	remove_proc_entry("ZFSACL_Flags", proc_fs_cifs);
+	remove_proc_entry("zfsacl_configuration_flags", proc_fs_cifs);
 #endif
 
 #ifdef CONFIG_CIFS_DFS_UPCALL
@@ -1045,17 +1045,21 @@ static ssize_t cifs_zfsacl_flags_proc_write(struct file *file,
 	unsigned int flags, idmap_flags;
 	char flags_string[12] = { 0 };
 
+	if (count >= sizeof(flags_string))
+		return -EFAULT;
+
 	if (copy_from_user(flags_string, buffer, count))
 		return -EFAULT;
 
 	rc = kstrtouint(flags_string, 0, &flags);
 	if (rc) {
-		cifs_dbg(VFS, "Invalid ZFSACL_Flags: %s\n", flags_string);
+		cifs_dbg(VFS, "failed to convert flags [%s] to int\n",
+			 flags_string);
 		return rc;
 	}
 
 	if (flags & ~MODFLAG_ALL) {
-		cifs_dbg(VFS, "Invalid ZFSACL_Flags: %s\n", flags_string);
+		cifs_dbg(VFS, "Invalid flags: 0x%08\n", flags & ~MODFLAG_ALL);
 		return -EINVAL;
 	}
 
@@ -1070,7 +1074,13 @@ static ssize_t cifs_zfsacl_flags_proc_write(struct file *file,
 	    (idmap_flags == (MODFLAG_FAIL_UNKNOWN_SID | MODFLAG_SKIP_UNKNOWN_SID)) ||
 	    (idmap_flags == (MODFLAG_FAIL_UNKNOWN_SID | MODFLAG_MAP_UNKNOWN_SID)) ||
 	    (idmap_flags == (MODFLAG_SKIP_UNKNOWN_SID | MODFLAG_MAP_UNKNOWN_SID))) {
-		cifs_dbg(VFS, "Only one idmap-related flag may be set");
+		cifs_dbg(VFS, "Only one idmap-related flag may be set. Current settings: "
+			 "fail_unknown_sid: %s, skip_unknown_sid: %s, map_unknown_sid: %s, "
+			 "raw: 0x%08x\n",
+			 idmap_flags & MODFLAG_FAIL_UNKNOWN_SID ? "true" : "false",
+			 idmap_flags & MODFLAG_SKIP_UNKNOWN_SID ? "true" : "false",
+			 idmap_flags & MODFLAG_MAP_UNKNOWN_SID ? "true" : "false",
+			 idmap_flags);
 		return -EINVAL;
 	}
 

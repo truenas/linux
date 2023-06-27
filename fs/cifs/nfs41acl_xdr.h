@@ -30,6 +30,9 @@
 #define NA_ACCESS_MASK_OFFSET 3
 #define NA_WHO_OFFSET 4
 
+/*
+ * Following are defined in RFC 5661 Section 6.2.1.3 ACE Access Mask
+ */
 #define ACE4_READ_DATA 0x00000001
 #define ACE4_WRITE_DATA 0x00000002
 #define ACE4_APPEND_DATA 0x00000004
@@ -56,6 +59,9 @@
 
 #define ACE4_ALL_PERMS (ACE4_MODIFY_PERMS|ACE4_WRITE_ACL|ACE4_WRITE_OWNER)
 
+/*
+ * Following are defined in RFC 5661 Section 6.2.1.4 ACE flags
+ */
 #define ACE4_FILE_INHERIT_ACE 0x00000001
 #define ACE4_DIRECTORY_INHERIT_ACE 0x00000002
 #define ACE4_NO_PROPAGATE_INHERIT_ACE 0x00000004
@@ -82,11 +88,23 @@
 #define NACE41_LEN 5
 #define NACL_OFFSET 2
 
+/*
+ * Follow ACL flags are defined in RFC 5661 Section 6.4.3.2 and are mapped to
+ * NT Security Descriptor control bits (MS-DTYP Section 2.4.6) on an as-needed
+ * basis. From a practical standpoint the primary concern is preserving the
+ * DACL Protected bit as this alters Windows SMB client auto-inheritance
+ * behavior when propagating ACL changes recursively.
+ */
 #define ACL4_AUTO_INHERIT 0x00000001
 #define ACL4_PROTECTED 0x00000002
 #define ACL4_DEFAULTED 0x00000004
+
+/* Non-RFC ZFS flag indicating that ACL is a directory */
 #define ACL4_ISDIR 0x00020000
 
+/*
+ * Following are defined in RFC 5661 Section 6.2.1.1
+ */
 #define ACE4_ACCESS_ALLOWED_ACE_TYPE 0x0000
 #define ACE4_ACCESS_DENIED_ACE_TYPE 0x0001
 #define ACE4_SYSTEM_AUDIT_ACE_TYPE 0x0002

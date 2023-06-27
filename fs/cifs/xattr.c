@@ -241,7 +241,7 @@ static int cifs_xattr_set(const struct xattr_handler *handler,
 
 		break;
 	}
-#endif /* CONFIG_TRUENASE */
+#endif /* CONFIG_TRUENAS */
 
 #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 	case XATTR_ACL_ACCESS:
