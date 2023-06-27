@@ -526,9 +526,33 @@ ssize_t cifs_listxattr(struct dentry *direntry, char *data, size_t buf_size)
 		search server for EAs or streams to
 		returns as xattrs */
 
-	if (pTcon->ses->server->ops->query_all_EAs)
+	if (pTcon->ses->server->ops->query_all_EAs) {
 		rc = pTcon->ses->server->ops->query_all_EAs(xid, pTcon,
 				full_path, NULL, data, buf_size, cifs_sb);
+		if (rc < 0) goto list_ea_exit;
+	}
+
+#ifdef CONFIG_TRUENAS
+	if ((pTcon->ses->server->ops->get_acl) &&
+	    (pTcon->ses->server->dialect >= SMB30_PROT_ID)) {
+		/*
+		 * If OS/2 style EA support is disabled we still
+		 * want to return our special ACL xattr in the list.
+		 */
+		rc = rc > 0 ? rc : 0;
+		if (buf_size) {
+			if ((rc + sizeof(CIFS_XATTR_ZFS_ACL)) > buf_size) {
+				rc = -ERANGE;
+				goto list_ea_exit;
+			}
+			memcpy(data + rc, CIFS_XATTR_ZFS_ACL,
+			       sizeof(CIFS_XATTR_ZFS_ACL));
+		}
+
+		rc += sizeof(CIFS_XATTR_ZFS_ACL);
+	}
+#endif /* CONFIG_TRUENAS */
+
 list_ea_exit:
 	free_dentry_path(page);
 	free_xid(xid);
