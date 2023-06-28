@@ -128,9 +128,17 @@
  * Supported flags for /proc/fs/cifs/zfsacl_configuration_flags
  */
 #define MODFLAG_UNDEFINED		0x00000000
+
+/* if SID is unknown map it to current fsuid */
 #define MODFLAG_MAP_UNKNOWN_SID		0x00000001
+
+/* if SID is unknown, skip it */
 #define MODFLAG_SKIP_UNKNOWN_SID	0x00000002
+
+/* if SID is unknown, fail the operation */
 #define MODFLAG_FAIL_UNKNOWN_SID	0x00000004
+
+/* Allow writing ACL through xattr (off by default) */
 #define MODFLAG_ALLOW_ACL_WRITE		0x00000008
 
 #define MODFLAG_ALL_IDMAP (MODFLAG_FAIL_UNKNOWN_SID | MODFLAG_MAP_UNKNOWN_SID |\

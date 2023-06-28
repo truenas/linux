@@ -260,7 +260,6 @@ is_well_known_sid(const struct cifs_sid *psid, uint32_t *puid, bool is_group)
 		*puid = le32_to_cpu(psid->sub_auth[2]);
 	}
 
-	cifs_dbg(FYI, "Unix UID %d returned from SID\n", *puid);
 	return true; /* well known sid found, uid returned */
 }
 
@@ -1842,7 +1841,8 @@ convert_smb_flags_to_nfs(u8 smbflags, u32 *nfs_flags_out)
 	u32 flags = 0;
 
 	if (smbflags & (SUCCESSFUL_ACCESS_ACE_FLAG | FAILED_ACCESS_ACE_FLAG)) {
-		cifs_dbg(VFS, "ACE contains unsupported flags 0x%04x\n", smbflags);
+		cifs_dbg(VFS, "%s: ACE contains unsupported flags 0x%04x\n",
+			 __func__, smbflags);
 		return -EINVAL;
 	}
 
@@ -1866,8 +1866,8 @@ convert_smb_ace_type_to_nfs(u8 smbacetype, u32 *nfs_ace_type_out)
 		*nfs_ace_type_out = ACCESS_DENIED_ACE_TYPE;
 		break;
 	default:
-		cifs_dbg(VFS, "ACE contains unsupported ace type 0x%04x\n",
-			 smbacetype);
+		cifs_dbg(VFS, "%s: ACE contains unsupported ace type 0x%04x\n",
+			 __func__, smbacetype);
 		return -EINVAL;
 	}
 
@@ -1960,7 +1960,8 @@ convert_smb_sid_to_nfs_who(struct cifs_sid *psid, u32 *iflag, u32 *who_id, u32 *
 	int rc;
 
 	if (unlikely(psid->num_subauth > SID_MAX_SUB_AUTHORITIES)) {
-		cifs_dbg(FYI, "%s: %u subauthorities is too many!\n",
+		cifs_dbg(FYI, "%s: subauthority count [%u] exceeds "
+			 "maxiumum possible value.\n",
 			 __func__, psid->num_subauth);
 		return -EIO;
 	}
@@ -2007,8 +2008,9 @@ try_upcall_to_get_id:
 
 	BUILD_BUG_ON(sizeof(uid_t) != sizeof(gid_t));
 	if (sidkey->datalen != sizeof(uid_t)) {
-		cifs_dbg(FYI, "%s: Downcall contained malformed key (datalen=%hu)\n",
-			 __func__, sidkey->datalen);
+		cifs_dbg(FYI, "%s: Downcall for sid [%s] contained malformed "
+			 "key (datalen=%hu)\n",
+			 __func__, sidstr, sidkey->datalen);
 		key_invalidate(sidkey);
 		key_put(sidkey);
 		revert_creds(saved_cred);
@@ -2039,7 +2041,8 @@ do_ace_conversion(struct cifs_ace *pace,
 	int error;
 
 	if (le16_to_cpu(pace->size) < 16) {
-		cifs_dbg(VFS, "ACE too small %d\n", le16_to_cpu(pace->size));
+		cifs_dbg(VFS, "%s: NT ACE size is invalid %d\n",
+			 __func__, le16_to_cpu(pace->size));
 		return -E2BIG;
 	}
 
@@ -2060,6 +2063,25 @@ do_ace_conversion(struct cifs_ace *pace,
 
 	error = convert_smb_sid_to_nfs_who(&pace->sid, p_iflag, p_who_id, p_flags);
 	if (error == -ENOKEY) {
+		if (*p_acp_type == ACE4_ACCESS_DENIED_ACE_TYPE) {
+			sid_str = sid_to_key_str(&pace->sid, SIDOWNER);
+			if (sid_str == NULL) {
+				return -ENOMEM;
+			}
+
+			cifs_dbg(VFS,
+				 "%s: [%s] unable to convert SID into a local "
+				 "ID for a DENY ACL entry. Since omission or "
+				 "alteration of the ACL entry would increase "
+				 "access to the file, this error may not be "
+				 "overriden via client configuration change. "
+				 "Administrative action will be required to "
+				 "either remove the ACL entry from the remote "
+				 "server or map the unknown SID to a local "
+				 "Unix ID on this client\n", __func__, sid_str);
+			kfree(sid_str);
+			return -ENOKEY;
+                }
 		if (global_zfsaclflags & MODFLAG_SKIP_UNKNOWN_SID) {
 			return -EAGAIN;
 		} else if (global_zfsaclflags & MODFLAG_MAP_UNKNOWN_SID) {
@@ -2226,7 +2248,9 @@ convert_dacl_to_zfsacl(struct cifs_acl *dacl_ptr,
 		return generate_empty_zfsacl(buf_out);
 
 	if (end < (char *)dacl_ptr + le16_to_cpu(dacl_ptr->size)) {
-		cifs_dbg(VFS, "ACL too small to parse DACL\n");
+		cifs_dbg(VFS, "%s: ACL size [%u] encoded in NT DACL "
+			 "is invalid.\n",
+			 __func__, le16_to_cpu(dacl_ptr->size));
 		return EINVAL;
 	}
 
@@ -2245,7 +2269,10 @@ convert_dacl_to_zfsacl(struct cifs_acl *dacl_ptr,
 		acl_base += pace->size;
 
 		if (end < (char *)acl_base) {
-			cifs_dbg(VFS, "ACL too small to parse DACL\n");
+			cifs_dbg(VFS, "%s: ACL entry %d in NT DACL has a size "
+				 "[%u] that would exceed the buffer size "
+				 "allocated for DACL.",
+				 __func__, i, pace->size);
 			kfree(xdr_base);
 			return -EINVAL;
 		}
@@ -2269,18 +2296,16 @@ convert_dacl_to_zfsacl(struct cifs_acl *dacl_ptr,
 				aces_set = 0;
 				break;
 			default:
-				cifs_dbg(VFS, "ACE conversion failed\n");
+				cifs_dbg(VFS, "%s: conversion of ACE %d in "
+					 "DACL could not be converted into "
+					 "local ZFS ACE format: %d\n",
+					 __func__, i, aces_set);
 				kfree(xdr_base);
 				return aces_set;
 			}
 		}
 
 		good_aces += aces_set;
-		if (good_aces > num_aces) {
-			cifs_dbg(VFS, "Whoops, grew too big\n");
-			kfree(xdr_base);
-			return -E2BIG;
-		}
 		zfsacl += (aces_set * NACE41_LEN);
 	}
 
