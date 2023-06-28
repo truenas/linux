@@ -28,7 +28,6 @@
 #define CIFS_XATTR_CIFS_NTSD_FULL "system.cifs_ntsd_full" /* owner/DACL/SACL */
 #define CIFS_XATTR_ATTRIB "cifs.dosattrib"  /* full name: user.cifs.dosattrib */
 #define CIFS_XATTR_CREATETIME "cifs.creationtime"  /* user.cifs.creationtime */
-#define CIFS_XATTR_ZFS_ACL "system.nfs4_acl_xdr" /* DACL only */
 /*
  * Although these three are just aliases for the above, need to move away from
  * confusing users and using the 20+ year old term 'cifs' when it is no longer
@@ -41,8 +40,14 @@
 #define SMB3_XATTR_CREATETIME "smb3.creationtime"  /* user.smb3.creationtime */
 /* BB need to add server (Samba e.g) support for security and trusted prefix */
 
+#ifdef CONFIG_TRUENAS
+#define CIFS_XATTR_ZFS_ACL NA41_NAME /* DACL only */
 enum { XATTR_USER, XATTR_CIFS_ACL, XATTR_ACL_ACCESS, XATTR_ACL_DEFAULT,
 	XATTR_CIFS_NTSD, XATTR_CIFS_NTSD_FULL, XATTR_ZFSACL };
+#else
+enum { XATTR_USER, XATTR_CIFS_ACL, XATTR_ACL_ACCESS, XATTR_ACL_DEFAULT,
+	XATTR_CIFS_NTSD, XATTR_CIFS_NTSD_FULL };
+#endif /* CONFIG_TRUENAS */
 
 static int cifs_attrib_set(unsigned int xid, struct cifs_tcon *pTcon,
 			   struct inode *inode, const char *full_path,
