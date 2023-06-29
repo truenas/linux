@@ -2039,6 +2039,7 @@ do_ace_conversion(struct cifs_ace *pace,
 		  u32 *p_ace_type)
 {
 	int error;
+	char *sid_str;
 
 	if (le16_to_cpu(pace->size) < 16) {
 		cifs_dbg(VFS, "%s: NT ACE size is invalid %d\n",
@@ -2063,7 +2064,7 @@ do_ace_conversion(struct cifs_ace *pace,
 
 	error = convert_smb_sid_to_nfs_who(&pace->sid, p_iflag, p_who_id, p_flags);
 	if (error == -ENOKEY) {
-		if (*p_acp_type == ACE4_ACCESS_DENIED_ACE_TYPE) {
+		if (*p_ace_type == ACE4_ACCESS_DENIED_ACE_TYPE) {
 			sid_str = sid_to_key_str(&pace->sid, SIDOWNER);
 			if (sid_str == NULL) {
 				return -ENOMEM;

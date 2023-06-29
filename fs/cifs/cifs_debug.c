@@ -1059,7 +1059,7 @@ static ssize_t cifs_zfsacl_flags_proc_write(struct file *file,
 	}
 
 	if (flags & ~MODFLAG_ALL) {
-		cifs_dbg(VFS, "Invalid flags: 0x%08\n", flags & ~MODFLAG_ALL);
+		cifs_dbg(VFS, "Invalid flags: 0x%08x\n", flags & ~MODFLAG_ALL);
 		return -EINVAL;
 	}
 
