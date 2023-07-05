@@ -2,7 +2,7 @@
 #define _NFS41ACL_H
 
 /*
- * Native ZFS NFSv41-style ACL is packed in xattr as
+ * Native ZFS NFSv41-style ACL is packed (using network byte order) in xattr as
  * follows:
  *
  * struct nfsace4i {

@@ -1752,8 +1752,8 @@ generate_empty_zfsacl(char **buf_out)
 		return -ENOMEM;
 
 	zfsacl = xdrbuf;
-	*zfsacl++ = 0;
-	*zfsacl++ = htonl(1);
+	*zfsacl++ = 0; /* acl_flags */
+	*zfsacl++ = htonl(1); /* acl count */
 
 	set_xdr_ace(zfsacl, ACEI4_SPECIAL_WHO, ACE4_SPECIAL_OWNER,
 		    ACE4_ACCESS_ALLOWED_ACE_TYPE, 0, 0);
@@ -1778,8 +1778,8 @@ generate_null_zfsacl(char **buf_out)
 		return -ENOMEM;
 
 	zfsacl = xdrbuf;
-	*zfsacl++ = 0;
-	*zfsacl++ = htonl(1);
+	*zfsacl++ = 0; /* acl_flags */
+	*zfsacl++ = htonl(1); /* acl count */
 
 	set_xdr_ace(zfsacl, ACEI4_SPECIAL_WHO, ACE4_SPECIAL_EVERYONE,
 		    ACE4_ACCESS_ALLOWED_ACE_TYPE, ACE4_ALL_PERMS, 0);
@@ -1863,7 +1863,7 @@ convert_smb_ace_type_to_nfs(u8 smbacetype, u32 *nfs_ace_type_out)
 		*nfs_ace_type_out = ACE4_ACCESS_ALLOWED_ACE_TYPE;
 		break;
 	case ACCESS_DENIED_ACE_TYPE:
-		*nfs_ace_type_out = ACCESS_DENIED_ACE_TYPE;
+		*nfs_ace_type_out = ACE4_ACCESS_DENIED_ACE_TYPE;
 		break;
 	default:
 		cifs_dbg(VFS, "%s: ACE contains unsupported ace type 0x%04x\n",
@@ -2440,7 +2440,11 @@ convert_zfswho_to_ntsid(u32 iflag, u32 who_id, struct inode *inode, u32 flags, s
 	uint sidtype = flags & ACE4_IDENTIFIER_GROUP;
 	uid_t id;
 
-	if (iflag == 0) {
+	if ((iflag & ACEI4_SPECIAL_WHO) == 0) {
+		/*
+		 * This is not a special entry (owner@, group@, everyone@)
+		 * and so we need to make go through normal conversion
+		 */
 		return id_to_sid(who_id, sidtype, &ace->sid);
 	}
 
@@ -2472,7 +2476,7 @@ convert_zfswho_to_ntsid(u32 iflag, u32 who_id, struct inode *inode, u32 flags, s
 	return -EINVAL;
 }
 
-#define BASE_ACE_SIZE (1 + 1 + 2 + 4)
+#define BASE_ACE_SIZE (1 + 1 + 2 + 4) /* struct cifs_ace: type, flags, size, access_req */
 #define CIFS_ACE_SIZE(cnt) (BASE_ACE_SIZE + (CIFS_SID_BASE_SIZE + (cnt * 4)))
 
 static int
@@ -2496,7 +2500,7 @@ convert_zfsace_to_cifs_aces(u32 *zfsace, char *acl_base, struct inode *inode, u1
 	 * an identical access mask. One is non-inheriting for the inode owner
 	 * or group, and the other is inherit-only with the special SID value.
 	 */
-	if (iflag && (who_id != ACE4_SPECIAL_EVERYONE) &&
+	if ((iflag & ACEI4_SPECIAL_WHO) && (who_id != ACE4_SPECIAL_EVERYONE) &&
 	    S_ISDIR(inode->i_mode) && ((flags & ACE4_INHERIT_ONLY_ACE) == 0)) {
 		convert_zfsperm_to_ntperm(perms, ace);
 		convert_zfsflag_to_ntflag(flags | ACE4_INHERIT_ONLY_ACE, ace);
@@ -2670,6 +2674,7 @@ parse_single_ace(u32 *zfsace, struct cifs_ntsd **ppntsd_out, u32 *acllen_out)
 		return 0;
 	}
 
+	/* dacl_is_empty */
 	pnntsd->dacloffset = cpu_to_le32(sizeof(struct cifs_ntsd));
 	dacl = (struct cifs_acl *)(pnntsd + sizeof(struct cifs_ntsd));
 	dacl->size = cpu_to_le16(sizeof(struct cifs_acl));
@@ -2751,11 +2756,12 @@ int zfsacl_xattr_to_ntsd(char *aclbuf,
 	dacl->size = cpu_to_le16(acl_size_out);
 	if (error) {
 		kfree(pnntsd);
+		return error;
 	}
 
 	*ppntsd_out = pnntsd;
 	*acllen_out = secdesclen;
 
-	return error;
+	return 0;
 }
 #endif /* CONFIG_TRUENAS */
