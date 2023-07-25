@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0
 VERSION = 6
 PATCHLEVEL = 1
-SUBLEVEL = 24
-NAME = Hurr durr I'ma ninja sloth
+SUBLEVEL = 40
+NAME = Curry Ramen
 
 ifndef EXTRAVERSION
 EXTRAVERSION =
