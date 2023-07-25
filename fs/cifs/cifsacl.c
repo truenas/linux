@@ -2252,7 +2252,7 @@ convert_dacl_to_zfsacl(struct cifs_acl *dacl_ptr,
 		cifs_dbg(VFS, "%s: ACL size [%u] encoded in NT DACL "
 			 "is invalid.\n",
 			 __func__, le16_to_cpu(dacl_ptr->size));
-		return EINVAL;
+		return -EINVAL;
 	}
 
 	xdr_base = kzalloc(ACES_TO_XDRSIZE(num_aces), GFP_KERNEL);
