@@ -3131,8 +3131,10 @@ static int nvme_init_non_mdts_limits(struct nvme_ctrl *ctrl)
 	else
 		ctrl->max_zeroes_sectors = 0;
 
+	/* NVME_ID_CNS_CS_CTRL is supported from v2.0.0 onwards. */
 	if (ctrl->subsys->subtype != NVME_NQN_NVME ||
 	    !nvme_id_cns_ok(ctrl, NVME_ID_CNS_CS_CTRL) ||
+	    ctrl->vs < NVME_VS(2, 0, 0) ||
 	    test_bit(NVME_CTRL_SKIP_ID_CNS_CS, &ctrl->flags))
 		return 0;
 
