@@ -2910,7 +2910,8 @@ static int nvme_init_non_mdts_limits(struct nvme_ctrl *ctrl)
 	else
 		ctrl->max_zeroes_sectors = 0;
 
-	if (nvme_ctrl_limited_cns(ctrl))
+	/* NVME_ID_CNS_CS_CTRL is supported from v2.0.0 onwards. */
+	if (ctrl->vs < NVME_VS(2, 0, 0))
 		return 0;
 
 	id = kzalloc(sizeof(*id), GFP_KERNEL);
