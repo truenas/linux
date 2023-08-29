@@ -1,3 +1,9 @@
+linux-5.15.128+truenas (5.15.128+truenas-1) sid; urgency=low
+
+  * Rebase local commits onto upstream v5.15.128
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 29 Aug 2023 11:00:00 +0500
+
 linux-5.15.123+truenas (5.15.123+truenas-1) sid; urgency=low
 
   * Rebase local commits onto upstream v5.15.123
