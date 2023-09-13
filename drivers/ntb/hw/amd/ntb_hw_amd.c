@@ -1011,7 +1011,7 @@ static void amd_set_side_info_reg(struct amd_ntb_dev *ndev, bool peer)
 	}
 }
 
-static void amd_clear_side_info_reg(struct amd_ntb_dev *ndev, bool peer)
+static bool amd_clear_side_info_reg(struct amd_ntb_dev *ndev, bool peer)
 {
 	void __iomem *mmio = NULL;
 	unsigned int reg;
@@ -1026,7 +1026,9 @@ static void amd_clear_side_info_reg(struct amd_ntb_dev *ndev, bool peer)
 		reg &= ~AMD_SIDE_READY;
 		writel(reg, mmio + AMD_SIDEINFO_OFFSET);
 		readl(mmio + AMD_SIDEINFO_OFFSET);
+		return true;
 	}
+	return false;
 }
 
 static void amd_init_side_info(struct amd_ntb_dev *ndev)
@@ -1041,16 +1043,19 @@ static void amd_init_side_info(struct amd_ntb_dev *ndev)
 	writel(ntb_ctl, mmio + AMD_CNTL_OFFSET);
 }
 
-static void amd_deinit_side_info(struct amd_ntb_dev *ndev)
+static bool amd_deinit_side_info(struct amd_ntb_dev *ndev)
 {
 	void __iomem *mmio = ndev->self_mmio;
 	u32 ntb_ctl;
+	bool res;
 
-	amd_clear_side_info_reg(ndev, false);
+	res = amd_clear_side_info_reg(ndev, false);
 
 	ntb_ctl = readl(mmio + AMD_CNTL_OFFSET);
 	ntb_ctl &= ~(PMM_REG_CTL | SMM_REG_CTL);
 	writel(ntb_ctl, mmio + AMD_CNTL_OFFSET);
+
+	return res;
 }
 
 static int amd_init_ntb(struct amd_ntb_dev *ndev)
@@ -1234,6 +1239,17 @@ static int amd_ntb_pci_probe(struct pci_dev *pdev,
 	if (rc)
 		goto err_init_dev;
 
+	/*
+	 * If our READY bit in SIDEINFO register is already set, it likely
+	 * means we have crashed and the other controller could miss it.
+	 * In such case clear the bit, interrupt the other side, and give
+	 * it some time to see zero before we set the READY again below.
+	 */
+	if (amd_deinit_side_info(ndev)) {
+		ntb_peer_db_set(&ndev->ntb, BIT_ULL(ndev->db_last_bit));
+		msleep(1000);
+	}
+
 	/* write side info */
 	amd_init_side_info(ndev);
 
@@ -1269,8 +1285,8 @@ static void amd_ntb_pci_remove(struct pci_dev *pdev)
 	 * to the peer. This will make sure that when the peer handles the
 	 * DB event, it correctly reads this bit as being 0.
 	 */
-	amd_deinit_side_info(ndev);
-	ntb_peer_db_set(&ndev->ntb, BIT_ULL(ndev->db_last_bit));
+	if (amd_deinit_side_info(ndev))
+		ntb_peer_db_set(&ndev->ntb, BIT_ULL(ndev->db_last_bit));
 	ntb_unregister_device(&ndev->ntb);
 	ndev_deinit_debugfs(ndev);
 	amd_deinit_dev(ndev);
@@ -1285,8 +1301,8 @@ static void amd_ntb_pci_shutdown(struct pci_dev *pdev)
 	/* Send link down notification */
 	ntb_link_event(&ndev->ntb);
 
-	amd_deinit_side_info(ndev);
-	ntb_peer_db_set(&ndev->ntb, BIT_ULL(ndev->db_last_bit));
+	if (amd_deinit_side_info(ndev))
+		ntb_peer_db_set(&ndev->ntb, BIT_ULL(ndev->db_last_bit));
 	ntb_unregister_device(&ndev->ntb);
 	ndev_deinit_debugfs(ndev);
 	amd_deinit_dev(ndev);
