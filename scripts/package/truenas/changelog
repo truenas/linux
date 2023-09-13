@@ -24,6 +24,12 @@ linux-6.1.49+truenas (6.1.49+truenas-1) sid; urgency=low
 
 linux-6.1.49+truenas (6.1.49+truenas-1) sid; urgency=low
 
+  * ntb_hw_amd: Simulate link flap after unclean reboot
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Web, 13 Sep 2023 14:00:00 +0500
+
+linux-6.1.49+truenas (6.1.49+truenas-1) sid; urgency=low
+
   * Rebase local commits onto upstream v6.1.49
 
  -- iXsystems engineering team <dev@ixsystems.com>  Tue, 29 Aug 2023 11:00:00 +0500
