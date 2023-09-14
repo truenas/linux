@@ -217,7 +217,7 @@ struct amd_ntb_dev {
 #define hb_ndev(__work) container_of(__work, struct amd_ntb_dev, hb_timer.work)
 
 static void amd_set_side_info_reg(struct amd_ntb_dev *ndev, bool peer);
-static void amd_clear_side_info_reg(struct amd_ntb_dev *ndev, bool peer);
+static bool amd_clear_side_info_reg(struct amd_ntb_dev *ndev, bool peer);
 static int amd_poll_link(struct amd_ntb_dev *ndev);
 
 #endif
