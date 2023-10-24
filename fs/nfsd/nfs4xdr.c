@@ -318,11 +318,36 @@ nfsd4_decode_nfsace4(struct nfsd4_compoundargs *argp, struct nfs4_ace *ace)
 
 /* A counted array of nfsace4's */
 static noinline __be32
+#if CONFIG_TRUENAS
+nfsd4_decode_acl(struct nfsd4_compoundargs *argp, struct nfs4_acl **acl,
+		 enum nfs4_acl_type acl_type)
+{
+	struct nfs4_ace *ace;
+	__be32 status;
+	u32 count;
+	u32 acl_flag = 0;
+
+	switch (acl_type) {
+	case NFS4ACL_NONE:
+	case NFS4ACL_ACL:
+		break;
+
+	case NFS4ACL_DACL:
+	case NFS4ACL_SACL:
+		/*
+		 * Per RFC-8881 Section 6.4.3.2 nfsacl41 has a leading aclflag4
+		 */
+		if (xdr_stream_decode_u32(argp->xdr, &acl_flag) < 0)
+			return nfserr_bad_xdr;
+		break;
+	}
+#else
 nfsd4_decode_acl(struct nfsd4_compoundargs *argp, struct nfs4_acl **acl)
 {
 	struct nfs4_ace *ace;
 	__be32 status;
 	u32 count;
+#endif /* CONFIG_TRUENAS */
 
 	if (xdr_stream_decode_u32(argp->xdr, &count) < 0)
 		return nfserr_bad_xdr;
@@ -339,6 +364,9 @@ nfsd4_decode_acl(struct nfsd4_compoundargs *argp, struct nfs4_acl **acl)
 	if (*acl == NULL)
 		return nfserr_jukebox;
 
+#if CONFIG_TRUENAS
+	(*acl)->flag = acl_flag;
+#endif /* CONFIG_TRUENAS */
 	(*acl)->naces = count;
 	for (ace = (*acl)->aces; ace < (*acl)->aces + count; ace++) {
 		status = nfsd4_decode_nfsace4(argp, ace);
@@ -411,7 +439,11 @@ nfsd4_decode_fattr4(struct nfsd4_compoundargs *argp, u32 *bmval, u32 bmlen,
 		iattr->ia_valid |= ATTR_SIZE;
 	}
 	if (bmval[0] & FATTR4_WORD0_ACL) {
+#if CONFIG_TRUENAS
+		status = nfsd4_decode_acl(argp, acl, NFS4ACL_ACL);
+#else
 		status = nfsd4_decode_acl(argp, acl);
+#endif /* CONFIG_TRUENAS */
 		if (status)
 			return status;
 	} else
@@ -500,6 +532,16 @@ nfsd4_decode_fattr4(struct nfsd4_compoundargs *argp, u32 *bmval, u32 bmlen,
 			return nfserr_bad_xdr;
 		}
 	}
+#if CONFIG_TRUENAS
+	/*
+	 * This is based on the FATTR4_WORD0_ACL handling above.
+	 */
+	if (bmval[1] & FATTR4_WORD1_DACL) {
+		status = nfsd4_decode_acl(argp, acl, NFS4ACL_DACL);
+		if (status)
+			return status;
+	}
+#endif /* CONFIG_TRUENAS */
 	label->len = 0;
 	if (IS_ENABLED(CONFIG_NFSD_V4_SECURITY_LABEL) &&
 	    bmval[2] & FATTR4_WORD2_SECURITY_LABEL) {
@@ -2970,6 +3012,10 @@ static __be32 nfsd4_encode_fattr4_supported_attrs(struct xdr_stream *xdr,
 	if (!IS_POSIXACL(d_inode(args->dentry)) &&
 		!IS_NFSV4ACL(d_inode(args->dentry)))
 		supp[0] &= ~FATTR4_WORD0_ACL;
+#if CONFIG_TRUENAS
+	if (!IS_NFSV4ACL(d_inode(args->dentry)))
+		supp[1] &= ~FATTR4_WORD1_DACL;
+#endif /* CONFIG_TRUENAS */
 	if (!args->contextsupport)
 		supp[2] &= ~FATTR4_WORD2_SECURITY_LABEL;
 
@@ -3520,6 +3566,13 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 	int attrlen_offset;
 	u32 attrmask[3];
 	int err;
+#if CONFIG_TRUENAS
+	/*
+	 * Even though we expect *either* ACL or DACL to be fetched,
+	 * lets be cautious and use separate variables.
+	 */
+	struct nfs4_acl *dacl = NULL;
+#endif /* CONFIG_TRUENAS */
 	struct nfsd4_compoundres *resp = rqstp->rq_resp;
 	u32 minorversion = resp->cstate.minorversion;
 	struct path path = {
@@ -3600,7 +3653,19 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 		args.fhp = fhp;
 
 	if (attrmask[0] & FATTR4_WORD0_ACL) {
+#if CONFIG_TRUENAS
+		/*
+		 * In TrueNAS we have renamed the existing nfsd4_get_nfs4_acl
+		 * to get_nfs4_posix_acl, so that we can implement a nfsd4_get_nfs4_acl
+		 * that can be based either on POSIX ACL or ZFS ACL.
+		 *
+		 * Add a acl_type parameter so that the same underlying function
+		 * can be adapted to get either ACL or DACL.
+		 */
+		err = nfsd4_get_nfs4_acl(rqstp, dentry, &args.acl, NFS4ACL_ACL);
+#else
 		err = nfsd4_get_nfs4_acl(rqstp, dentry, &args.acl);
+#endif /* CONFIG_TRUENAS */
 		if (err == -EOPNOTSUPP)
 			attrmask[0] &= ~FATTR4_WORD0_ACL;
 		else if (err == -EINVAL) {
@@ -3609,6 +3674,19 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 		} else if (err != 0)
 			goto out_nfserr;
 	}
+
+#if CONFIG_TRUENAS
+	if (attrmask[1] & FATTR4_WORD1_DACL) {
+		err = nfsd4_get_nfs4_acl(rqstp, dentry, &dacl, NFS4ACL_DACL);
+		if (err == -EOPNOTSUPP)
+			attrmask[1] &= ~FATTR4_WORD1_DACL;
+		else if (err == -EINVAL) {
+			status = nfserr_attrnotsupp;
+			goto out;
+		} else if (err != 0)
+			goto out_nfserr;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	args.contextsupport = false;
 
@@ -3649,6 +3727,51 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 		if (status != nfs_ok)
 			goto out;
 	}
+#if CONFIG_TRUENAS
+	/* See FATTR4_WORD0_ACL above */
+	if (attrmask[1] & FATTR4_WORD1_DACL) {
+		struct nfs4_ace *ace;
+		__be32 *p;
+
+		if (dacl == NULL) {
+			p = xdr_reserve_space(xdr, 4);
+			if (!p)
+				goto out_resource;
+
+			*p++ = cpu_to_be32(0);
+			goto out_dacl;
+		}
+		p = xdr_reserve_space(xdr, 4);
+		if (!p)
+			goto out_resource;
+		*p++ = cpu_to_be32(dacl->flag);
+
+		p = xdr_reserve_space(xdr, 4);
+		if (!p)
+			goto out_resource;
+		*p++ = cpu_to_be32(dacl->naces);
+
+		for (ace = dacl->aces; ace < dacl->aces + dacl->naces; ace++) {
+			p = xdr_reserve_space(xdr, 4*3);
+			if (!p)
+				goto out_resource;
+			*p++ = cpu_to_be32(ace->type);
+			*p++ = cpu_to_be32(ace->flag);
+			*p++ = cpu_to_be32(ace->access_mask &
+					   NFS4_ACE_MASK_ALL);
+			if (ace->whotype != NFS4_ACL_WHO_NAMED)
+				status = nfs4_acl_write_who(xdr, ace->whotype);
+			else if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP)
+				status = nfsd4_encode_group(xdr, rqstp, ace->who_gid);
+			else
+				status = nfsd4_encode_user(xdr, rqstp, ace->who_uid);
+
+			if (status)
+				goto out;
+		}
+	}
+out_dacl:
+#endif /* CONFIG_TRUENAS */
 	*attrlen_p = cpu_to_be32(xdr->buf->len - attrlen_offset - XDR_UNIT);
 	status = nfs_ok;
 
@@ -3658,6 +3781,9 @@ out:
 		security_release_secctx(args.context, args.contextlen);
 #endif /* CONFIG_NFSD_V4_SECURITY_LABEL */
 	kfree(args.acl);
+#if CONFIG_TRUENAS
+	kfree(dacl);
+#endif /* CONFIG_TRUENAS */
 	if (tempfh) {
 		fh_put(tempfh);
 		kfree(tempfh);
