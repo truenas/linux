@@ -824,12 +824,14 @@ struct nfs_setattrargs {
 	const struct nfs4_label		*label;
 };
 
+#ifndef CONFIG_TRUENAS
 enum nfs4_acl_type {
 	NFS4ACL_NONE = 0,
 	NFS4ACL_ACL,
 	NFS4ACL_DACL,
 	NFS4ACL_SACL,
 };
+#endif /* ! CONFIG_TRUENAS */
 
 struct nfs_setaclargs {
 	struct nfs4_sequence_args	seq_args;
