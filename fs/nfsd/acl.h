@@ -40,6 +40,9 @@ struct svc_fh;
 struct svc_rqst;
 struct nfsd_attrs;
 enum nfs_ftype4;
+#if CONFIG_TRUENAS
+enum nfs4_acl_type;
+#endif /* CONFIG_TRUENAS */
 
 int nfs4_acl_bytes(int entries);
 int nfs4_acl_get_whotype(char *, u32);
@@ -47,7 +50,11 @@ __be32 nfs4_acl_write_who(struct xdr_stream *xdr, int who);
 
 void nfsd4_setup_attr(struct dentry *dentry, struct nfsd_attrs *attr);
 int nfsd4_get_nfs4_acl(struct svc_rqst *rqstp, struct dentry *dentry,
+#if CONFIG_TRUENAS
+		struct nfs4_acl **acl, enum nfs4_acl_type acl_type);
+#else
 		struct nfs4_acl **acl);
+#endif /* CONFIG_TRUENAS */
 int nfsv4_set_zfacl_from_attr(struct dentry *dentry,
 		struct nfsd_attrs *attr);
 
