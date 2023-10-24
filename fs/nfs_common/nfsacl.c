@@ -28,6 +28,10 @@
 #include <linux/nfsacl.h>
 #include <linux/nfs3.h>
 #include <linux/sort.h>
+#if CONFIG_TRUENAS
+#include "nfs41acl_xdr.h"
+#endif /* CONFIG_TRUENAS */
+
 
 MODULE_DESCRIPTION("NFS ACL support");
 MODULE_LICENSE("GPL");
@@ -419,3 +423,134 @@ bool nfs_stream_decode_acl(struct xdr_stream *xdr, unsigned int *aclcnt,
 	return true;
 }
 EXPORT_SYMBOL_GPL(nfs_stream_decode_acl);
+
+#if CONFIG_TRUENAS
+static int
+convert_to_nfs40_ace(u32 *xdrbuf, size_t *remaining, struct nfs4_ace *ace)
+{
+	int error = 0;
+	u32 iflag, id;
+
+	if (*remaining < ACE4SIZE)
+		return -EOVERFLOW;
+
+	ace->type = ntohl(*(xdrbuf++));
+	if (ace->type > NFS4_ACE_ACCESS_DENIED_ACE_TYPE)
+		return -EINVAL;
+
+	ace->flag = ntohl(*(xdrbuf++));
+	iflag = ntohl(*(xdrbuf++));
+	ace->access_mask = ntohl(*(xdrbuf++)) & NFS4_ACE_MASK_ALL;
+	id = ntohl(*(xdrbuf++));
+
+	*remaining -= ACE4SIZE;
+
+	if (iflag & ACEI4_SPECIAL_WHO) {
+		switch (id) {
+		case ACE4_SPECIAL_OWNER:
+			ace->whotype = NFS4_ACL_WHO_OWNER;
+			break;
+		case ACE4_SPECIAL_GROUP:
+			ace->whotype = NFS4_ACL_WHO_GROUP;
+			break;
+		case ACE4_SPECIAL_EVERYONE:
+			ace->whotype = NFS4_ACL_WHO_EVERYONE;
+			break;
+		}
+	} else {
+		ace->whotype = NFS4_ACL_WHO_NAMED;
+		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
+			ace->who_gid = make_kgid(&init_user_ns, id);
+			if (!gid_valid(ace->who_gid)) {
+				error = -EINVAL;
+			}
+		} else {
+			ace->who_uid = make_kuid(&init_user_ns, id);
+			if (!uid_valid(ace->who_uid)) {
+				error = -EINVAL;
+			}
+		}
+	}
+
+	return error;
+}
+
+int
+convert_nfs41xdr_to_nfs40_acl(u32 *xdrbuf, size_t remaining, struct nfs4_acl *acl)
+{
+	int error = 0;
+	int i;
+
+	for (i = 0; i < acl->naces; i++, xdrbuf += NACE41_LEN) {
+		error = convert_to_nfs40_ace(xdrbuf, &remaining, &acl->aces[i]);
+		if (error)
+			break;
+	}
+
+	return error;
+}
+EXPORT_SYMBOL_GPL(convert_nfs41xdr_to_nfs40_acl);
+
+static int
+convert_ace_to_nfs41(u32 *p, const struct nfs4_ace *ace)
+{
+	int error = 0;
+	u32 iflag = 0, who = -1;
+
+	/* Audit and Alarm are not currently supported */
+	if (ace->type > NFS4_ACE_ACCESS_DENIED_ACE_TYPE)
+		return -EINVAL;
+
+	switch (ace->whotype) {
+	case NFS4_ACL_WHO_OWNER:
+		iflag = ACEI4_SPECIAL_WHO;
+		who = ACE4_SPECIAL_OWNER;
+		break;
+	case NFS4_ACL_WHO_GROUP:
+		iflag = ACEI4_SPECIAL_WHO;
+		who = ACE4_SPECIAL_GROUP;
+		break;
+	case NFS4_ACL_WHO_EVERYONE:
+		iflag = ACEI4_SPECIAL_WHO;
+		who = ACE4_SPECIAL_EVERYONE;
+		break;
+	case NFS4_ACL_WHO_NAMED:
+		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP)
+			who = (u32)__kgid_val(ace->who_gid);
+		else
+			who = (u32)__kuid_val(ace->who_uid);
+		break;
+	default:
+		error = -EINVAL;
+	}
+
+	*p++ = htonl(ace->type);
+	*p++ = htonl(ace->flag & NFS41_FLAGS);
+	*p++ = htonl(iflag);
+	*p++ = htonl(ace->access_mask & NFS4_ACE_MASK_ALL);
+	*p++ = htonl(who);
+
+	return error;
+}
+
+int
+generate_nfs41acl_buf(u32 *xdrbuf, const struct nfs4_acl *acl)
+{
+	int error = 0;
+	int i;
+
+	/* first byte is NFS41 Flags. Skip since these are RFC3530 acls */
+	*xdrbuf++ = 0;
+	*xdrbuf++ = htonl(acl->naces);
+
+	for (i = 0; i < acl->naces; i++, xdrbuf += NACE41_LEN) {
+		error = convert_ace_to_nfs41(xdrbuf, &acl->aces[i]);
+		if (error)
+			break;
+	}
+
+	return error;
+}
+EXPORT_SYMBOL_GPL(generate_nfs41acl_buf);
+#endif /* CONFIG_TRUENAS */
+
