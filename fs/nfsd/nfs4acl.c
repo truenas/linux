@@ -247,10 +247,10 @@ convert_nfs41xdr_to_nfs40_acl(u32 *xdrbuf, size_t remaining, struct nfs4_acl *ac
 
 static int
 get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
-		struct nfs4_acl **pacl)
+		struct nfs4_acl **pacl, enum nfs4_acl_type acl_type)
 {
 	int error = 0;
-	u32 ace_cnt;
+	u32 ace_cnt, acl_flag = 0;
 	u32 *xdr_buf = NULL, *p;
 	struct nfs4_acl *acl = NULL;
 	ssize_t len;
@@ -292,12 +292,38 @@ get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 
 	BUG_ON(!(XDRSIZE_IS_VALID(len)));
 
-	/*
-	 * At preset only NFS 4.0 (RFC 3530) ACLs are exported by the NFS
-	 * server, and so the ACL-wide flags are ignored when generating the
-	 * internal NFS server ACL.
-	 */
-	p = xdr_buf + 1;
+	switch (acl_type) {
+	case NFS4ACL_ACL:
+		/*
+		 * Only NFS 4.0 (RFC 3530) ACLs are to be exported here by the NFS
+		 * server, and so the ACL-wide flags are ignored when generating the
+		 * internal NFS server ACL.
+		 */
+		p = xdr_buf + 1;
+		break;
+
+	case NFS4ACL_DACL:
+	case NFS4ACL_SACL:
+		/*
+		 * When we read the vsa_aclflags from the xattr there are some
+		 * values that are not supported by NFS (e.g. ACL_IS_DIR).Mask
+		 * them out.
+		 *
+		 * Fortunately, ACL4_AUTO_INHERIT, ACL4_PROTECTED and
+		 * ACL4_DEFAULTED have the same values as the ZFS equivalents
+		 * (ACL_AUTO_INHERIT, ACL_PROTECTED, ACL_DEFAULTED) so no
+		 * value mapping is required.
+		 */
+		p = xdr_buf;
+		acl_flag = ntohl(*(p++)) & (ACL4_AUTO_INHERIT | ACL4_PROTECTED | ACL4_DEFAULTED);
+		break;
+
+	default:
+		/* Should never happen */
+		error = -EINVAL;
+		goto out;
+	}
+
 	ace_cnt = ntohl(*(p++));
 	if (ace_cnt > NFS41ACL_MAX_ENTRIES) {
 		error = -ERANGE;
@@ -310,6 +336,7 @@ get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 		goto out;
 	}
 	acl->naces = ace_cnt;
+	acl->flag = acl_flag;
 
 	error = convert_nfs41xdr_to_nfs40_acl(p++, len - (2 * sizeof(u32)), acl);
 	if (error)
@@ -323,12 +350,12 @@ out:
 
 int
 nfsd4_get_nfs4_acl(struct svc_rqst *rqstp, struct dentry *dentry,
-		struct nfs4_acl **acl)
+		struct nfs4_acl **acl, enum nfs4_acl_type acl_type)
 {
 	struct inode *inode = d_inode(dentry);
 
 	if (IS_NFSV4ACL(inode))
-		return get_nfs4_nfsv41xdr_acl(rqstp, dentry, acl);
+		return get_nfs4_nfsv41xdr_acl(rqstp, dentry, acl, acl_type);
 	else
 		return get_nfs4_posix_acl(rqstp, dentry, acl);
 }
