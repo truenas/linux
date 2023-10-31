@@ -52,7 +52,7 @@ nfs_stream_encode_acl(struct xdr_stream *xdr, struct inode *inode,
 extern int
 convert_nfs41xdr_to_nfs40_acl(u32 *xdrbuf, size_t remaining, struct nfs4_acl *acl);
 extern int
-generate_nfs41acl_buf(u32 *xdrbuf, const struct nfs4_acl *acl);
+generate_nfs41acl_buf(u32 *xdrbuf, const struct nfs4_acl *acl, bool isdir);
 #endif /* CONFIG_TRUENAS */
 
 #endif  /* __LINUX_NFSACL_H */

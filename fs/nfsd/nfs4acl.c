@@ -936,7 +936,7 @@ nfsd4_acl_to_attr_zfsacl(enum nfs_ftype4 type, struct nfs4_acl *acl,
 	if (!xdr_buf)
 		return nfserrno(-ENOMEM);
 
-	error = generate_nfs41acl_buf(xdr_buf, acl);
+	error = generate_nfs41acl_buf(xdr_buf, acl, type == NF4DIR);
 	if (error) {
 		kfree(xdr_buf);
 		return nfserrno(error);

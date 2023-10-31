@@ -30,6 +30,9 @@
 #include <linux/sort.h>
 #if CONFIG_TRUENAS
 #include "nfs41acl_xdr.h"
+
+/* Value from zfs/include/os/linux/spl/sys/acl.h */
+#define ACL_IS_DIR	0x20000
 #endif /* CONFIG_TRUENAS */
 
 
@@ -534,13 +537,15 @@ convert_ace_to_nfs41(u32 *p, const struct nfs4_ace *ace)
 }
 
 int
-generate_nfs41acl_buf(u32 *xdrbuf, const struct nfs4_acl *acl)
+generate_nfs41acl_buf(u32 *xdrbuf, const struct nfs4_acl *acl, bool isdir)
 {
 	int error = 0;
 	int i;
 
-	/* first byte is NFS41 Flags. Skip since these are RFC3530 acls */
-	*xdrbuf++ = 0;
+	/*
+	 * first byte is NFS41 Flags. Maybe be zero if these are RFC3530 acls
+	 */
+	*xdrbuf++ = htonl(acl->flag | (isdir ? ACL_IS_DIR : 0));
 	*xdrbuf++ = htonl(acl->naces);
 
 	for (i = 0; i < acl->naces; i++, xdrbuf += NACE41_LEN) {
