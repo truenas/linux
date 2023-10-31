@@ -1,0 +1,5 @@
+linux-6.6.0+truenas (6.6.0+truenas-1) sid; urgency=low
+
+  * Port local patches on top of 6.6.0
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 31 Oct 2023 12:00:00 +0500
