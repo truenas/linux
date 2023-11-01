@@ -6,7 +6,7 @@ jobs:
 
   pre_build:
 
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
@@ -23,12 +23,12 @@ jobs:
     needs: pre_build
     if: ${{ needs.pre_build.outputs.should_skip != 'true' }}
 
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
 
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
@@ -40,7 +40,7 @@ jobs:
       - name: Generate .config
         run: |
           rm -rf .git .gitattributes .gitignore
-          export EXTRAVERSION=-debug
+          sed  -i 's/^EXTRAVERSION.*/EXTRAVERSION = -debug/'  Makefile
           make defconfig
           make syncconfig
           make archprepare
@@ -85,12 +85,12 @@ jobs:
     needs: pre_build
     if: ${{ needs.pre_build.outputs.should_skip != 'true' }}
 
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
 
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
@@ -105,7 +105,7 @@ jobs:
       - name: Generate .config
         run: |
           rm -rf .git .gitattributes .gitignore
-          export EXTRAVERSION=-production
+          sed  -i 's/^EXTRAVERSION.*/EXTRAVERSION = -production/'  Makefile
           make defconfig
           make syncconfig
           make archprepare
