@@ -71,6 +71,13 @@
 
 #include "nfs4trace.h"
 
+#if CONFIG_TRUENAS
+#include "../nfs_common/nfs41acl_xdr.h"
+
+/* 0xFFFFFFFFFFFFFFFF == 18446744073709551615, len('18446744073709551615') == 20 */
+#define U64_STRBUF_SIZE 21
+#endif /* CONFIG_TRUENAS */
+
 #define NFSDBG_FACILITY		NFSDBG_PROC
 
 #define NFS4_BITMASK_SZ		3
@@ -7956,6 +7963,508 @@ static bool nfs4_xattr_list_nfs4_sacl(struct dentry *dentry)
 	return nfs4_server_supports_acls(NFS_SB(dentry->d_sb), NFS4ACL_SACL);
 }
 
+#if CONFIG_TRUENAS
+/*
+ * We will publish the DACL thru NA41_NAME ("system.nfs4_acl_xdr")
+ *
+ * First some support functions.  These may be similar to upstream
+ * functions in nfsd.
+ */
+
+/*
+ * return the size of the struct nfs4_acl required to represent an acl
+ * with @entries entries.
+ */
+static int nfs4_acl_bytes(int entries)
+{
+	return sizeof(struct nfs4_acl) + entries * sizeof(struct nfs4_ace);
+}
+
+static struct {
+	char *string;
+	int   stringlen;
+	int type;
+} s2t_map[] = {
+	{
+		.string    = "OWNER@",
+		.stringlen = sizeof("OWNER@") - 1,
+		.type      = NFS4_ACL_WHO_OWNER,
+	},
+	{
+		.string    = "GROUP@",
+		.stringlen = sizeof("GROUP@") - 1,
+		.type      = NFS4_ACL_WHO_GROUP,
+	},
+	{
+		.string    = "EVERYONE@",
+		.stringlen = sizeof("EVERYONE@") - 1,
+		.type      = NFS4_ACL_WHO_EVERYONE,
+	},
+};
+
+static int nfs4_acl_get_whotype(char *p, u32 len)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(s2t_map); i++) {
+		if (s2t_map[i].stringlen == len &&
+		    (memcmp(s2t_map[i].string, p, len) == 0))
+			return s2t_map[i].type;
+	}
+	return NFS4_ACL_WHO_NAMED;
+}
+
+/*
+ * XDR encode the ace who into the supplied buffer.
+ *
+ * Return the number of bytes (including the leading nbytes and
+ * any padding necessary)
+ */
+static int nfs4_ace_encode_who(struct nfs4_ace *ace, char *buf)
+{
+	u32 *p = (u32 *)buf;
+	int count = -EINVAL;
+	const char *pstr = NULL;
+	char idbuf[U64_STRBUF_SIZE];  /* Future-proof in case uid_t / gid_t change size */
+	int total_bytes, pad_count;
+
+	/*
+	 * First find the size of the string (into count)
+	 *
+	 * Will also have some side-effects which will be used below:
+	 * either idbuf will be populated (for NFS4_ACL_WHO_NAMED) or
+	 * pstr will point into s2t_map.
+	 */
+	if (ace->whotype == NFS4_ACL_WHO_NAMED) {
+		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
+			gid_t gid = from_kgid_munged(&init_user_ns, ace->who_gid);
+
+			snprintf(idbuf, sizeof(idbuf), "%llu", (unsigned long long)gid);
+		} else {
+			uid_t uid = from_kuid_munged(&init_user_ns, ace->who_uid);
+
+			snprintf(idbuf, sizeof(idbuf), "%llu", (unsigned long long)uid);
+		}
+		count = strlen(idbuf);
+	} else {
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(s2t_map); i++) {
+			if (ace->whotype == s2t_map[i].type) {
+				count = s2t_map[i].stringlen;
+				pstr = s2t_map[i].string;
+				break;
+			}
+		}
+	}
+	if (count < 0)
+		return count; /* error */
+
+	/*
+	 * who is a utf8str_mixed, i.e. a utf8string.  Per RFC 1832
+	 * this is encoded as a uint32_t length followed by
+	 * string bytes, and then padded by null up to a 4 byte
+	 * boundary.
+	 */
+	total_bytes = 4 + (XDR_QUADLEN(count) << 2);
+	if (!buf)
+		return total_bytes;
+	pad_count = total_bytes - (4 + count);
+
+	/*
+	 * A buffer was supplied. Write the string length, followed by the
+	 * string bytes and then null padding, if necessary.
+	 */
+	*p++ = htonl(count);
+	if (ace->whotype == NFS4_ACL_WHO_NAMED)
+		memcpy(p, idbuf, count);
+	else
+		memcpy(p, pstr, count);
+	if (pad_count) {
+		char *pad = buf + (4 + count);
+
+		memset(pad, 0, pad_count);
+	}
+	return total_bytes;
+}
+
+/*
+ * Convert the specified (numeric) name into a unsigned long long ID.
+ *
+ * Do this rather than u32 in an effort to future-proof.
+ *
+ * Returns true on success.
+ */
+static bool numeric_name_to_id(const char *name, u32 namelen, unsigned long long *id)
+{
+	int ret;
+	char buf[U64_STRBUF_SIZE];
+
+	if (id && (namelen + 1 > sizeof(buf)))
+		/* no id buffer or too long to represent a 64-bit id: */
+		return false;
+	/* Just to make sure it's null-terminated: */
+	memcpy(buf, name, namelen);
+	buf[namelen] = '\0';
+	ret = kstrtoull(buf, 10, id);
+	return ret == 0;
+}
+
+/*
+ * Decode the XDR data supplied in data parameter into an ACE.
+ *
+ * Upon success 0 is returned, and the data parameter is advanced.
+ */
+static int nfs4_decode_nfsace4(void **data, size_t *remaining, struct nfs4_ace *ace)
+{
+	u32 *p = *data;
+	u32 length, length_incl_padding;
+	int error = 0;
+
+	/*
+	 * Per RFC8881 6.2.1 acl the format of nfsace4 is:
+	 * uint32_t type
+	 * uint32_t flag
+	 * uint32_t access_mask
+	 * utf8str_mixed who
+	 *
+	 * where utf8str_mixed is a utf8string.  Per RFC 1832
+	 * this is encoded as a uint32_t length followed by
+	 * string bytes, and then padded by null up to a 4 byte
+	 * boundary.
+	 *
+	 * When it comes to checking remaining, first we will check
+	 * the first four uint32_t (4*4 -> 16 bytes), so that we can
+	 * read the length of the who string.  We do not modify remaining
+	 * unless we are successful in decoding the ACE & advancing thru
+	 * the data buffer.
+	 */
+	#define NFSACE4_HEADER_BYTES (4 * sizeof(u32))
+	if (*remaining < NFSACE4_HEADER_BYTES) {
+		pr_err("NFS: %s buffer not large enough to contain ACE head", __func__);
+		return -EOVERFLOW;
+	}
+	ace->type = ntohl(*(p++));
+	ace->flag = ntohl(*(p++));
+	ace->access_mask = ntohl(*(p++));
+	length = ntohl(*(p++));
+	length_incl_padding = XDR_QUADLEN(length) << 2;
+
+	/*
+	 * Now that we have the length, check remaining again.
+	 *
+	 * The input buffer includes both the string and null
+	 * padding (if necessary to align things).
+	 */
+	if (*remaining < (NFSACE4_HEADER_BYTES + length_incl_padding)) {
+		pr_err("NFS: %s buffer not large enough to contain ACE who", __func__);
+		return -EOVERFLOW;
+	}
+
+	ace->whotype = nfs4_acl_get_whotype((char *)p, length);
+
+	if (ace->whotype == NFS4_ACL_WHO_NAMED) {
+		/*
+		 * We're just going to support numeric IDs here.
+		 * (it's very expensive to do otherwise)
+		 */
+		unsigned long long id = -1;
+
+		if (numeric_name_to_id((const char *)p, length, &id)) {
+			if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
+				ace->who_gid = make_kgid(&init_user_ns, id);
+				if (!gid_valid(ace->who_gid)) {
+					pr_err("NFS: %s Invalid who_gid: %.*s", __func__,
+					       length, (char *)p);
+					error = -EINVAL;
+				}
+			} else {
+				ace->who_uid = make_kuid(&init_user_ns, id);
+				if (!uid_valid(ace->who_uid)) {
+					pr_err("NFS: %s Invalid who_uid: %.*s", __func__,
+					       length, (char *)p);
+					error = -EINVAL;
+				}
+			}
+		} else {
+			pr_err("NFS: %s Non-numeric who: %.*s", __func__, length, (char *)p);
+			error = -EINVAL;
+		}
+	}
+	/*
+	 * If the whotype was a value other than NFS4_ACL_WHO_NAMED
+	 * (e.g. NFS4_ACL_WHO_OWNER), then no further decoding is
+	 * required (so, no else statement).
+	 */
+
+	if (error >= 0) {
+		/*
+		 * Advance by a multiple of 4 bytes (string + padding).
+		 * Since p is a pointer to u32 we don't need to << 2 the
+		 * output from XDR_QUADLEN.
+		 */
+		p += XDR_QUADLEN(length);
+		*data = p;
+		/* Reduce remaining by initial 4 uint32_t + the string (incl padding) */
+		*remaining -= (NFSACE4_HEADER_BYTES + length_incl_padding);
+	}
+	return error;
+}
+
+/*
+ * Decode the buffer containing the raw XDR data into struct nfs4_acl.
+ *
+ * This is similar to nfsd4_decode_acl
+ */
+static int nfs4_aclbuf_decode(void *buf, size_t buflen, enum nfs4_acl_type type,
+			      struct nfs4_acl **pacl)
+{
+	u32 acl_flag, count;
+	u32 *p = buf;
+	struct nfs4_acl *acl;
+	int acl_bytes;
+	struct nfs4_ace *ace;
+	int status;
+	size_t remaining;
+
+	if (buflen < 8) {
+		pr_err("NFS: %s ACL buffer too small: %zd", __func__, buflen);
+		return -EINVAL;
+	}
+
+	acl_flag = ntohl(*(p++));
+	count = ntohl(*(p++));
+	remaining = buflen - 8;
+	acl_bytes = nfs4_acl_bytes(count);
+	acl = kmalloc(acl_bytes, GFP_KERNEL);
+	if (acl == NULL)
+		return -ENOMEM;
+
+	acl->flag = acl_flag;
+	acl->naces = count;
+	for (ace = acl->aces; ace < acl->aces + count; ace++) {
+		status = nfs4_decode_nfsace4((void **)&p, &remaining, ace);
+		if (status) {
+			kfree(acl);
+			return status;
+		}
+	}
+
+	*pacl = acl;
+	return acl_bytes;
+}
+
+/*
+ * XDR encode the specified ACL.
+ *
+ * Returns 0 on success, and populates the buf and buflen parameters.  The
+ * buf must be freed by the caller.
+ */
+static int nfs4_encode_acl_to_buf(struct nfs4_acl *acl, void **buf, size_t *buflen)
+{
+	int byte_count = 0;
+	struct nfs4_ace *ace;
+	void *xdrbuf;
+	u32 *p;
+
+	/*
+	 * First count how many bytes we will need.
+	 */
+	byte_count += 8; /* acl_type and naces */
+	for (ace = acl->aces; ace < acl->aces + acl->naces; ace++) {
+		int who_bytes;
+
+		byte_count += 12; /* ace type, flag, access_mask */
+		who_bytes = nfs4_ace_encode_who(ace, NULL);
+		if (who_bytes < 0) {
+			pr_err("NFS: %s Failed to determine bytes for ACE (%d)", __func__,
+			       who_bytes);
+			return who_bytes;
+		}
+		byte_count += who_bytes;
+	}
+
+	xdrbuf = kmalloc(byte_count, GFP_KERNEL);
+	if (xdrbuf == NULL)
+		return -ENOMEM;
+
+	/*
+	 * Next encode the acl to the buffer
+	 */
+	p = xdrbuf;
+	*p++ = htonl(acl->flag);
+	*p++ = htonl(acl->naces);
+	for (ace = acl->aces; ace < acl->aces + acl->naces; ace++) {
+		int bytes;
+		*p++ = htonl(ace->type);
+		*p++ = htonl(ace->flag);
+		*p++ = htonl(ace->access_mask);
+		bytes = nfs4_ace_encode_who(ace, (char *)p);
+		p += (bytes >> 2);	/* >> 2 because pointer to u32 */
+	}
+
+	/* Return the allocated buffer */
+	*buf = xdrbuf;
+	*buflen = byte_count;
+	return 0;
+}
+
+/*
+ * Allow the client to WRITE the NA41_NAME ("system.nfs4_acl_xdr")
+ */
+static int nfs4_xattr_set_nfs4_acl_xdr(const struct xattr_handler *handler,
+				       struct mnt_idmap *idmap,
+				       struct dentry *unused, struct inode *inode,
+				       const char *key, const void *buf,
+				       size_t buflen, int flags)
+{
+	u32 *p = (u32 *)buf;
+	u32 acl_flag, ace_cnt;
+	struct nfs4_acl *acl = NULL;
+	int error;
+	void *xdrbuf = NULL;
+	size_t xdrbuflen;
+
+	/* Ensure data was provided */
+	if (!buf || !buflen || buflen < 8)
+		return -EINVAL;
+
+	/*
+	 * In order to write this view (system.nfs4_acl_xdr) of our ZFS ACL
+	 * we will need to:
+	 * - Decode supplied data (system.nfs4_acl_xdr) to struct nfs4_acl
+	 * - Encode struct nfs4_acl to DACL XDR
+	 * - Write the DACL XDR.  The nfsd will store it as the NA41_NAME.
+	 *
+	 * To perform the first step we will also need to decode the number
+	 * of ACEs to calculate the size of the buffer required.
+	 */
+
+	/* Mask out bits from the DACL flag that are not supported by the protocol */
+	acl_flag = ntohl(*(p++)) & (ACL4_AUTO_INHERIT | ACL4_PROTECTED | ACL4_DEFAULTED);
+	ace_cnt = ntohl(*(p++));
+	if (ace_cnt > NFS41ACL_MAX_ENTRIES)
+		return -ERANGE;
+
+	/* Allocate a buffer for the struct nfs4_acl */
+	acl = kzalloc(nfs4_acl_bytes(ace_cnt), GFP_KERNEL);
+	if (!acl)
+		return -ENOMEM;
+
+	/* Decode supplied data (system.nfs4_acl_xdr) to struct nfs4_acl */
+	acl->flag = acl_flag;
+	acl->naces = ace_cnt;
+	error = convert_nfs41xdr_to_nfs40_acl(p++, buflen - (2 * sizeof(u32)), acl);
+	if (error)
+		goto acl_out;
+
+	/* Encode struct nfs4_acl to DACL XDR */
+	error = nfs4_encode_acl_to_buf(acl, &xdrbuf, &xdrbuflen);
+	if (error)
+		goto acl_out;
+
+	/* Write the DACL XDR. */
+	error = nfs4_proc_set_acl(inode, xdrbuf, xdrbuflen, NFS4ACL_DACL);
+	kfree(xdrbuf);
+
+acl_out:
+	kfree(acl);
+	return error;
+}
+
+/*
+ * Allow the client to READ the NA41_NAME ("system.nfs4_acl_xdr")
+ */
+static int nfs4_xattr_get_nfs4_acl_xdr(const struct xattr_handler *handler,
+				       struct dentry *unused, struct inode *inode,
+				       const char *key, void *buf, size_t buflen)
+{
+	int ret = 0;
+	ssize_t dacl_size, acl_size;
+	void *dacl_buf = NULL;
+
+	/*
+	 * In order to present this view (system.nfs4_acl_xdr) of our ZFS ACL
+	 * we will need to:
+	 * - Read the DACL
+	 * - Decode DACL to struct nfs4_acl
+	 * - Encode nfs4_acl to system.nfs4_acl_xdr (to be returned)
+	 *
+	 * Even if the caller just requested the size we will have to fetch
+	 * the DACL in order to calculate the size required.
+	 */
+
+	/* Fetch the DACL size first  */
+	dacl_size = nfs4_proc_get_acl(inode, NULL, 0, NFS4ACL_DACL);
+	if (dacl_size <= 0)
+		return dacl_size;
+	dacl_buf = kmalloc(dacl_size, GFP_KERNEL);
+	if (dacl_buf == NULL)
+		return -ENOMEM;
+
+	/* Read the DACL */
+	ret = nfs4_proc_get_acl(inode, dacl_buf, dacl_size, NFS4ACL_DACL);
+	if (ret < 0) {
+		pr_err("NFS: %s Failed to read DACL: %d", __func__, ret);
+		goto dacl_out;
+	}
+
+	if (!buf || buflen == 0) {
+		/*
+		 * We just want the size, so decode the number of ACEs
+		 * in the DACL and perform a calculation.
+		 */
+		u32 count;
+		u32 *p = dacl_buf;
+
+		p++;	/* Skip the acl_flag */
+		count = ntohl(*(p++));
+		ret = ACES_TO_XDRSIZE(count);
+	} else {
+		/*
+		 * Decode DACL to struct nfs4_acl
+		 */
+		struct nfs4_acl *acl = NULL;
+
+		acl_size = nfs4_aclbuf_decode(dacl_buf, dacl_size, NFS4ACL_DACL, &acl);
+		if (acl_size < 0) {
+			pr_err("NFS: %s Failed to decode DACL: %zu", __func__, acl_size);
+			ret = -EINVAL;
+			goto dacl_out;
+		}
+		/* This should be the same as acl_size */
+		ret = ACES_TO_XDRSIZE(acl->naces);
+		if (buflen >= ret) {
+			int error;
+
+			/* Encode nfs4_acl to system.nfs4_acl_xdr (to be returned) */
+			error = generate_nfs41acl_buf(buf, acl, S_ISDIR(inode->i_mode));
+			if (error) {
+				pr_err("NFS: %s generate_nfs41acl_buf returned: %d", __func__,
+				       error);
+				ret = error;
+			}
+		} else {
+			pr_err("NFS: %s Supplied buffer too small: %zu vs %d", __func__,
+			       buflen, ret);
+			ret = -EINVAL;
+		}
+
+		kfree(acl);
+	}
+
+
+dacl_out:
+	kfree(dacl_buf);
+	return ret;
+}
+
+static bool nfs4_xattr_list_nfs4_acl_xdr(struct dentry *dentry)
+{
+	return nfs4_server_supports_acls(NFS_SB(dentry->d_sb), NFS4ACL_DACL);
+}
+#endif /* CONFIG_TRUENAS */
+
 #endif
 
 #ifdef CONFIG_NFS_V4_SECURITY_LABEL
@@ -10951,6 +11460,15 @@ static const struct xattr_handler nfs4_xattr_nfs4_sacl_handler = {
 	.get	= nfs4_xattr_get_nfs4_sacl,
 	.set	= nfs4_xattr_set_nfs4_sacl,
 };
+
+#if CONFIG_TRUENAS
+static const struct xattr_handler nfs4_xattr_nfs4_acl_xdr_handler = {
+	.name	= NA41_NAME,
+	.list	= nfs4_xattr_list_nfs4_acl_xdr,
+	.get	= nfs4_xattr_get_nfs4_acl_xdr,
+	.set	= nfs4_xattr_set_nfs4_acl_xdr,
+};
+#endif /* CONFIG_TRUENAS */
 #endif
 
 #ifdef CONFIG_NFS_V4_2
@@ -10966,6 +11484,9 @@ const struct xattr_handler * const nfs4_xattr_handlers[] = {
 #if defined(CONFIG_NFS_V4_1)
 	&nfs4_xattr_nfs4_dacl_handler,
 	&nfs4_xattr_nfs4_sacl_handler,
+#if CONFIG_TRUENAS
+	&nfs4_xattr_nfs4_acl_xdr_handler,
+#endif /* CONFIG_TRUENAS */
 #endif
 #ifdef CONFIG_NFS_V4_SECURITY_LABEL
 	&nfs4_xattr_nfs4_label_handler,
