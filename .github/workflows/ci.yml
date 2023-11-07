@@ -14,7 +14,7 @@ jobs:
     steps:
       - name: Skip Duplicate Actions
         id: skip_check
-        uses: fkirc/skip-duplicate-actions@v3.4.1
+        uses: fkirc/skip-duplicate-actions@v5
         with:
           concurrent_skipping: 'same_content_newer'
 
@@ -28,7 +28,7 @@ jobs:
     steps:
 
       - name: Check out repository code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
@@ -41,13 +41,19 @@ jobs:
         run: |
           rm -rf .git .gitattributes .gitignore
           export EXTRAVERSION="-debug"
-          make defconfig
-          make syncconfig
-          make archprepare
+          make ARCH=x86_64 defconfig
           ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/debian_amd64.config
           ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/truenas.config
           ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/tn-debug.config
+          make syncconfig
+          make archprepare
           ./scripts/package/mkdebian
+          # Workaround to provide additional free space for kernel build
+          # https://github.com/actions/virtual-environments/issues/2840
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Build Kernel
         run: |
@@ -63,12 +69,12 @@ jobs:
           mv ../*.deb ./debug-kernel/
           mv ../*.changes ./debug-kernel/
           mv ../*.buildinfo ./debug-kernel/
-          cp .config ./debug-kernel/
+          cp .config ./debug-config
 
       - name: Export artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{github.sha}}
+          name: ${{github.sha}}-debug
           path: ./debug-kernel
 
       - name: Status
@@ -85,7 +91,7 @@ jobs:
     steps:
 
       - name: Check out repository code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
@@ -105,6 +111,12 @@ jobs:
           make syncconfig
           make archprepare
           ./scripts/package/mkdebian
+          # Workaround to provide additional free space for kernel build
+          # https://github.com/actions/virtual-environments/issues/2840
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Build Kernel
         run: |
@@ -120,14 +132,14 @@ jobs:
           mv ../*.deb ./production-kernel/
           mv ../*.changes ./production-kernel/
           mv ../*.buildinfo ./production-kernel/
-          cp .config ./production-kernel/
+          cp .config ./production-config
 
       - name: Export artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{github.sha}}
+          name: ${{github.sha}}-production
           path: ./production-kernel
 
-      - name: Status 
+      - name: Status
         run: |
           echo "Status: ${{job.status}}"
