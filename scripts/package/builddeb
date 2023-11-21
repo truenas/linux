@@ -102,21 +102,8 @@ install_linux_image () {
 		mkdir -p "${pdir}${debhookdir}/${script}.d"
 
 		mkdir -p "${pdir}/DEBIAN"
-		cat <<-EOF > "${pdir}/DEBIAN/${script}"
-
-		#!/bin/sh
-
-		set -e
-
-		# Pass maintainer script parameters to hook scripts
-		export DEB_MAINT_PARAMS="\$*"
-
-		# Tell initramfs builder whether it's wanted
-		export INITRD=$(if_enabled_echo CONFIG_BLK_DEV_INITRD Yes No)
-
-		test -d ${debhookdir}/${script}.d && run-parts --arg="${KERNELRELEASE}" --arg="/${installed_image_path}" ${debhookdir}/${script}.d
-		exit 0
-		EOF
+		cp "scripts/package/truenas/$script" "${pdir}/DEBIAN/${script}"
+		sed -i "3i version=$KERNELRELEASE" "${pdir}/DEBIAN/${script}"
 		chmod 755 "${pdir}/DEBIAN/${script}"
 	done
 }
@@ -182,9 +169,25 @@ install_libc_headers () {
 	mv $pdir/usr/include/asm $pdir/usr/include/$host_arch/
 }
 
+install_perf () {
+	tools_dir=$1
+	rm -rf $tools_dir
+	mkdir -p $tools_dir
+	tools_dest=`readlink -f $tools_dir`
+	if [ -n "$O" ] ; then
+		output=$(readlink -f $objtree)
+		mkdir -p $output/tools/perf
+		output="O=$output/tools/perf"
+	fi
+	$MAKE -C $srctree/tools/perf $output LDFLAGS= srctree=$KBUILD_SRC prefix=$tools_dest/usr NO_LIBTRACEEVENT=1 install
+	dpkg-shlibdeps $tools_dest/usr/bin/*
+}
+
 rm -f debian/files
 
 packages_enabled=$(dh_listpackages)
+
+echo "XXX: packages list: ${packages_enabled}"
 
 for package in ${packages_enabled}
 do
@@ -195,10 +198,14 @@ do
 		install_linux_image_dbg debian/linux-image-dbg debian/linux-image;;
 	linux-image-*|user-mode-linux-*)
 		install_linux_image debian/linux-image ${package};;
-	linux-libc-dev)
+	linux-*-libc-dev)
 		install_libc_headers debian/linux-libc-dev;;
 	linux-headers-*)
-		install_kernel_headers debian/linux-headers ${package#linux-headers-};;
+		install_kernel_headers debian/linux-headers ${KERNELRELEASE};;
+	linux-perf-truenas)
+		if is_enabled CONFIG_PERF_EVENTS && echo "${version}" | grep -q "production"; then
+			install_perf debian/linux-perf
+		fi
 	esac
 done
 
@@ -209,10 +216,14 @@ do
 		create_package ${package} debian/linux-image-dbg;;
 	linux-image-*|user-mode-linux-*)
 		create_package ${package} debian/linux-image;;
-	linux-libc-dev)
+	linux-*-libc-dev)
 		create_package ${package} debian/linux-libc-dev;;
 	linux-headers-*)
 		create_package ${package} debian/linux-headers;;
+	linux-perf-truenas)
+		if is_enabled CONFIG_PERF_EVENTS && echo "${version}" | grep -q "production"; then
+			create_package ${package} debian/linux-perf
+		fi
 	esac
 done
 

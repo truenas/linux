@@ -20,6 +20,9 @@
 
 #include <scsi/scsi_transport_sas.h>
 
+#include <linux/libata.h>
+#include "../ata/ahci.h"
+
 struct ses_device {
 	unsigned char *page1;
 	unsigned char *page1_types;
@@ -57,8 +60,9 @@ static int ses_probe(struct device *dev)
 	return err;
 }
 
-#define SES_TIMEOUT (30 * HZ)
-#define SES_RETRIES 3
+#define SES_TIMEOUT		(30 * HZ)
+#define SES_RETRIES		3
+#define SES_POLL_PERIOD_S	60
 
 static void init_device_slot_control(unsigned char *dest_desc,
 				     struct enclosure_component *ecomp,
@@ -450,10 +454,20 @@ static int ses_process_descriptor(struct enclosure_component *ecomp,
 	struct ses_component *scomp = ecomp->scratch;
 	unsigned char *d;
 
-	if (invalid)
+	if (invalid) {
+		scomp->addr = 0;
 		return 0;
+	}
 
 	switch (proto) {
+	case SCSI_PROTOCOL_ATA:
+		d = desc + 4;
+		if (eip) {
+			slot = get_unaligned_be32(d);
+			d = desc + 8;
+		}
+		addr = get_unaligned_be32(d) + 1;
+		break;
 	case SCSI_PROTOCOL_FCP:
 		if (eip) {
 			if (max_desc_len <= 7)
@@ -564,6 +578,8 @@ static void ses_enclosure_data_process(struct enclosure_device *edev,
 		/* skip past overall descriptor */
 		desc_ptr += len + 4;
 	}
+	if (!create)
+		spin_lock(&edev->enc_lock);
 	if (ses_dev->page10 && ses_dev->page10_len > 9)
 		addl_desc_ptr = ses_dev->page10 + 8;
 	type_ptr = ses_dev->page1_types;
@@ -636,6 +652,8 @@ static void ses_enclosure_data_process(struct enclosure_device *edev,
 			}
 		}
 	}
+	if (!create)
+		spin_unlock(&edev->enc_lock);
 	kfree(buf);
 	kfree(hdr_buf);
 }
@@ -654,12 +672,34 @@ static void ses_match_to_enclosure(struct enclosure_device *edev,
 
 	if (scsi_is_sas_rphy(sdev->sdev_target->dev.parent))
 		efd.addr = sas_get_address(sdev);
+	else if (scsi_is_ata(sdev))
+		efd.addr = sdev->host->host_no + 1;
 
 	if (efd.addr) {
 		efd.dev = &sdev->sdev_gendev;
 
 		enclosure_for_each_device(ses_enclosure_find_by_addr, &efd);
 	}
+}
+
+static int poll_task_cb(void *arg)
+{
+	struct enclosure_device *edev = (struct enclosure_device*) arg;
+	struct scsi_device *sdev = to_scsi_device(edev->edev.parent);
+	struct scsi_device *tmp_sdev;
+
+	while (!kthread_should_stop()) {
+		shost_for_each_device(tmp_sdev, sdev->host) {
+			if (tmp_sdev->lun != 0 || scsi_device_enclosure(tmp_sdev))
+				continue;
+			ses_match_to_enclosure(edev, tmp_sdev, 1);
+		}
+		if (!kthread_should_stop()) {
+			schedule_timeout_interruptible(
+				    msecs_to_jiffies(SES_POLL_PERIOD_S * 1000));
+		}
+	}
+	return (0);
 }
 
 static int ses_intf_add(struct device *cdev)
@@ -677,11 +717,21 @@ static int ses_intf_add(struct device *cdev)
 
 	if (!scsi_device_enclosure(sdev)) {
 		/* not an enclosure, but might be in one */
-		struct enclosure_device *prev = NULL;
+		if (scsi_is_ahci(sdev)) {
+			struct ata_port *ap = ata_shost_to_port(sdev->host);
+			struct ahci_host_priv *hpriv = ap->host->private_data;
+			struct Scsi_Host *shost = hpriv->em_shost;
 
-		while ((edev = enclosure_find(&sdev->host->shost_gendev, prev)) != NULL) {
-			ses_match_to_enclosure(edev, sdev, 1);
-			prev = edev;
+			edev = enclosure_find(&shost->shost_gendev, NULL);
+			if (edev)
+				ses_match_to_enclosure(edev, sdev, 1);
+		} else {
+			struct enclosure_device *prev = NULL;
+
+			while ((edev = enclosure_find(&sdev->host->shost_gendev, prev)) != NULL) {
+				ses_match_to_enclosure(edev, sdev, 1);
+				prev = edev;
+			}
 		}
 		return -ENODEV;
 	}
@@ -788,6 +838,7 @@ page2_not_supported:
 
 	kfree(hdr_buf);
 
+	spin_lock_init(&edev->enc_lock);
 	edev->scratch = ses_dev;
 	for (i = 0; i < components; i++)
 		edev->component[i].scratch = scomp + i;
@@ -796,10 +847,32 @@ page2_not_supported:
 
 	/* see if there are any devices matching before
 	 * we found the enclosure */
-	shost_for_each_device(tmp_sdev, sdev->host) {
-		if (tmp_sdev->lun != 0 || scsi_device_enclosure(tmp_sdev))
-			continue;
-		ses_match_to_enclosure(edev, tmp_sdev, 0);
+	if (scsi_is_ahciem(sdev)) {
+		for (i = 0; i < components; i++) {
+			struct ses_component *tmp_scomp;
+			struct Scsi_Host *tmp_shost;
+
+			tmp_scomp = edev->component[i].scratch;
+			if (!tmp_scomp->addr)
+				continue;
+			tmp_shost = scsi_host_lookup(tmp_scomp->addr - 1);
+			shost_for_each_device(tmp_sdev, tmp_shost) {
+				struct device *tmp_dev = &tmp_sdev->sdev_gendev;
+
+				if (enclosure_add_device(edev, i, tmp_dev) == 0)
+					kobject_uevent(&tmp_dev->kobj, KOBJ_CHANGE);
+				break; /* there is only one device */
+			}
+			scsi_host_put(tmp_shost);
+		}
+		edev->poll_task = NULL;
+	} else {
+		edev->poll_task = kthread_create(poll_task_cb, (void *)edev,
+			    dev_name(&sdev->sdev_gendev));
+		if (!IS_ERR(edev->poll_task))
+			wake_up_process(edev->poll_task);
+		else
+			edev->poll_task = NULL;
 	}
 
 	return 0;
@@ -829,8 +902,17 @@ static int ses_remove(struct device *dev)
 static void ses_intf_remove_component(struct scsi_device *sdev)
 {
 	struct enclosure_device *edev, *prev = NULL;
+	struct Scsi_Host *shost;
 
-	while ((edev = enclosure_find(&sdev->host->shost_gendev, prev)) != NULL) {
+	if (scsi_is_ahci(sdev)) {
+		struct ata_port *ap = ata_shost_to_port(sdev->host);
+		struct ahci_host_priv *hpriv = ap->host->private_data;
+
+		shost = hpriv->em_shost;
+	} else
+		shost = sdev->host;
+
+	while ((edev = enclosure_find(&shost->shost_gendev, prev)) != NULL) {
 		prev = edev;
 		if (!enclosure_remove_device(edev, &sdev->sdev_gendev))
 			break;
@@ -848,6 +930,11 @@ static void ses_intf_remove_enclosure(struct scsi_device *sdev)
 	edev = enclosure_find(&sdev->sdev_gendev, NULL);
 	if (!edev)
 		return;
+
+	if (edev->poll_task) {
+		kthread_stop(edev->poll_task);
+		edev->poll_task = NULL;
+	}
 
 	ses_dev = edev->scratch;
 	edev->scratch = NULL;

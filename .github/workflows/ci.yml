@@ -1,0 +1,145 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+
+  pre_build:
+
+    runs-on: ubuntu-22.04
+
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+
+    steps:
+      - name: Skip Duplicate Actions
+        id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'same_content_newer'
+
+  build_debug_kernel:
+
+    needs: pre_build
+    if: ${{ needs.pre_build.outputs.should_skip != 'true' }}
+
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential gawk flex bison openssl dkms \
+          libelf-dev libudev-dev libpci-dev libiberty-dev autoconf dwarves \
+          libncurses-dev libssl-dev devscripts debhelper
+
+      - name: Generate .config
+        run: |
+          rm -rf .git .gitattributes .gitignore
+          sed  -i 's/^EXTRAVERSION.*/EXTRAVERSION = -debug/'  Makefile
+          make ARCH=x86_64 defconfig
+          ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/debian_amd64.config
+          ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/truenas.config
+          ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/tn-debug.config
+          make syncconfig
+          make archprepare
+          # Workaround to provide additional free space for kernel build
+          # https://github.com/actions/virtual-environments/issues/2840
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: Build Kernel
+        run: |
+          cp .config /tmp/
+          make distclean
+          mv /tmp/.config .config
+          make -j$(nproc) bindeb-pkg
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p debug-kernel
+          mv ../*.deb ./debug-kernel/
+          mv ../*.changes ./debug-kernel/
+          mv ../*.buildinfo ./debug-kernel/
+          cp .config ./debug-kernel/debug-config
+
+      - name: Export artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{github.sha}}
+          path: ./debug-kernel
+
+      - name: Status
+        run: |
+          echo "Status: ${{job.status}}"
+
+  build_production_kernel:
+
+    needs: pre_build
+    if: ${{ needs.pre_build.outputs.should_skip != 'true' }}
+
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential gawk flex bison openssl dkms \
+          libelf-dev libudev-dev libpci-dev libiberty-dev autoconf dwarves \
+          libncurses-dev libssl-dev libelf-dev libdw-dev systemtap-sdt-dev \
+          libunwind-dev libslang2-dev libperl-dev binutils-dev libiberty-dev \
+          python3-dev liblzma-dev libzstd-dev libcap-dev libnuma-dev \
+          libbabeltrace-dev openjdk-11-jdk devscripts libncurses-dev \
+          libssl-dev debhelper libpfm4-dev libtraceevent-dev
+
+      - name: Generate .config
+        run: |
+          rm -rf .git .gitattributes .gitignore
+          sed  -i 's/^EXTRAVERSION.*/EXTRAVERSION = -production/'  Makefile
+          make ARCH=x86_64 defconfig
+          ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/debian_amd64.config
+          ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/truenas.config
+          ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/tn-production.config
+          make syncconfig
+          make archprepare
+          # Workaround to provide additional free space for kernel build
+          # https://github.com/actions/virtual-environments/issues/2840
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: Build Kernel
+        run: |
+          cp .config /tmp/
+          make distclean
+          mv /tmp/.config .config
+          make -j$(nproc) bindeb-pkg
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p production-kernel
+          mv ../*.deb ./production-kernel/
+          mv ../*.changes ./production-kernel/
+          mv ../*.buildinfo ./production-kernel/
+          cp .config ./production-kernel/production-config
+
+      - name: Export artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{github.sha}}
+          path: ./production-kernel
+
+      - name: Status
+        run: |
+          echo "Status: ${{job.status}}"

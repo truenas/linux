@@ -331,6 +331,7 @@ enum {
 	ATA_EHI_NO_AUTOPSY	= (1 << 2),  /* no autopsy */
 	ATA_EHI_QUIET		= (1 << 3),  /* be quiet */
 	ATA_EHI_NO_RECOVERY	= (1 << 4),  /* no recovery */
+	ATA_EHI_UPDATE_SECTORS	= (1 << 5),  /* update sector count */
 
 	ATA_EHI_DID_SOFTRESET	= (1 << 16), /* already soft-reset this port */
 	ATA_EHI_DID_HARDRESET	= (1 << 17), /* already soft-reset this port */
@@ -2083,5 +2084,7 @@ static inline u8 ata_wait_idle(struct ata_port *ap)
 	return status;
 }
 #endif /* CONFIG_ATA_SFF */
+
+extern bool scsi_is_ata(struct scsi_device *sdev);
 
 #endif /* __LINUX_LIBATA_H__ */

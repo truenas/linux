@@ -53,6 +53,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/idr.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -66,7 +67,6 @@
 #define NTB_TRANSPORT_VER	"4"
 #define NTB_TRANSPORT_NAME	"ntb_transport"
 #define NTB_TRANSPORT_DESC	"Software Queue-Pair Transport over NTB"
-#define NTB_TRANSPORT_MIN_SPADS (MW0_SZ_HIGH + 2)
 
 MODULE_DESCRIPTION(NTB_TRANSPORT_DESC);
 MODULE_VERSION(NTB_TRANSPORT_VER);
@@ -88,6 +88,10 @@ MODULE_PARM_DESC(max_num_clients, "Maximum number of NTB transport clients");
 static unsigned int copy_bytes = 1024;
 module_param(copy_bytes, uint, 0644);
 MODULE_PARM_DESC(copy_bytes, "Threshold under which NTB will use the CPU to copy instead of DMA");
+
+static bool compact;
+module_param(compact, bool, 0644);
+MODULE_PARM_DESC(compact, "Use compact version of sratchpad protocol");
 
 static bool use_dma;
 module_param(use_dma, bool, 0644);
@@ -213,6 +217,11 @@ struct ntb_transport_mw {
 	dma_addr_t dma_addr;
 };
 
+struct ntb_transport_client_dev_name {
+	struct list_head entry;
+	char device_name[];
+};
+
 struct ntb_transport_client_dev {
 	struct list_head entry;
 	struct ntb_transport_ctx *nt;
@@ -224,9 +233,11 @@ struct ntb_transport_ctx {
 	struct list_head client_devs;
 
 	struct ntb_dev *ndev;
+	int unit;
 
 	struct ntb_transport_mw *mw_vec;
 	struct ntb_transport_qp *qp_vec;
+	int compact;
 	unsigned int mw_count;
 	unsigned int qp_count;
 	u64 qp_bitmap;
@@ -263,6 +274,15 @@ enum {
 	MW0_SZ_LOW,
 };
 
+/*
+ * Compart version of sratchpad protocol, using twice less registers.
+ */
+enum {
+	NTBTC_PARAMS = 0,	/* NUM_QPS << 24 + NUM_MWS << 16 + VERSION */
+	NTBTC_QP_LINKS,		/* QP links status */
+	NTBTC_MW0_SZ,		/* MW size limited to 32 bits. */
+};
+
 #define dev_client_dev(__dev) \
 	container_of((__dev), struct ntb_transport_client_dev, dev)
 
@@ -271,7 +291,7 @@ enum {
 
 #define QP_TO_MW(nt, qp)	((qp) % nt->mw_count)
 #define NTB_QP_DEF_NUM_ENTRIES	100
-#define NTB_LINK_DOWN_TIMEOUT	10
+#define NTB_LINK_DOWN_TIMEOUT	100
 
 static void ntb_transport_rxc_db(unsigned long data);
 static const struct ntb_ctx_ops ntb_transport_ops;
@@ -321,11 +341,57 @@ static struct bus_type ntb_transport_bus = {
 	.remove = ntb_transport_bus_remove,
 };
 
+static void ntb_transport_client_release(struct device *dev)
+{
+	struct ntb_transport_client_dev *client_dev;
+
+	client_dev = dev_client_dev(dev);
+	kfree(client_dev);
+}
+
+int ntb_transport_add_dev(struct ntb_transport_ctx *nt, char *device_name)
+{
+	struct ntb_transport_client_dev *client_dev;
+	struct device *dev;
+	int node, rc;
+
+	node = dev_to_node(&nt->ndev->dev);
+	client_dev = kzalloc_node(sizeof(*client_dev), GFP_KERNEL, node);
+	if (!client_dev)
+		return -ENOMEM;
+
+	dev = &client_dev->dev;
+
+	/* setup and register client devices */
+	dev_set_name(dev, "%s%d", device_name, nt->unit);
+	dev->bus = &ntb_transport_bus;
+	dev->release = ntb_transport_client_release;
+	dev->parent = &nt->ndev->dev;
+
+	rc = device_register(dev);
+	if (rc) {
+		kfree(client_dev);
+		return rc;
+	}
+
+	list_add_tail(&client_dev->entry, &nt->client_devs);
+	return 0;
+}
+
 static LIST_HEAD(ntb_transport_list);
+static DEFINE_IDA(ntb_transport_unit_ida);
+static LIST_HEAD(ntb_transport_client_list);
 
 static int ntb_bus_init(struct ntb_transport_ctx *nt)
 {
+	struct ntb_transport_client_dev_name *n;
+
+	nt->unit = ida_alloc(&ntb_transport_unit_ida, GFP_KERNEL);
+	if (nt->unit < 0)
+		return nt->unit;
 	list_add_tail(&nt->entry, &ntb_transport_list);
+	list_for_each_entry(n, &ntb_transport_client_list, entry)
+		ntb_transport_add_dev(nt, n->device_name);
 	return 0;
 }
 
@@ -341,14 +407,7 @@ static void ntb_bus_remove(struct ntb_transport_ctx *nt)
 	}
 
 	list_del(&nt->entry);
-}
-
-static void ntb_transport_client_release(struct device *dev)
-{
-	struct ntb_transport_client_dev *client_dev;
-
-	client_dev = dev_client_dev(dev);
-	kfree(client_dev);
+	ida_free(&ntb_transport_unit_ida, nt->unit);
 }
 
 /**
@@ -359,6 +418,7 @@ static void ntb_transport_client_release(struct device *dev)
  */
 void ntb_transport_unregister_client_dev(char *device_name)
 {
+	struct ntb_transport_client_dev_name *n;
 	struct ntb_transport_client_dev *client, *cd;
 	struct ntb_transport_ctx *nt;
 
@@ -369,6 +429,13 @@ void ntb_transport_unregister_client_dev(char *device_name)
 				list_del(&client->entry);
 				device_unregister(&client->dev);
 			}
+	list_for_each_entry(n, &ntb_transport_client_list, entry) {
+		if (!strcmp(n->device_name, device_name)) {
+			list_del(&n->entry);
+			kfree(n);
+			break;
+		}
+	}
 }
 EXPORT_SYMBOL_GPL(ntb_transport_unregister_client_dev);
 
@@ -380,42 +447,20 @@ EXPORT_SYMBOL_GPL(ntb_transport_unregister_client_dev);
  */
 int ntb_transport_register_client_dev(char *device_name)
 {
-	struct ntb_transport_client_dev *client_dev;
+	struct ntb_transport_client_dev_name *n;
 	struct ntb_transport_ctx *nt;
-	int node;
-	int rc, i = 0;
+	int rc;
 
-	if (list_empty(&ntb_transport_list))
-		return -ENODEV;
+	n = kzalloc(sizeof(*n) + strlen(device_name) + 1, GFP_KERNEL);
+	if (!n)
+		return -ENOMEM;
+	strcpy(n->device_name, device_name);
+	list_add_tail(&n->entry, &ntb_transport_client_list);
 
 	list_for_each_entry(nt, &ntb_transport_list, entry) {
-		struct device *dev;
-
-		node = dev_to_node(&nt->ndev->dev);
-
-		client_dev = kzalloc_node(sizeof(*client_dev),
-					  GFP_KERNEL, node);
-		if (!client_dev) {
-			rc = -ENOMEM;
+		rc = ntb_transport_add_dev(nt, device_name);
+		if (rc < 0)
 			goto err;
-		}
-
-		dev = &client_dev->dev;
-
-		/* setup and register client devices */
-		dev_set_name(dev, "%s%d", device_name, i);
-		dev->bus = &ntb_transport_bus;
-		dev->release = ntb_transport_client_release;
-		dev->parent = &nt->ndev->dev;
-
-		rc = device_register(dev);
-		if (rc) {
-			put_device(dev);
-			goto err;
-		}
-
-		list_add_tail(&client_dev->entry, &nt->client_devs);
-		i++;
 	}
 
 	return 0;
@@ -438,10 +483,6 @@ EXPORT_SYMBOL_GPL(ntb_transport_register_client_dev);
 int ntb_transport_register_client(struct ntb_transport_client *drv)
 {
 	drv->driver.bus = &ntb_transport_bus;
-
-	if (list_empty(&ntb_transport_list))
-		return -ENODEV;
-
 	return driver_register(&drv->driver);
 }
 EXPORT_SYMBOL_GPL(ntb_transport_register_client);
@@ -1047,49 +1088,76 @@ static void ntb_transport_link_work(struct work_struct *work)
 	for (i = 0; i < nt->qp_count; i++)
 		ntb_transport_setup_qp_msi(nt, i);
 
-	for (i = 0; i < nt->mw_count; i++) {
-		size = nt->mw_vec[i].phys_size;
+	if (nt->compact) {
+		for (i = 0; i < nt->mw_count; i++) {
+			size = nt->mw_vec[i].phys_size;
 
-		if (max_mw_size && size > max_mw_size)
-			size = max_mw_size;
+			if (max_mw_size && size > max_mw_size)
+				size = max_mw_size;
+			BUG_ON(upper_32_bits(size) != 0);
 
-		spad = MW0_SZ_HIGH + (i * 2);
-		ntb_peer_spad_write(ndev, PIDX, spad, upper_32_bits(size));
+			spad = NTBTC_MW0_SZ + i;
+			ntb_peer_spad_write(ndev, PIDX, spad, lower_32_bits(size));
+		}
+		ntb_peer_spad_write(ndev, PIDX, NTBTC_QP_LINKS, 0);
+		ntb_peer_spad_write(ndev, PIDX, NTBTC_PARAMS,
+		    (nt->qp_count << 24) | (nt->mw_count << 16) |
+		    NTB_TRANSPORT_VERSION);
+	} else {
+		for (i = 0; i < nt->mw_count; i++) {
+			size = nt->mw_vec[i].phys_size;
 
-		spad = MW0_SZ_LOW + (i * 2);
-		ntb_peer_spad_write(ndev, PIDX, spad, lower_32_bits(size));
+			if (max_mw_size && size > max_mw_size)
+				size = max_mw_size;
+
+			spad = MW0_SZ_HIGH + (i * 2);
+			ntb_peer_spad_write(ndev, PIDX, spad, upper_32_bits(size));
+
+			spad = MW0_SZ_LOW + (i * 2);
+			ntb_peer_spad_write(ndev, PIDX, spad, lower_32_bits(size));
+		}
+		ntb_peer_spad_write(ndev, PIDX, NUM_MWS, nt->mw_count);
+		ntb_peer_spad_write(ndev, PIDX, NUM_QPS, nt->qp_count);
+		ntb_peer_spad_write(ndev, PIDX, QP_LINKS, 0);
+		ntb_peer_spad_write(ndev, PIDX, VERSION, NTB_TRANSPORT_VERSION);
 	}
 
-	ntb_peer_spad_write(ndev, PIDX, NUM_MWS, nt->mw_count);
-
-	ntb_peer_spad_write(ndev, PIDX, NUM_QPS, nt->qp_count);
-
-	ntb_peer_spad_write(ndev, PIDX, VERSION, NTB_TRANSPORT_VERSION);
-
 	/* Query the remote side for its info */
-	val = ntb_spad_read(ndev, VERSION);
-	dev_dbg(&pdev->dev, "Remote version = %d\n", val);
-	if (val != NTB_TRANSPORT_VERSION)
-		goto out;
+	if (nt->compact) {
+		val = ntb_spad_read(ndev, NTBTC_PARAMS);
+		dev_dbg(&pdev->dev, "Remote params = 0x%x\n", val);
+		if (val != ((nt->qp_count << 24) | (nt->mw_count << 16) |
+		    NTB_TRANSPORT_VERSION))
+			goto out;
+	} else {
+		val = ntb_spad_read(ndev, VERSION);
+		dev_dbg(&pdev->dev, "Remote version = %d\n", val);
+		if (val != NTB_TRANSPORT_VERSION)
+			goto out;
 
-	val = ntb_spad_read(ndev, NUM_QPS);
-	dev_dbg(&pdev->dev, "Remote max number of qps = %d\n", val);
-	if (val != nt->qp_count)
-		goto out;
+		val = ntb_spad_read(ndev, NUM_QPS);
+		dev_dbg(&pdev->dev, "Remote max number of qps = %d\n", val);
+		if (val != nt->qp_count)
+			goto out;
 
-	val = ntb_spad_read(ndev, NUM_MWS);
-	dev_dbg(&pdev->dev, "Remote number of mws = %d\n", val);
-	if (val != nt->mw_count)
-		goto out;
+		val = ntb_spad_read(ndev, NUM_MWS);
+		dev_dbg(&pdev->dev, "Remote number of mws = %d\n", val);
+		if (val != nt->mw_count)
+			goto out;
+	}
 
 	for (i = 0; i < nt->mw_count; i++) {
 		u64 val64;
 
-		val = ntb_spad_read(ndev, MW0_SZ_HIGH + (i * 2));
-		val64 = (u64)val << 32;
+		if (nt->compact) {
+			val64 = ntb_spad_read(ndev, NTBTC_MW0_SZ + i);
+		} else {
+			val = ntb_spad_read(ndev, MW0_SZ_HIGH + (i * 2));
+			val64 = (u64)val << 32;
 
-		val = ntb_spad_read(ndev, MW0_SZ_LOW + (i * 2));
-		val64 |= val;
+			val = ntb_spad_read(ndev, MW0_SZ_LOW + (i * 2));
+			val64 |= val;
+		}
 
 		dev_dbg(&pdev->dev, "Remote MW%d size = %#llx\n", i, val64);
 
@@ -1133,15 +1201,19 @@ static void ntb_qp_link_work(struct work_struct *work)
 						   link_work.work);
 	struct pci_dev *pdev = qp->ndev->pdev;
 	struct ntb_transport_ctx *nt = qp->transport;
-	int val;
+	int i, val;
 
 	WARN_ON(!nt->link_is_up);
 
-	val = ntb_spad_read(nt->ndev, QP_LINKS);
-
-	ntb_peer_spad_write(nt->ndev, PIDX, QP_LINKS, val | BIT(qp->qp_num));
+	/* Report queues that are up on our side */
+	for (i = 0, val = 0; i < nt->qp_count; i++) {
+		if (nt->qp_vec[i].client_ready)
+			val |= BIT(i);
+	}
+	ntb_peer_spad_write(nt->ndev, PIDX, QP_LINKS, val);
 
 	/* query remote spad for qp ready bits */
+	val = ntb_spad_read(nt->ndev, QP_LINKS);
 	dev_dbg_ratelimited(&pdev->dev, "Remote QP link status = %x\n", val);
 
 	/* See if the remote side is up */
@@ -1294,14 +1366,23 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 	spad_count = ntb_spad_count(ndev);
 
 	/* Limit the MW's based on the availability of scratchpads */
-
-	if (spad_count < NTB_TRANSPORT_MIN_SPADS) {
-		nt->mw_count = 0;
-		rc = -EINVAL;
-		goto err;
+	nt->compact = compact || (spad_count < 4 + 2 * mw_count);
+	if (nt->compact) {
+		if (spad_count < NTBTC_MW0_SZ + 1) {
+			nt->mw_count = 0;
+			rc = -EINVAL;
+			goto err;
+		}
+		max_mw_count_for_spads = spad_count - NTBTC_MW0_SZ;
+	} else {
+		if (spad_count < MW0_SZ_HIGH + 2) {
+			nt->mw_count = 0;
+			rc = -EINVAL;
+			goto err;
+		}
+		max_mw_count_for_spads = (spad_count - MW0_SZ_HIGH) / 2;
 	}
 
-	max_mw_count_for_spads = (spad_count - MW0_SZ_HIGH) / 2;
 	nt->mw_count = min(mw_count, max_mw_count_for_spads);
 
 	nt->msi_spad_offset = nt->mw_count * 2 + MW0_SZ_HIGH;
@@ -1320,6 +1401,10 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 					  &mw->phys_size);
 		if (rc)
 			goto err1;
+		if (nt->compact && mw->phys_size > 0xffffffff) {
+			rc = -ENXIO;
+			goto err1;
+		}
 
 		mw->vbase = ioremap_wc(mw->phys_addr, mw->phys_size);
 		if (!mw->vbase) {
@@ -1374,6 +1459,7 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 
 	INIT_DELAYED_WORK(&nt->link_work, ntb_transport_link_work);
 	INIT_WORK(&nt->link_cleanup, ntb_transport_link_cleanup_work);
+	nt->link_is_up = false;
 
 	rc = ntb_set_ctx(ndev, nt, &ntb_transport_ops);
 	if (rc)
@@ -1384,7 +1470,6 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 	if (rc)
 		goto err3;
 
-	nt->link_is_up = false;
 	ntb_link_enable(ndev, NTB_SPEED_AUTO, NTB_WIDTH_AUTO);
 	ntb_link_event(ndev);
 
@@ -1412,6 +1497,8 @@ static void ntb_transport_free(struct ntb_client *self, struct ntb_dev *ndev)
 	u64 qp_bitmap_alloc;
 	int i;
 
+	ntb_bus_remove(nt);
+
 	ntb_transport_link_cleanup(nt);
 	cancel_work_sync(&nt->link_cleanup);
 	cancel_delayed_work_sync(&nt->link_work);
@@ -1425,11 +1512,10 @@ static void ntb_transport_free(struct ntb_client *self, struct ntb_dev *ndev)
 			ntb_transport_free_queue(qp);
 		debugfs_remove_recursive(qp->debugfs_dir);
 	}
+	debugfs_remove_recursive(nt->debugfs_node_dir);
 
 	ntb_link_disable(ndev);
 	ntb_clear_ctx(ndev);
-
-	ntb_bus_remove(nt);
 
 	for (i = nt->mw_count; i--; ) {
 		ntb_free_mw(nt, i);
@@ -1726,7 +1812,8 @@ static void ntb_transport_rxc_db(unsigned long data)
 		 */
 		if (qp->active)
 			tasklet_schedule(&qp->rxc_db_work);
-	}
+	} else if (qp->active)
+		ntb_db_clear_mask(qp->ndev, BIT_ULL(qp->qp_num));
 }
 
 static void ntb_tx_copy_callback(void *data,
@@ -2341,16 +2428,21 @@ EXPORT_SYMBOL_GPL(ntb_transport_link_up);
  */
 void ntb_transport_link_down(struct ntb_transport_qp *qp)
 {
-	int val;
+	struct ntb_transport_ctx *nt;
+	int i, val;
 
 	if (!qp)
 		return;
 
 	qp->client_ready = false;
 
-	val = ntb_spad_read(qp->ndev, QP_LINKS);
-
-	ntb_peer_spad_write(qp->ndev, PIDX, QP_LINKS, val & ~BIT(qp->qp_num));
+	/* Report queues that are up on our side */
+	nt = qp->transport;
+	for (i = 0, val = 0; i < nt->qp_count; i++) {
+		if (nt->qp_vec[i].client_ready)
+			val |= BIT(i);
+	}
+	ntb_peer_spad_write(nt->ndev, PIDX, QP_LINKS, val);
 
 	if (qp->link_is_up)
 		ntb_send_link_down(qp);
@@ -2440,14 +2532,18 @@ static void ntb_transport_doorbell_callback(void *data, int vector)
 	u64 db_bits;
 	unsigned int qp_num;
 
-	if (ntb_db_read(nt->ndev) & nt->msi_db_mask) {
+	db_bits = ntb_db_read(nt->ndev);
+	if (db_bits & nt->msi_db_mask) {
 		ntb_transport_msi_peer_desc_changed(nt);
 		ntb_db_clear(nt->ndev, nt->msi_db_mask);
 	}
 
-	db_bits = (nt->qp_bitmap & ~nt->qp_bitmap_free &
+	db_bits &= (nt->qp_bitmap & ~nt->qp_bitmap_free &
 		   ntb_db_vector_mask(nt->ndev, vector));
-
+	if (db_bits) {
+		ntb_db_set_mask(nt->ndev, db_bits);
+		ntb_db_clear(nt->ndev, db_bits);
+	}
 	while (db_bits) {
 		qp_num = __ffs(db_bits);
 		qp = &nt->qp_vec[qp_num];

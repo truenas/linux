@@ -229,8 +229,8 @@ int init_cx18_i2c(struct cx18 *cx)
 		/* Setup adapter */
 		cx->i2c_adap[i] = cx18_i2c_adap_template;
 		cx->i2c_adap[i].algo_data = &cx->i2c_algo[i];
-		sprintf(cx->i2c_adap[i].name + strlen(cx->i2c_adap[i].name),
-				" #%d-%d", cx->instance, i);
+		sprintf(cx->i2c_adap[i].name, "%s #%d-%d",
+			 cx18_i2c_adap_template.name, cx->instance, i);
 		i2c_set_adapdata(&cx->i2c_adap[i], &cx->v4l2_dev);
 		cx->i2c_adap[i].dev.parent = &cx->pci_dev->dev;
 	}

@@ -401,7 +401,7 @@ int ndev_init_isr(struct intel_ntb_dev *ndev,
 		ndev->vec[i].ndev = ndev;
 		ndev->vec[i].num = i;
 		rc = request_irq(ndev->msix[i].vector, ndev_vec_isr, 0,
-				 "ndev_vec_isr", &ndev->vec[i]);
+				 NTB_NAME, &ndev->vec[i]);
 		if (rc)
 			goto err_msix_request;
 	}
@@ -429,8 +429,7 @@ err_msix_vec_alloc:
 	if (rc)
 		goto err_msi_enable;
 
-	rc = request_irq(pdev->irq, ndev_irq_isr, 0,
-			 "ndev_irq_isr", ndev);
+	rc = request_irq(pdev->irq, ndev_irq_isr, 0, NTB_NAME, ndev);
 	if (rc)
 		goto err_msi_request;
 
@@ -447,8 +446,7 @@ err_msi_enable:
 
 	pci_intx(pdev, 1);
 
-	rc = request_irq(pdev->irq, ndev_irq_isr, IRQF_SHARED,
-			 "ndev_irq_isr", ndev);
+	rc = request_irq(pdev->irq, ndev_irq_isr, IRQF_SHARED, NTB_NAME, ndev);
 	if (rc)
 		goto err_intx_request;
 
@@ -1769,16 +1767,6 @@ static int intel_ntb_init_pci(struct intel_ntb_dev *ndev, struct pci_dev *pdev)
 	if (rc)
 		goto err_pci_regions;
 
-	pci_set_master(pdev);
-
-	rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-	if (rc) {
-		rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-		if (rc)
-			goto err_dma_mask;
-		dev_warn(&pdev->dev, "Cannot DMA highmem\n");
-	}
-
 	ndev->self_mmio = pci_iomap(pdev, 0, 0);
 	if (!ndev->self_mmio) {
 		rc = -EIO;
@@ -1796,6 +1784,33 @@ err_pci_regions:
 	pci_disable_device(pdev);
 err_pci_enable:
 	pci_set_drvdata(pdev, NULL);
+	return rc;
+}
+
+static int intel_ntb_init_dma(struct intel_ntb_dev *ndev, struct pci_dev *pdev)
+{
+	int rc;
+
+	pci_set_master(pdev);
+
+	rc = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
+	if (rc)
+		rc = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
+	if (rc)
+		goto err_dma_mask;
+
+	rc = -EIO;
+	if (!ndev->bar4_split)
+		rc = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64));
+	if (rc)
+		rc = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
+	if (rc)
+		goto err_dma_mask;
+
+	return 0;
+
+err_dma_mask:
+	pci_clear_master(pdev);
 	return rc;
 }
 
@@ -1888,6 +1903,10 @@ static int intel_ntb_pci_probe(struct pci_dev *pdev,
 
 	ndev_reset_unsafe_flags(ndev);
 
+	rc = intel_ntb_init_dma(ndev, pdev);
+	if (rc)
+		goto err_init_dma;
+
 	ndev->reg->poll_link(ndev);
 
 	ndev_init_debugfs(ndev);
@@ -1902,6 +1921,7 @@ static int intel_ntb_pci_probe(struct pci_dev *pdev,
 
 err_register:
 	ndev_deinit_debugfs(ndev);
+err_init_dma:
 	if (pdev_is_gen1(pdev) || pdev_is_gen3(pdev) ||
 	    pdev_is_gen4(pdev) || pdev_is_gen5(pdev))
 		xeon_deinit_dev(ndev);
