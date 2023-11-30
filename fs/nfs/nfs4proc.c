@@ -73,6 +73,9 @@
 
 #if CONFIG_TRUENAS
 #include "../nfs_common/nfs41acl_xdr.h"
+
+/* 0xFFFFFFFFFFFFFFFF == 18446744073709551615, len('18446744073709551615') == 20 */
+#define U64_STRBUF_SIZE 21
 #endif /* CONFIG_TRUENAS */
 
 #define NFSDBG_FACILITY		NFSDBG_PROC
@@ -7837,7 +7840,7 @@ static int nfs4_ace_encode_who(struct nfs4_ace *ace, char *buf)
 	u32 *p = (u32 *)buf;
 	int count = -EINVAL;
 	const char *pstr = NULL;
-	char idbuf[11];
+	char idbuf[U64_STRBUF_SIZE];  /* Future-proof in case uid_t / gid_t change size */
 	int total_bytes, pad_count;
 
 	/*
@@ -7848,13 +7851,15 @@ static int nfs4_ace_encode_who(struct nfs4_ace *ace, char *buf)
 	 * pstr will point into s2t_map.
 	 */
 	if (ace->whotype == NFS4_ACL_WHO_NAMED) {
-		u32 id;
+		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
+			gid_t gid = from_kgid_munged(&init_user_ns, ace->who_gid);
 
-		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP)
-			id = from_kgid_munged(&init_user_ns, ace->who_gid);
-		else
-			id = from_kuid_munged(&init_user_ns, ace->who_uid);
-		sprintf(idbuf, "%u", id);
+			snprintf(idbuf, sizeof(idbuf), "%lu", (unsigned long)gid);
+		} else {
+			uid_t uid = from_kuid_munged(&init_user_ns, ace->who_uid);
+
+			snprintf(idbuf, sizeof(idbuf), "%lu", (unsigned long)uid);
+		}
 		count = strlen(idbuf);
 	} else {
 		int i;
@@ -7899,22 +7904,24 @@ static int nfs4_ace_encode_who(struct nfs4_ace *ace, char *buf)
 }
 
 /*
- * Convert the specified (numeric) name into a u32 ID.
+ * Convert the specified (numeric) name into a unsigned long ID.
+ *
+ * Do this rather than u32 in an effort to future-proof.
  *
  * Returns true on success.
  */
-static bool numeric_name_to_id(const char *name, u32 namelen, u32 *id)
+static bool numeric_name_to_id(const char *name, u32 namelen, unsigned long *id)
 {
 	int ret;
-	char buf[11];
+	char buf[U64_STRBUF_SIZE];
 
-	if (namelen + 1 > sizeof(buf))
-		/* too long to represent a 32-bit id: */
+	if (id && (namelen + 1 > sizeof(buf)))
+		/* no id buffer or too long to represent a 64-bit id: */
 		return false;
 	/* Just to make sure it's null-terminated: */
 	memcpy(buf, name, namelen);
 	buf[namelen] = '\0';
-	ret = kstrtouint(buf, 10, id);
+	ret = kstrtoul(buf, 10, id);
 	return ret == 0;
 }
 
@@ -7953,7 +7960,7 @@ static int nfs4_decode_nfsace4(void **data, struct nfs4_ace *ace)
 		 * We're just going to support numeric IDs here.
 		 * (it's very expensive to do otherwise)
 		 */
-		u32 id = -1;
+		unsigned long id = -1;
 
 		if (numeric_name_to_id((const char *)p, length, &id)) {
 			if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
@@ -7982,13 +7989,15 @@ static int nfs4_decode_nfsace4(void **data, struct nfs4_ace *ace)
 	 * required (so, no else statement).
 	 */
 
-	/*
-	 * Advance by a multiple of 4 bytes (string + padding).
-	 * Since p is a pointer to u32 we don't need to << 2 the
-	 * output from XDR_QUADLEN.
-	 */
-	p += XDR_QUADLEN(length);
-	*data = p;
+	if (error >= 0) {
+		/*
+		 * Advance by a multiple of 4 bytes (string + padding).
+		 * Since p is a pointer to u32 we don't need to << 2 the
+		 * output from XDR_QUADLEN.
+		 */
+		p += XDR_QUADLEN(length);
+		*data = p;
+	}
 	return error;
 }
 
@@ -8022,7 +8031,14 @@ static int nfs4_aclbuf_decode(void *buf, size_t buflen, enum nfs4_acl_type type,
 	acl->flag = acl_flag;
 	acl->naces = count;
 	for (ace = acl->aces; ace < acl->aces + count; ace++) {
-		status = nfs4_decode_nfsace4((void **)&p, ace);
+		/*
+		 * Ensure that we have not overrun our input buffer
+		 * (Output buffer controlled by for loop condition)
+		 */
+		if ((void *)p >= (buf + buflen))
+			status = -EINVAL;
+		else
+			status = nfs4_decode_nfsace4((void **)&p, ace);
 		if (status) {
 			kfree(acl);
 			return status;
