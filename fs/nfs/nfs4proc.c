@@ -73,9 +73,6 @@
 
 #if CONFIG_TRUENAS
 #include "../nfs_common/nfs41acl_xdr.h"
-
-/* 0xFFFFFFFFFFFFFFFF == 18446744073709551615, len('18446744073709551615') == 20 */
-#define U64_STRBUF_SIZE 21
 #endif /* CONFIG_TRUENAS */
 
 #define NFSDBG_FACILITY		NFSDBG_PROC
@@ -7835,12 +7832,12 @@ static int nfs4_acl_get_whotype(char *p, u32 len)
  * Return the number of bytes (including the leading nbytes and
  * any padding necessary)
  */
-static int nfs4_ace_encode_who(struct nfs4_ace *ace, char *buf)
+static int nfs4_ace_encode_who(struct nfs_server *server, struct nfs4_ace *ace, char *buf)
 {
 	u32 *p = (u32 *)buf;
 	int count = -EINVAL;
 	const char *pstr = NULL;
-	char idbuf[U64_STRBUF_SIZE];  /* Future-proof in case uid_t / gid_t change size */
+	char idbuf[IDMAP_NAMESZ];
 	int total_bytes, pad_count;
 
 	/*
@@ -7851,16 +7848,10 @@ static int nfs4_ace_encode_who(struct nfs4_ace *ace, char *buf)
 	 * pstr will point into s2t_map.
 	 */
 	if (ace->whotype == NFS4_ACL_WHO_NAMED) {
-		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
-			gid_t gid = from_kgid_munged(&init_user_ns, ace->who_gid);
-
-			snprintf(idbuf, sizeof(idbuf), "%lu", (unsigned long)gid);
-		} else {
-			uid_t uid = from_kuid_munged(&init_user_ns, ace->who_uid);
-
-			snprintf(idbuf, sizeof(idbuf), "%lu", (unsigned long)uid);
-		}
-		count = strlen(idbuf);
+		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP)
+			count = nfs_map_gid_to_group(server, ace->who_gid, idbuf, IDMAP_NAMESZ);
+		else
+			count = nfs_map_uid_to_name(server, ace->who_uid, idbuf, IDMAP_NAMESZ);
 	} else {
 		int i;
 
@@ -7904,33 +7895,11 @@ static int nfs4_ace_encode_who(struct nfs4_ace *ace, char *buf)
 }
 
 /*
- * Convert the specified (numeric) name into a unsigned long ID.
- *
- * Do this rather than u32 in an effort to future-proof.
- *
- * Returns true on success.
- */
-static bool numeric_name_to_id(const char *name, u32 namelen, unsigned long *id)
-{
-	int ret;
-	char buf[U64_STRBUF_SIZE];
-
-	if (id && (namelen + 1 > sizeof(buf)))
-		/* no id buffer or too long to represent a 64-bit id: */
-		return false;
-	/* Just to make sure it's null-terminated: */
-	memcpy(buf, name, namelen);
-	buf[namelen] = '\0';
-	ret = kstrtoul(buf, 10, id);
-	return ret == 0;
-}
-
-/*
  * Decode the XDR data supplied in data parameter into an ACE.
  *
  * Upon success 0 is returned, and the data parameter is advanced.
  */
-static int nfs4_decode_nfsace4(void **data, struct nfs4_ace *ace)
+static int nfs4_decode_nfsace4(struct nfs_server *server, void **data, struct nfs4_ace *ace)
 {
 	u32 *p = *data;
 	u32 length;
@@ -7956,31 +7925,32 @@ static int nfs4_decode_nfsace4(void **data, struct nfs4_ace *ace)
 	ace->whotype = nfs4_acl_get_whotype((char *)p, length);
 
 	if (ace->whotype == NFS4_ACL_WHO_NAMED) {
-		/*
-		 * We're just going to support numeric IDs here.
-		 * (it's very expensive to do otherwise)
-		 */
-		unsigned long id = -1;
-
-		if (numeric_name_to_id((const char *)p, length, &id)) {
-			if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
-				ace->who_gid = make_kgid(&init_user_ns, id);
+		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
+			if (length <= 0 || nfs_map_group_to_gid(server, (const char *)p, length,
+								&ace->who_gid) != 0) {
+				pr_err("NFS: %s Failed to obtain who_gid: %.*s", __func__,
+				       length, (char *)p);
+				error = -EINVAL;
+			} else {
 				if (!gid_valid(ace->who_gid)) {
 					pr_err("NFS: %s Invalid who_gid: %.*s", __func__,
 					       length, (char *)p);
 					error = -EINVAL;
 				}
+			}
+		} else {
+			if (length <= 0 || nfs_map_name_to_uid(server, (const char *)p, length,
+							       &ace->who_uid) != 0) {
+				pr_err("NFS: %s Failed to obtain who_uid: %.*s", __func__,
+				       length, (char *)p);
+				error = -EINVAL;
 			} else {
-				ace->who_uid = make_kuid(&init_user_ns, id);
-				if (!uid_valid(ace->who_uid)) {
+				if (!gid_valid(ace->who_gid)) {
 					pr_err("NFS: %s Invalid who_uid: %.*s", __func__,
 					       length, (char *)p);
 					error = -EINVAL;
 				}
 			}
-		} else {
-			pr_err("NFS: %s Non-numeric who: %.*s", __func__, length, (char *)p);
-			error = -EINVAL;
 		}
 	}
 	/*
@@ -8006,8 +7976,8 @@ static int nfs4_decode_nfsace4(void **data, struct nfs4_ace *ace)
  *
  * This is similar to nfsd4_decode_acl
  */
-static int nfs4_aclbuf_decode(void *buf, size_t buflen, enum nfs4_acl_type type,
-			      struct nfs4_acl **pacl)
+static int nfs4_aclbuf_decode(struct nfs_server *server, void *buf, size_t buflen,
+			      enum nfs4_acl_type type, struct nfs4_acl **pacl)
 {
 	u32 acl_flag, count;
 	u32 *p = buf;
@@ -8038,7 +8008,7 @@ static int nfs4_aclbuf_decode(void *buf, size_t buflen, enum nfs4_acl_type type,
 		if ((void *)p >= (buf + buflen))
 			status = -EINVAL;
 		else
-			status = nfs4_decode_nfsace4((void **)&p, ace);
+			status = nfs4_decode_nfsace4(server, (void **)&p, ace);
 		if (status) {
 			kfree(acl);
 			return status;
@@ -8055,12 +8025,14 @@ static int nfs4_aclbuf_decode(void *buf, size_t buflen, enum nfs4_acl_type type,
  * Returns 0 on success, and populates the buf and buflen parameters.  The
  * buf must be freed by the caller.
  */
-static int nfs4_encode_acl_to_buf(struct nfs4_acl *acl, void **buf, size_t *buflen)
+static int nfs4_encode_acl_to_buf(struct inode *inode, struct nfs4_acl *acl,
+				  void **buf, size_t *buflen)
 {
 	int byte_count = 0;
 	struct nfs4_ace *ace;
 	void *xdrbuf;
 	u32 *p;
+	struct nfs_server *server = NFS_SERVER(inode);
 
 	/*
 	 * First count how many bytes we will need.
@@ -8070,7 +8042,7 @@ static int nfs4_encode_acl_to_buf(struct nfs4_acl *acl, void **buf, size_t *bufl
 		int who_bytes;
 
 		byte_count += 12; /* ace type, flag, access_mask */
-		who_bytes = nfs4_ace_encode_who(ace, NULL);
+		who_bytes = nfs4_ace_encode_who(server, ace, NULL);
 		if (who_bytes < 0) {
 			pr_err("NFS: %s Failed to determine bytes for ACE (%d)", __func__,
 			       who_bytes);
@@ -8094,7 +8066,7 @@ static int nfs4_encode_acl_to_buf(struct nfs4_acl *acl, void **buf, size_t *bufl
 		*p++ = htonl(ace->type);
 		*p++ = htonl(ace->flag);
 		*p++ = htonl(ace->access_mask);
-		bytes = nfs4_ace_encode_who(ace, (char *)p);
+		bytes = nfs4_ace_encode_who(server, ace, (char *)p);
 		p += (bytes >> 2);	/* >> 2 because pointer to u32 */
 	}
 
@@ -8154,7 +8126,7 @@ static int nfs4_xattr_set_nfs4_acl_xdr(const struct xattr_handler *handler,
 		goto acl_out;
 
 	/* Encode struct nfs4_acl to DACL XDR */
-	error = nfs4_encode_acl_to_buf(acl, &xdrbuf, &xdrbuflen);
+	error = nfs4_encode_acl_to_buf(inode, acl, &xdrbuf, &xdrbuflen);
 	if (error)
 		goto acl_out;
 
@@ -8177,6 +8149,7 @@ static int nfs4_xattr_get_nfs4_acl_xdr(const struct xattr_handler *handler,
 	int ret = 0;
 	ssize_t dacl_size, acl_size;
 	void *dacl_buf = NULL;
+	struct nfs_server *server = NFS_SERVER(inode);
 
 	/*
 	 * In order to present this view (system.nfs4_acl_xdr) of our ZFS ACL
@@ -8221,7 +8194,7 @@ static int nfs4_xattr_get_nfs4_acl_xdr(const struct xattr_handler *handler,
 		 */
 		struct nfs4_acl *acl = NULL;
 
-		acl_size = nfs4_aclbuf_decode(dacl_buf, dacl_size, NFS4ACL_DACL, &acl);
+		acl_size = nfs4_aclbuf_decode(server, dacl_buf, dacl_size, NFS4ACL_DACL, &acl);
 		if (acl_size < 0) {
 			pr_err("NFS: %s Failed to decode DACL: %zu", __func__, acl_size);
 			ret = -EINVAL;
