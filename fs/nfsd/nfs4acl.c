@@ -43,7 +43,8 @@
 #include "nfsd.h"
 #include "acl.h"
 #include "vfs.h"
-#include "nfs41acl_xdr.h"
+#include "../nfs_common/nfs41acl_xdr.h"
+#include <linux/nfsacl.h>	/* For convert_nfs41xdr_to_nfs40_acl and generate_nfs41acl_buf */
 
 #define NFS4_ACL_TYPE_DEFAULT	0x01
 #define NFS4_ACL_DIR		0x02
@@ -179,78 +180,11 @@ rel_pacl:
 }
 
 static int
-convert_to_nfs40_ace(u32 *xdrbuf, struct nfs4_ace *ace)
-{
-	int error = 0;
-	u32 iflag, id;
-
-	ace->type = ntohl(*(xdrbuf++));
-	if (ace->type > NFS4_ACE_ACCESS_DENIED_ACE_TYPE)
-		return -EINVAL;
-
-	ace->flag = ntohl(*(xdrbuf++));
-	iflag = ntohl(*(xdrbuf++));
-	ace->access_mask = ntohl(*(xdrbuf++)) & NFS4_ACE_MASK_ALL;
-	id = ntohl(*(xdrbuf++));
-
-	if (iflag & ACEI4_SPECIAL_WHO) {
-		switch(id) {
-		case ACE4_SPECIAL_OWNER:
-			ace->whotype = NFS4_ACL_WHO_OWNER;
-			break;
-		case ACE4_SPECIAL_GROUP:
-			ace->whotype = NFS4_ACL_WHO_GROUP;
-			break;
-		case ACE4_SPECIAL_EVERYONE:
-			ace->whotype = NFS4_ACL_WHO_EVERYONE;
-			break;
-		}
-	} else {
-		ace->whotype = NFS4_ACL_WHO_NAMED;
-		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP) {
-			ace->who_gid = make_kgid(&init_user_ns, id);
-			if (!gid_valid(ace->who_gid)) {
-				error = -EINVAL;
-			}
-		} else {
-			ace->who_uid = make_kuid(&init_user_ns, id);
-			if (!uid_valid(ace->who_uid)) {
-				error = -EINVAL;
-			}
-		}
-	}
-
-	return error;
-}
-
-static int
-convert_nfs41xdr_to_nfs40_acl(u32 *xdrbuf, size_t remaining, struct nfs4_acl *acl)
-{
-	int error = 0;
-	int i;
-
-	for (i = 0; i < acl->naces; i++, xdrbuf += NACE41_LEN) {
-		if (remaining < (NACE41_LEN * sizeof(u32))) {
-			error = -EOVERFLOW;
-			break;
-		}
-
-		error = convert_to_nfs40_ace(xdrbuf, &acl->aces[i]);
-		if (error)
-			break;
-
-		remaining -= (NACE41_LEN * sizeof(u32));
-	}
-
-	return error;
-}
-
-static int
 get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
-		struct nfs4_acl **pacl)
+		struct nfs4_acl **pacl, enum nfs4_acl_type acl_type)
 {
 	int error = 0;
-	u32 ace_cnt;
+	u32 ace_cnt, acl_flag = 0;
 	u32 *xdr_buf = NULL, *p;
 	struct nfs4_acl *acl = NULL;
 	ssize_t len;
@@ -292,12 +226,38 @@ get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 
 	BUG_ON(!(XDRSIZE_IS_VALID(len)));
 
-	/*
-	 * At preset only NFS 4.0 (RFC 3530) ACLs are exported by the NFS
-	 * server, and so the ACL-wide flags are ignored when generating the
-	 * internal NFS server ACL.
-	 */
-	p = xdr_buf + 1;
+	switch (acl_type) {
+	case NFS4ACL_ACL:
+		/*
+		 * Only NFS 4.0 (RFC 3530) ACLs are to be exported here by the NFS
+		 * server, and so the ACL-wide flags are ignored when generating the
+		 * internal NFS server ACL.
+		 */
+		p = xdr_buf + 1;
+		break;
+
+	case NFS4ACL_DACL:
+	case NFS4ACL_SACL:
+		/*
+		 * When we read the vsa_aclflags from the xattr there are some
+		 * values that are not supported by NFS (e.g. ACL_IS_DIR).Mask
+		 * them out.
+		 *
+		 * Fortunately, ACL4_AUTO_INHERIT, ACL4_PROTECTED and
+		 * ACL4_DEFAULTED have the same values as the ZFS equivalents
+		 * (ACL_AUTO_INHERIT, ACL_PROTECTED, ACL_DEFAULTED) so no
+		 * value mapping is required.
+		 */
+		p = xdr_buf;
+		acl_flag = ntohl(*(p++)) & (ACL4_AUTO_INHERIT | ACL4_PROTECTED | ACL4_DEFAULTED);
+		break;
+
+	default:
+		/* Should never happen */
+		error = -EINVAL;
+		goto out;
+	}
+
 	ace_cnt = ntohl(*(p++));
 	if (ace_cnt > NFS41ACL_MAX_ENTRIES) {
 		error = -ERANGE;
@@ -310,6 +270,7 @@ get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 		goto out;
 	}
 	acl->naces = ace_cnt;
+	acl->flag = acl_flag;
 
 	error = convert_nfs41xdr_to_nfs40_acl(p++, len - (2 * sizeof(u32)), acl);
 	if (error)
@@ -323,12 +284,12 @@ out:
 
 int
 nfsd4_get_nfs4_acl(struct svc_rqst *rqstp, struct dentry *dentry,
-		struct nfs4_acl **acl)
+		struct nfs4_acl **acl, enum nfs4_acl_type acl_type)
 {
 	struct inode *inode = d_inode(dentry);
 
 	if (IS_NFSV4ACL(inode))
-		return get_nfs4_nfsv41xdr_acl(rqstp, dentry, acl);
+		return get_nfs4_nfsv41xdr_acl(rqstp, dentry, acl, acl_type);
 	else
 		return get_nfs4_posix_acl(rqstp, dentry, acl);
 }
@@ -952,67 +913,6 @@ nfsd4_acl_to_attr_posix(enum nfs_ftype4 type, struct nfs4_acl *acl,
 		return nfserrno(host_error);
 }
 
-static int
-convert_ace_to_nfs41(u32 *p, const struct nfs4_ace *ace)
-{
-	int error = 0;
-	u32 iflag = 0, who = -1;
-
-	/* Audit and Alarm are not currently supported */
-	if (ace->type > NFS4_ACE_ACCESS_DENIED_ACE_TYPE)
-		return -EINVAL;
-
-	switch (ace->whotype) {
-	case NFS4_ACL_WHO_OWNER:
-		iflag = ACEI4_SPECIAL_WHO;
-		who = ACE4_SPECIAL_OWNER;
-		break;
-	case NFS4_ACL_WHO_GROUP:
-		iflag = ACEI4_SPECIAL_WHO;
-		who = ACE4_SPECIAL_GROUP;
-		break;
-	case NFS4_ACL_WHO_EVERYONE:
-		iflag = ACEI4_SPECIAL_WHO;
-		who = ACE4_SPECIAL_EVERYONE;
-		break;
-	case NFS4_ACL_WHO_NAMED:
-		if (ace->flag & NFS4_ACE_IDENTIFIER_GROUP)
-			who = (u32)__kgid_val(ace->who_gid);
-		else
-			who = (u32)__kuid_val(ace->who_uid);
-		break;
-	default:
-		error = -EINVAL;
-	}
-
-	*p++ = htonl(ace->type);
-	*p++ = htonl(ace->flag & NFS41_FLAGS);
-	*p++ = htonl(iflag);
-	*p++ = htonl(ace->access_mask & NFS4_ACE_MASK_ALL);
-	*p++ = htonl(who);
-
-	return error;
-}
-
-static int
-generate_nfs41acl_buf(u32 *xdrbuf, const struct nfs4_acl *acl)
-{
-	int error = 0;
-	int i;
-
-	/* first byte is NFS41 Flags. Skip since these are RFC3530 acls */
-	*xdrbuf++ = 0;
-	*xdrbuf++ = htonl(acl->naces);
-
-	for (i = 0; i < acl->naces; i++, xdrbuf += NACE41_LEN) {
-		error = convert_ace_to_nfs41(xdrbuf, &acl->aces[i]);
-		if (error)
-			break;
-	}
-
-	return error;
-}
-
 static __be32
 nfsd4_acl_to_attr_zfsacl(enum nfs_ftype4 type, struct nfs4_acl *acl,
 			 fsacl_t *fsaclp)
@@ -1036,7 +936,7 @@ nfsd4_acl_to_attr_zfsacl(enum nfs_ftype4 type, struct nfs4_acl *acl,
 	if (!xdr_buf)
 		return nfserrno(-ENOMEM);
 
-	error = generate_nfs41acl_buf(xdr_buf, acl);
+	error = generate_nfs41acl_buf(xdr_buf, acl, type == NF4DIR);
 	if (error) {
 		kfree(xdr_buf);
 		return nfserrno(error);
