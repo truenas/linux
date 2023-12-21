@@ -1153,7 +1153,7 @@ static ssize_t cifs_zfsacl_flags_proc_write(struct file *file,
 
 	idmap_flags = flags & MODFLAG_ALL_IDMAP;
 
-	if ((flags & MODFLAG_ALL_IDMAP) == 0) {
+	if (idmap_flags == 0) {
 		cifs_dbg(VFS, "At least one idmap-related flag must be set");
 		return -EINVAL;
 	}

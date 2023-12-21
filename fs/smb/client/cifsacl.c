@@ -2136,7 +2136,7 @@ convert_smb_sid_to_nfs_who(struct cifs_sid *psid, u32 *iflag, u32 *who_id, u32 *
 		cifs_dbg(FYI, "%s: subauthority count [%u] exceeds "
 			 "maxiumum possible value.\n",
 			 __func__, psid->num_subauth);
-		return -EIO;
+		return -EINVAL;
 	}
 
 	rc = convert_smb_sid_to_nfs_who_special(psid, iflag, who_id, flags);
@@ -2503,6 +2503,10 @@ int ntsd_to_zfsacl_xattr(struct cifs_ntsd *pntsd,
 		return -EIO;
 
 	dacloffset = le32_to_cpu(pntsd->dacloffset);
+	if (!dacloffset) {
+		return generate_null_zfsacl(buf_out);
+	}
+
 	dacl_ptr = (struct cifs_acl *)((char *)pntsd + dacloffset);
 	if (dacl_ptr == NULL) {
 		return generate_null_zfsacl(buf_out);
@@ -2797,7 +2801,7 @@ force_smb3_dacl_info(struct smb3_sd *sd, u32 acl_flag)
 }
 
 /*
- * This is special handling for either NULL or emtpy ACLs.
+ * This is special handling for either NULL or empty ACLs.
  * Returns 0 if ACL is generated, -EAGAIN if regular parsing
  * required, and otherwise -errno.
  */
