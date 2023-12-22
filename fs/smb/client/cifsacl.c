@@ -2067,26 +2067,26 @@ convert_smb_sid_to_nfs_who_special(struct cifs_sid *psid,
 	 * Check for direct mapping of owner@, group@, and everyone@
 	 */
 	if (psid->num_subauth > 3) {
-		return 0;
+		return -ENOENT;
 	}
 
 	if (compare_sids(psid, &sid_everyone) == 0) {
 		*iflag = ACEI4_SPECIAL_WHO;
 		*who_id = ACE4_SPECIAL_EVERYONE;
-		return 1;
+		return 0;
 	}
 
 	if (compare_sids(psid, &sid_creator_owner) == 0) {
 		*iflag = ACEI4_SPECIAL_WHO;
 		*who_id = ACE4_SPECIAL_OWNER;
-		return 1;
+		return 0;
 	}
 
 	if (compare_sids(psid, &sid_creator_group) == 0) {
 		*iflag = ACEI4_SPECIAL_WHO;
 		*who_id = ACE4_SPECIAL_GROUP;
 		*flags |= ACE4_IDENTIFIER_GROUP;
-		return 1;
+		return 0;
 	}
 
 	/*
@@ -2103,24 +2103,24 @@ convert_smb_sid_to_nfs_who_special(struct cifs_sid *psid,
 	case ACCOUNT_SID_UNIX_GROUP:
 		*flags |= ACE4_IDENTIFIER_GROUP;
 		*who_id = le32_to_cpu(psid->sub_auth[1]);
-		return 1;
+		return 0;
 	case ACCOUNT_SID_UNIX_USER:
 		*who_id = le32_to_cpu(psid->sub_auth[1]);
-		return 1;
+		return 0;
 	case ACCOUNT_SID_NFS_GROUP:
 		*flags |= ACE4_IDENTIFIER_GROUP;
 		*who_id = le32_to_cpu(psid->sub_auth[2]);
-		return 1;
+		return 0;
 	case ACCOUNT_SID_NFS_USER:
 		*who_id = le32_to_cpu(psid->sub_auth[2]);
-		return 1;
+		return 0;
 	case ACCOUNT_SID_UNKNOWN:
 		// This SID most likely is for a user or group
 		// which means we must make an upcall
 		break;
 	}
 
-	return 0;
+	return -ENOENT;
 }
 
 static int
@@ -2140,10 +2140,15 @@ convert_smb_sid_to_nfs_who(struct cifs_sid *psid, u32 *iflag, u32 *who_id, u32 *
 	}
 
 	rc = convert_smb_sid_to_nfs_who_special(psid, iflag, who_id, flags);
-	if (rc < 0) {
+	switch (rc) {
+	case -ENOENT:
+		// We need to perform a lookup;
+		break;
+	case -EAGAIN:
+	case 0:
+		// EAGAIN means skip this entry
+		// zero means that it was converted
 		return rc;
-	} else if (rc) {
-		return 0;
 	}
 
 	saved_cred = override_creds(root_cred);
@@ -2158,6 +2163,7 @@ try_upcall_to_get_id:
 	if (IS_ERR(sidkey)) {
 		if (sidkey == NULL) {
 			revert_creds(saved_cred);
+			kfree(sidstr);
 			return -ENOMEM;
 		}
 
