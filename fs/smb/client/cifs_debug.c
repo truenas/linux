@@ -1131,10 +1131,10 @@ static ssize_t cifs_zfsacl_flags_proc_write(struct file *file,
 {
 	int rc;
 	unsigned int flags, idmap_flags;
-	char flags_string[12] = { 0 };
+	char flags_string[6] = { 0 };
 
 	if (count >= sizeof(flags_string))
-		return -EFAULT;
+		return -EINVAL;
 
 	if (copy_from_user(flags_string, buffer, count))
 		return -EFAULT;
