@@ -675,6 +675,18 @@ int cifs_sfu_make_node(unsigned int xid, struct inode *inode,
 		       struct dentry *dentry, struct cifs_tcon *tcon,
 		       const char *full_path, umode_t mode, dev_t dev);
 
+#ifdef CONFIG_TRUENAS
+int ntsd_to_zfsacl_xattr(struct smb_ntsd *pacl,
+			 u32 acllen,
+			 struct inode *inode,
+			 char **buf_out);
+int zfsacl_xattr_to_ntsd(char *aclbuf,
+			 size_t size,
+			 struct inode *inode,
+			 struct smb_ntsd **ppntsd_out,
+			 u32 *acllen_out);
+#endif
+
 #ifdef CONFIG_CIFS_DFS_UPCALL
 static inline int get_dfs_path(const unsigned int xid, struct cifs_ses *ses,
 			       const char *old_path,
