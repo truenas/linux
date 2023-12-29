@@ -26,6 +26,9 @@
 #include "smbdirect.h"
 #endif
 #include "cifs_swn.h"
+#ifdef CONFIG_TRUENAS
+#include "nfs41acl_xdr.h"
+#endif
 
 void
 cifs_dump_mem(char *label, void *data, int length)
@@ -779,6 +782,10 @@ static const struct proc_ops cifs_security_flags_proc_ops;
 static const struct proc_ops cifs_linux_ext_proc_ops;
 static const struct proc_ops cifs_mount_params_proc_ops;
 
+#ifdef CONFIG_TRUENAS
+static const struct proc_ops cifs_zfsacl_flags_proc_ops;
+#endif
+
 void
 cifs_proc_init(void)
 {
@@ -803,6 +810,11 @@ cifs_proc_init(void)
 		    &cifs_lookup_cache_proc_ops);
 
 	proc_create("mount_params", 0444, proc_fs_cifs, &cifs_mount_params_proc_ops);
+
+#ifdef CONFIG_TRUENAS
+	proc_create("zfsacl_configuration_flags", 0644, proc_fs_cifs,
+		    &cifs_zfsacl_flags_proc_ops);
+#endif
 
 #ifdef CONFIG_CIFS_DFS_UPCALL
 	proc_create("dfscache", 0644, proc_fs_cifs, &dfscache_proc_ops);
@@ -844,9 +856,14 @@ cifs_proc_clean(void)
 	remove_proc_entry("LookupCacheEnabled", proc_fs_cifs);
 	remove_proc_entry("mount_params", proc_fs_cifs);
 
+#ifdef CONFIG_TRUENAS
+	remove_proc_entry("zfsacl_configuration_flags", proc_fs_cifs);
+#endif
+
 #ifdef CONFIG_CIFS_DFS_UPCALL
 	remove_proc_entry("dfscache", proc_fs_cifs);
 #endif
+
 #ifdef CONFIG_CIFS_SMB_DIRECT
 	remove_proc_entry("rdma_readwrite_threshold", proc_fs_cifs);
 	remove_proc_entry("smbd_max_frmr_depth", proc_fs_cifs);
@@ -1094,6 +1111,79 @@ static const struct proc_ops cifs_security_flags_proc_ops = {
 	.proc_release	= single_release,
 	.proc_write	= cifs_security_flags_proc_write,
 };
+
+#ifdef CONFIG_TRUENAS
+static int cifs_zfsacl_flags_proc_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "0x%x\n", global_zfsaclflags);
+	return 0;
+}
+
+static int cifs_zfsacl_flags_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cifs_zfsacl_flags_proc_show, NULL);
+}
+
+static ssize_t cifs_zfsacl_flags_proc_write(struct file *file,
+					    const char __user *buffer,
+					    size_t count,
+					    loff_t *ppos)
+{
+	int rc;
+	unsigned int flags, idmap_flags;
+	char flags_string[6] = { 0 };
+
+	if (count >= sizeof(flags_string))
+		return -EINVAL;
+
+	if (copy_from_user(flags_string, buffer, count))
+		return -EFAULT;
+
+	rc = kstrtouint(flags_string, 0, &flags);
+	if (rc) {
+		cifs_dbg(VFS, "failed to convert flags [%s] to int\n",
+			 flags_string);
+		return rc;
+	}
+
+	if (flags & ~MODFLAG_ALL) {
+		cifs_dbg(VFS, "Invalid flags: 0x%08x\n", flags & ~MODFLAG_ALL);
+		return -EINVAL;
+	}
+
+	idmap_flags = flags & MODFLAG_ALL_IDMAP;
+
+	if (idmap_flags == 0) {
+		cifs_dbg(VFS, "At least one idmap-related flag must be set");
+		return -EINVAL;
+	}
+
+	if ((idmap_flags == MODFLAG_ALL_IDMAP) ||
+	    (idmap_flags == (MODFLAG_FAIL_UNKNOWN_SID | MODFLAG_SKIP_UNKNOWN_SID)) ||
+	    (idmap_flags == (MODFLAG_FAIL_UNKNOWN_SID | MODFLAG_MAP_UNKNOWN_SID)) ||
+	    (idmap_flags == (MODFLAG_SKIP_UNKNOWN_SID | MODFLAG_MAP_UNKNOWN_SID))) {
+		cifs_dbg(VFS, "Only one idmap-related flag may be set. Current settings: "
+			 "fail_unknown_sid: %s, skip_unknown_sid: %s, map_unknown_sid: %s, "
+			 "raw: 0x%08x\n",
+			 idmap_flags & MODFLAG_FAIL_UNKNOWN_SID ? "true" : "false",
+			 idmap_flags & MODFLAG_SKIP_UNKNOWN_SID ? "true" : "false",
+			 idmap_flags & MODFLAG_MAP_UNKNOWN_SID ? "true" : "false",
+			 idmap_flags);
+		return -EINVAL;
+	}
+
+	global_zfsaclflags = flags;
+	return count;
+}
+
+static const struct proc_ops cifs_zfsacl_flags_proc_ops = {
+	.proc_open	= cifs_zfsacl_flags_proc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= cifs_zfsacl_flags_proc_write,
+};
+#endif
 
 /* To make it easier to debug, can help to show mount params */
 static int cifs_mount_params_proc_show(struct seq_file *m, void *v)

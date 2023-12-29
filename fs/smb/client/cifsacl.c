@@ -25,10 +25,20 @@
 #include "fs_context.h"
 #include "cifs_fs_sb.h"
 #include "cifs_unicode.h"
+#ifdef CONFIG_TRUENAS
+#include "nfs41acl_xdr.h"
+#endif
 
 /* security id for everyone/world system group */
 static const struct cifs_sid sid_everyone = {
 	1, 1, {0, 0, 0, 0, 0, 1}, {0} };
+#ifdef CONFIG_TRUENAS
+static const struct cifs_sid sid_creator_owner = {
+	1, 1, {0, 0, 0, 0, 0, 3}, {0} };
+
+static const struct cifs_sid sid_creator_group = {
+	1, 1, {0, 0, 0, 0, 0, 3}, {cpu_to_le32(1)} };
+#endif /* CONFIG_TRUENAS */
 /* security id for Authenticated Users system group */
 static const struct cifs_sid sid_authusers = {
 	1, 1, {0, 0, 0, 0, 0, 5}, {cpu_to_le32(11)} };
@@ -1809,3 +1819,1132 @@ out:
 	return -EOPNOTSUPP;
 #endif
 }
+
+#ifdef CONFIG_TRUENAS
+enum account_special_sid_type {
+	ACCOUNT_SID_UNKNOWN,
+	ACCOUNT_SID_UNIX_USER,
+	ACCOUNT_SID_UNIX_GROUP,
+	ACCOUNT_SID_NFS_USER,
+	ACCOUNT_SID_NFS_GROUP,
+};
+
+unsigned int global_zfsaclflags = MODFLAG_DEFAULTS;
+
+static const struct {
+	u32 nfs_perm;
+	u32 smb_perm;
+} nfsperm2smb[] = {
+	{ ACE4_READ_DATA, FILE_READ_DATA},
+	{ ACE4_WRITE_DATA, FILE_WRITE_DATA},
+	{ ACE4_APPEND_DATA, FILE_APPEND_DATA},
+	{ ACE4_READ_NAMED_ATTRS, FILE_READ_EA},
+	{ ACE4_WRITE_NAMED_ATTRS, FILE_WRITE_EA},
+	{ ACE4_EXECUTE, FILE_EXECUTE},
+	{ ACE4_DELETE_CHILD, FILE_DELETE_CHILD},
+	{ ACE4_READ_ATTRIBUTES, FILE_READ_ATTRIBUTES},
+	{ ACE4_WRITE_ATTRIBUTES, FILE_WRITE_ATTRIBUTES},
+	{ ACE4_DELETE, DELETE},
+	{ ACE4_READ_ACL, READ_CONTROL},
+	{ ACE4_WRITE_ACL, WRITE_DAC},
+	{ ACE4_WRITE_OWNER, WRITE_OWNER},
+	{ ACE4_SYNCHRONIZE, SYNCHRONIZE},
+};
+
+static const struct {
+	u32 nfs_flag;
+	u8 smb_flag;
+} nfsflag2smb[] = {
+	{ ACE4_FILE_INHERIT_ACE, OBJECT_INHERIT_ACE},
+	{ ACE4_DIRECTORY_INHERIT_ACE, CONTAINER_INHERIT_ACE},
+	{ ACE4_NO_PROPAGATE_INHERIT_ACE, NO_PROPAGATE_INHERIT_ACE},
+	{ ACE4_INHERIT_ONLY_ACE, INHERIT_ONLY_ACE},
+	{ ACE4_INHERITED_ACE, INHERITED_ACE},
+};
+
+static int
+set_xdr_ace(u32 *acep,
+	    u32 who_iflag,
+	    u32 who_id,
+	    u32 ace_type,
+	    u32 access_mask,
+	    u32 flags)
+{
+        /* Audit and Alarm are not currently supported */
+        if (ace_type > ACE4_ACCESS_DENIED_ACE_TYPE)
+                return -EINVAL;
+
+        *acep++ = htonl(ace_type);
+        *acep++ = htonl(flags);
+        *acep++ = htonl(who_iflag);
+        *acep++ = htonl(access_mask);
+        *acep++ = htonl(who_id);
+
+        return 0;
+}
+
+static enum account_special_sid_type
+get_account_special_sid_type(struct cifs_sid *psid)
+{
+	if (psid->num_subauth == 2) {
+		if (psid->sub_auth[0] == sid_unix_groups.sub_auth[0]) {
+			return ACCOUNT_SID_UNIX_GROUP;
+		} else if (psid->sub_auth[0] == sid_unix_users.sub_auth[0]) {
+			return ACCOUNT_SID_UNIX_USER;
+		}
+	} else if (psid->num_subauth == 3) {
+		// S-1-5-88-1-<uid> - NFS user
+		// S-1-5-88-2-<gid> - NFS group
+		if (psid->sub_auth[0] !=  sid_unix_NFS_groups.sub_auth[0]) {
+			// First subauth doesn't match, not an NFS SID
+			return ACCOUNT_SID_UNKNOWN;
+		}
+		if (psid->sub_auth[1] == sid_unix_NFS_groups.sub_auth[1]) {
+			return ACCOUNT_SID_NFS_GROUP;
+		} else if (psid->sub_auth[1] == sid_unix_NFS_groups.sub_auth[1]) {
+			return ACCOUNT_SID_NFS_USER;
+		}
+	}
+
+	return ACCOUNT_SID_UNKNOWN;
+}
+
+/*
+ * Per Microsoft Win32 documentation, an empty DACL (i.e. one that
+ * is properly initialized and contains no ACEs) grants no access to the
+ * object it is assigned to. We can't set an empty ACL on ZFS, and so the
+ * best we can do is create an ACL with a single entry granting file owner
+ * owner@ no rights. Note that in Windows and Unix the file owner is able
+ * to override the ACL.
+ */
+static int
+generate_empty_zfsacl(char **buf_out)
+{
+	u32 *xdrbuf = NULL, *zfsacl;
+	xdrbuf = kzalloc(ACES_TO_XDRSIZE(1), GFP_KERNEL);
+	if (!xdrbuf)
+		return -ENOMEM;
+
+	zfsacl = xdrbuf;
+	*zfsacl++ = 0; /* acl_flags */
+	*zfsacl++ = htonl(1); /* acl count */
+
+	set_xdr_ace(zfsacl, ACEI4_SPECIAL_WHO, ACE4_SPECIAL_OWNER,
+		    ACE4_ACCESS_ALLOWED_ACE_TYPE, 0, 0);
+
+	*buf_out = (char *)xdrbuf;
+	return ACES_TO_XDRSIZE(1);
+}
+
+/*
+ * Per Microsoft Win32 documentation, a NULL DACL grants full access to
+ * any user that requests it; normal security checking is not performed
+ * with respect to the object. We can't set a NULL ZFS ACL and so
+ * the best we can do is set one granting everyone@ full control.
+ */
+static int
+generate_null_zfsacl(char **buf_out)
+{
+	u32 *xdrbuf = NULL, *zfsacl;
+
+	xdrbuf = kzalloc(ACES_TO_XDRSIZE(1), GFP_KERNEL);
+	if (!xdrbuf)
+		return -ENOMEM;
+
+	zfsacl = xdrbuf;
+	*zfsacl++ = 0; /* acl_flags */
+	*zfsacl++ = htonl(1); /* acl count */
+
+	set_xdr_ace(zfsacl, ACEI4_SPECIAL_WHO, ACE4_SPECIAL_EVERYONE,
+		    ACE4_ACCESS_ALLOWED_ACE_TYPE, ACE4_ALL_PERMS, 0);
+
+	*buf_out = (char *)xdrbuf;
+	return ACES_TO_XDRSIZE(1);
+}
+
+/*
+ * Convert generic access into NFSv4 perms
+ */
+static u32
+generic_to_nfs(u32 generic_access)
+{
+	u32 out = 0;
+	if (generic_access == GENERIC_ALL) {
+		return ACE4_ALL_PERMS;
+	}
+
+	if (generic_access & GENERIC_READ) {
+		out |= ACE4_READ_PERMS;
+	}
+
+	if (generic_access & GENERIC_EXECUTE) {
+		out |= ACE4_EXECUTE;
+	}
+
+	if (generic_access & GENERIC_WRITE) {
+		out |= (ACE4_WRITE_PERMS|ACE4_DELETE);
+	}
+
+	return out;
+}
+
+static int
+convert_smb_access_to_nfs(u32 smbaccess, u32 *nfs_access_out)
+{
+	int i;
+	u32 perms = generic_to_nfs(smbaccess);
+
+	if (perms == ACE4_ALL_PERMS) {
+		*nfs_access_out = perms;
+		return 0;
+	}
+
+	for (i = 0; i < (sizeof(nfsperm2smb) / sizeof(nfsperm2smb[0])); i++) {
+		if (smbaccess & nfsperm2smb[i].smb_perm)
+			perms |= nfsperm2smb[i].nfs_perm;
+	}
+
+	*nfs_access_out = perms;
+	return 0;
+}
+
+static int
+convert_smb_flags_to_nfs(u8 smbflags, u32 *nfs_flags_out)
+{
+	int i;
+	u32 flags = 0;
+
+	if (smbflags & (SUCCESSFUL_ACCESS_ACE_FLAG | FAILED_ACCESS_ACE_FLAG)) {
+		cifs_dbg(VFS, "%s: ACE contains unsupported flags 0x%04x\n",
+			 __func__, smbflags);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < (sizeof(nfsflag2smb) / sizeof(nfsflag2smb[0])); i++) {
+		if (smbflags & nfsflag2smb[i].smb_flag)
+			flags |= nfsflag2smb[i].nfs_flag;
+	}
+
+	*nfs_flags_out = flags;
+	return 0;
+}
+
+static int
+convert_smb_ace_type_to_nfs(u8 smbacetype, u32 *nfs_ace_type_out)
+{
+	switch (smbacetype) {
+	case ACCESS_ALLOWED_ACE_TYPE:
+		*nfs_ace_type_out = ACE4_ACCESS_ALLOWED_ACE_TYPE;
+		break;
+	case ACCESS_DENIED_ACE_TYPE:
+		*nfs_ace_type_out = ACE4_ACCESS_DENIED_ACE_TYPE;
+		break;
+	default:
+		cifs_dbg(VFS, "%s: ACE contains unsupported ace type 0x%04x\n",
+			 __func__, smbacetype);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
+ * Convert SID into NFS4 ID and type. Try to map BUILTIN / SPECIAL sids
+ * directly to NFS4 special type where possible (to avoid upcall to winbindd).
+ *
+ * Since the existing idmap key implementation does support return of both
+ * users and groups in one call, we first try to retrieve group (because this
+ * is in real life much more likely). If retrieving as group fails, we retry
+ * as user.
+ */
+static int
+convert_smb_sid_to_nfs_who_special(struct cifs_sid *psid,
+				   u32 *iflag,
+				   u32 *who_id,
+				   u32 *flags)
+{
+	/*
+	 * Check for direct mapping of owner@, group@, and everyone@
+	 */
+	if (psid->num_subauth > 3) {
+		return -ENOENT;
+	}
+
+	if (compare_sids(psid, &sid_everyone) == 0) {
+		*iflag = ACEI4_SPECIAL_WHO;
+		*who_id = ACE4_SPECIAL_EVERYONE;
+		return 0;
+	}
+
+	if (compare_sids(psid, &sid_creator_owner) == 0) {
+		*iflag = ACEI4_SPECIAL_WHO;
+		*who_id = ACE4_SPECIAL_OWNER;
+		return 0;
+	}
+
+	if (compare_sids(psid, &sid_creator_group) == 0) {
+		*iflag = ACEI4_SPECIAL_WHO;
+		*who_id = ACE4_SPECIAL_GROUP;
+		*flags |= ACE4_IDENTIFIER_GROUP;
+		return 0;
+	}
+
+	/*
+	 * SID communicating Unix mode can be safely skipped since we will
+	 * get permissions info from other ACL entries
+	 */
+	if (compare_sids(psid, &sid_unix_NFS_mode) == 0)
+		return -EAGAIN;
+
+	/*
+	 * SID may directly encode a Unix uid or gid.
+	 */
+	switch (get_account_special_sid_type(psid)) {
+	case ACCOUNT_SID_UNIX_GROUP:
+		*flags |= ACE4_IDENTIFIER_GROUP;
+		*who_id = le32_to_cpu(psid->sub_auth[1]);
+		return 0;
+	case ACCOUNT_SID_UNIX_USER:
+		*who_id = le32_to_cpu(psid->sub_auth[1]);
+		return 0;
+	case ACCOUNT_SID_NFS_GROUP:
+		*flags |= ACE4_IDENTIFIER_GROUP;
+		*who_id = le32_to_cpu(psid->sub_auth[2]);
+		return 0;
+	case ACCOUNT_SID_NFS_USER:
+		*who_id = le32_to_cpu(psid->sub_auth[2]);
+		return 0;
+	case ACCOUNT_SID_UNKNOWN:
+		// This SID most likely is for a user or group
+		// which means we must make an upcall
+		break;
+	}
+
+	return -ENOENT;
+}
+
+static int
+convert_smb_sid_to_nfs_who(struct cifs_sid *psid, u32 *iflag, u32 *who_id, u32 *flags)
+{
+	char *sidstr;
+	const struct cred *saved_cred;
+	struct key *sidkey;
+	uint sidtype = SIDGROUP;
+	int rc;
+
+	if (unlikely(psid->num_subauth > SID_MAX_SUB_AUTHORITIES)) {
+		cifs_dbg(FYI, "%s: subauthority count [%u] exceeds "
+			 "maxiumum possible value.\n",
+			 __func__, psid->num_subauth);
+		return -EINVAL;
+	}
+
+	rc = convert_smb_sid_to_nfs_who_special(psid, iflag, who_id, flags);
+	switch (rc) {
+	case -ENOENT:
+		// We need to perform a lookup;
+		break;
+	case -EAGAIN:
+	case 0:
+		// EAGAIN means skip this entry
+		// zero means that it was converted
+		return rc;
+	}
+
+	saved_cred = override_creds(root_cred);
+
+try_upcall_to_get_id:
+	sidstr = sid_to_key_str(psid, sidtype);
+	if (!sidstr) {
+		revert_creds(saved_cred);
+		return -ENOMEM;
+	}
+	sidkey = request_key(&cifs_idmap_key_type, sidstr, "");
+	if (IS_ERR(sidkey)) {
+		if (sidkey == NULL) {
+			revert_creds(saved_cred);
+			kfree(sidstr);
+			return -ENOMEM;
+		}
+
+		if ((PTR_ERR(sidkey) == -ENOKEY) &&
+		    (sidtype == SIDGROUP)) {
+			/*
+			 * No group, retry as SIDOWNER
+			 */
+			kfree(sidstr);
+			sidtype = SIDOWNER;
+			goto try_upcall_to_get_id;
+		}
+
+		cifs_dbg(FYI, "%s: Can't map SID %s to a %cid\n",
+			 __func__, sidstr, sidtype == SIDOWNER ? 'u' : 'g');
+
+		kfree(sidstr);
+		revert_creds(saved_cred);
+		return PTR_ERR(sidkey);
+	}
+
+	BUILD_BUG_ON(sizeof(uid_t) != sizeof(gid_t));
+	if (sidkey->datalen != sizeof(uid_t)) {
+		cifs_dbg(FYI, "%s: Downcall for sid [%s] contained malformed "
+			 "key (datalen=%hu)\n",
+			 __func__, sidstr, sidkey->datalen);
+		key_invalidate(sidkey);
+		key_put(sidkey);
+		revert_creds(saved_cred);
+		kfree(sidstr);
+		return -ENOKEY;
+	}
+
+	if (sidtype == SIDGROUP) {
+		*flags |= ACE4_IDENTIFIER_GROUP;
+	}
+
+	memcpy(who_id, &sidkey->payload.data[0], sizeof(uid_t));
+	key_put(sidkey);
+	revert_creds(saved_cred);
+	kfree(sidstr);
+
+	return 0;
+}
+
+static int
+do_ace_conversion(struct cifs_ace *pace,
+		  u32 *p_perms,
+		  u32 *p_iflag,
+		  u32 *p_who_id,
+		  u32 *p_flags,
+		  u32 *p_ace_type)
+{
+	int error;
+	char *sid_str;
+
+	if (le16_to_cpu(pace->size) < 16) {
+		cifs_dbg(VFS, "%s: NT ACE size is invalid %d\n",
+			 __func__, le16_to_cpu(pace->size));
+		return -E2BIG;
+	}
+
+	error = convert_smb_ace_type_to_nfs(pace->type, p_ace_type);
+	if (error) {
+		return error;
+	}
+
+	error = convert_smb_access_to_nfs(pace->access_req, p_perms);
+	if (error) {
+		return error;
+	}
+
+	error = convert_smb_flags_to_nfs(pace->flags, p_flags);
+	if (error) {
+		return error;
+	}
+
+	error = convert_smb_sid_to_nfs_who(&pace->sid, p_iflag, p_who_id, p_flags);
+	if (error == -ENOKEY) {
+		if (*p_ace_type == ACE4_ACCESS_DENIED_ACE_TYPE) {
+			sid_str = sid_to_key_str(&pace->sid, SIDOWNER);
+			if (sid_str == NULL) {
+				return -ENOMEM;
+			}
+
+			cifs_dbg(VFS,
+				 "%s: [%s] unable to convert SID into a local "
+				 "ID for a DENY ACL entry. Since omission or "
+				 "alteration of the ACL entry would increase "
+				 "access to the file, this error may not be "
+				 "overriden via client configuration change. "
+				 "Administrative action will be required to "
+				 "either remove the ACL entry from the remote "
+				 "server or map the unknown SID to a local "
+				 "Unix ID on this client\n", __func__, sid_str);
+			kfree(sid_str);
+			return -ENOKEY;
+                }
+		if (global_zfsaclflags & MODFLAG_SKIP_UNKNOWN_SID) {
+			return -EAGAIN;
+		} else if (global_zfsaclflags & MODFLAG_MAP_UNKNOWN_SID) {
+			*p_who_id = from_kuid(&init_user_ns, current_fsuid());
+			return 0;
+		}
+	}
+
+	return error;
+}
+
+static bool
+combine_with_next(struct cifs_ace *pace,
+		  u32 *p_perms,
+		  u32 *p_iflag,
+		  u32 *p_who_id,
+		  u32 *p_flags,
+		  u32 *p_ace_type)
+{
+	u32 perms = 0, iflag = 0, who_id = 0, flags = 0, ace_type = 0;
+	int error;
+
+	error = do_ace_conversion(pace,
+				  &perms,
+				  &iflag,
+				  &who_id,
+				  &flags,
+				  &ace_type);
+
+	/*
+	 * If an error is encountered here, it will also
+	 * be picked up when we formally parse next ACE
+	 * and so we'll handle the error there.
+	 */
+	if (error) {
+		return false;
+	}
+
+	if (perms != *p_perms) {
+		return false;
+	}
+
+	if (ace_type != *p_ace_type) {
+		return false;
+	}
+
+	if ((flags & ACE4_INHERIT_ONLY_ACE) == 0) {
+		return false;
+	}
+
+	if (iflag != ACEI4_SPECIAL_WHO) {
+		return false;
+	}
+
+	*p_iflag = iflag;
+	*p_who_id = who_id;
+	*p_flags = (flags & ~ACE4_INHERIT_ONLY_ACE);
+	return true;
+}
+
+/*
+ * There are various situations where admin may want to just skip
+ * certain aces in case of conversion failure. A primary example
+ * is if ACL contains an ACE for a local user on the remote server.
+ * In this case (as long as the ACE is ALLOW rather than DENY) it
+ * is safe (although perhaps incorrect) to simply skip the entry.
+ *
+ * Currently this function on success returns number of good ACEs
+ * added to the acl.
+ *
+ * On error return -errno.
+ */
+static int
+convert_smbace_to_nfsace(struct cifs_ace *pace,
+			 u32 *zfsacl,
+			 bool isdir,
+			 uid_t owner,
+			 uid_t group,
+			 bool islast,
+			 bool *pskip_next)
+{
+	u32 *zace = zfsacl;
+	u32 perms = 0, iflag = 0, who_id = 0, flags = 0, ace_type = 0;
+	uid_t to_check;
+	int error;
+
+	error = do_ace_conversion(pace,
+				  &perms,
+				  &iflag,
+				  &who_id,
+				  &flags,
+				  &ace_type);
+	if (error) {
+		return error;
+	}
+
+	to_check = flags & ACE4_IDENTIFIER_GROUP ? group : owner;
+
+	/*
+	 * This is a Samba server implementation detail for NFS4 ACL.
+	 * S-1-3-0 and S-1-3-1 are only valid with INHERIT_ONLY set
+	 * whereas owner@ and group@ in NFS4 ACL carry no such restriction.
+	 * Therefore the server will split owner@ into two separate aces:
+	 * one with S-1-3-0 (or S-1-3-1 in case of group@) and INHERIT_ONLY
+	 * and the other as a normal non-special entry for the ID of the user
+	 * or group with no inheritance flags set.
+	 *
+	 * The SMB server will always present the next ACE as the second of
+	 * the pair and so we peek ahead here. If both halves of pair are
+	 * present, then we combine into a single owner@ or group@ entry.
+	 */
+	if ((iflag == 0) &&
+	    (who_id == to_check) &&
+	    ((flags & ~(ACE4_INHERITED_ACE | ACE4_IDENTIFIER_GROUP)) == 0)) {
+		struct cifs_ace *next;
+		if (!isdir) {
+			iflag = ACEI4_SPECIAL_WHO;
+			if (flags & ACE4_IDENTIFIER_GROUP) {
+				who_id = ACE4_SPECIAL_GROUP;
+
+			} else {
+				who_id = ACE4_SPECIAL_OWNER;
+			}
+
+		} else if (!islast) {
+			next = (struct cifs_ace *)((char *)pace +
+			    le16_to_cpu(pace->size));
+			*pskip_next = combine_with_next(next,
+							&perms,
+							&iflag,
+							&who_id,
+							&flags,
+							&ace_type);
+		}
+	}
+
+	error = set_xdr_ace(zace, iflag, who_id, ace_type, perms, flags);
+	if (error) {
+		return error;
+	}
+
+	return 1;
+}
+
+static int
+convert_dacl_to_zfsacl(struct cifs_acl *dacl_ptr,
+		       char *end,
+		       struct inode *inode,
+		       char **buf_out)
+{
+	int good_aces = 0, aces_set;
+	char *acl_base;
+	u32 *xdr_base, *zfsacl, num_aces, i;
+	struct cifs_ace *pace;
+	bool skip_next = false;
+	bool isdir = S_ISDIR(inode->i_mode);
+	uid_t owner, group;
+
+	num_aces = le32_to_cpu(dacl_ptr->num_aces);
+	if (num_aces > NFS41ACL_MAX_ENTRIES)
+		return -E2BIG;
+
+	if (num_aces == 0)
+		return generate_empty_zfsacl(buf_out);
+
+	if (end < (char *)dacl_ptr + le16_to_cpu(dacl_ptr->size)) {
+		cifs_dbg(VFS, "%s: ACL size [%u] encoded in NT DACL "
+			 "is invalid.\n",
+			 __func__, le16_to_cpu(dacl_ptr->size));
+		return -EINVAL;
+	}
+
+	xdr_base = kzalloc(ACES_TO_XDRSIZE(num_aces), GFP_KERNEL);
+	if (!xdr_base)
+		return -ENOMEM;
+
+	zfsacl = (u32 *)xdr_base + NACL_OFFSET;
+	acl_base = (char *)dacl_ptr + sizeof(struct cifs_acl);
+
+	owner = from_kuid(&init_user_ns, inode->i_uid);
+	group = from_kgid(&init_user_ns, inode->i_gid);
+
+	for (i = 0; i < num_aces; i++) {
+		pace = (struct cifs_ace *)(acl_base);
+		acl_base += pace->size;
+
+		if (end < (char *)acl_base) {
+			cifs_dbg(VFS, "%s: ACL entry %d in NT DACL has a size "
+				 "[%u] that would exceed the buffer size "
+				 "allocated for DACL.",
+				 __func__, i, pace->size);
+			kfree(xdr_base);
+			return -EINVAL;
+		}
+
+		if (parse_sid(&pace->sid, end)) {
+			kfree(xdr_base);
+			return -EINVAL;
+		}
+
+		if (skip_next) {
+			skip_next = false;
+			continue;
+		}
+
+		aces_set = convert_smbace_to_nfsace(pace, zfsacl, isdir, owner,
+		    group, i == (num_aces -1), &skip_next);
+		if (aces_set < 0) {
+			switch (aces_set) {
+			case -EAGAIN:
+				// Entry should be skipped
+				aces_set = 0;
+				break;
+			default:
+				cifs_dbg(VFS, "%s: conversion of ACE %d in "
+					 "DACL could not be converted into "
+					 "local ZFS ACE format: %d\n",
+					 __func__, i, aces_set);
+				kfree(xdr_base);
+				return aces_set;
+			}
+		}
+
+		good_aces += aces_set;
+		zfsacl += (aces_set * NACE41_LEN);
+	}
+
+	xdr_base[0] = htonl(isdir ? ACL4_ISDIR : 0);
+	xdr_base[1] = htonl(good_aces);
+
+	*buf_out = (char *)xdr_base;
+	return ACES_TO_XDRSIZE(good_aces);
+}
+
+int ntsd_to_zfsacl_xattr(struct cifs_ntsd *pntsd,
+			 u32 acl_len,
+			 struct inode *inode,
+			 char **buf_out)
+{
+	struct cifs_acl *dacl_ptr; /* no need for SACL ptr */
+	char *end_of_acl = ((char *)pntsd) + acl_len;
+	__u32 dacloffset;
+
+	if (pntsd == NULL)
+		return -EIO;
+
+	dacloffset = le32_to_cpu(pntsd->dacloffset);
+	if (!dacloffset) {
+		return generate_null_zfsacl(buf_out);
+	}
+
+	dacl_ptr = (struct cifs_acl *)((char *)pntsd + dacloffset);
+	if (dacl_ptr == NULL) {
+		return generate_null_zfsacl(buf_out);
+	}
+
+	return convert_dacl_to_zfsacl(dacl_ptr, end_of_acl, inode, buf_out);
+}
+
+/*
+ * Creator-owner and creator-owner-group SIDs are only valid if flags are
+ * set to INHERIT_ONLY. This means other ones will need to be split into two
+ * separate entries.
+ */
+static int calculate_ntsd_acecnt(u32 *zfsacl, u32 acecnt, struct inode *inode, u32 *cnt)
+{
+	u32 *ace = zfsacl;
+	u32 i, cnt_out = 0;
+	u32 flag, iflag, who_id;
+	bool isdir = S_ISDIR(inode->i_mode);
+
+	for (i = 0; i < acecnt; i++) {
+		flag = ntohl(*(ace + NA_FLAG_OFFSET));
+		iflag = ntohl(*(ace + NA_IFLAG_OFFSET));
+		who_id = ntohl(*(ace + NA_WHO_OFFSET));
+
+		if (!isdir && (flag & DIR_ONLY_FLAGS)) {
+			/* Not all flags are valid for files */
+			return -EINVAL;
+		}
+
+		if ((flag & ACE4_INHERIT_ONLY_ACE) &&
+		    ((flag & (ACE4_DIRECTORY_INHERIT_ACE | \
+		    ACE4_FILE_INHERIT_ACE)) == 0)) {
+			/* INHERIT_ONLY without some inherit flags is invalid */
+			return -EINVAL;
+		}
+
+		if (isdir && (iflag == ACEI4_SPECIAL_WHO) &&
+		    ((flag & ACE4_INHERIT_ONLY_ACE) == 0) &&
+		    ((who_id == ACE4_SPECIAL_OWNER) || (who_id == ACE4_SPECIAL_GROUP))) {
+			cnt_out += 1;
+		}
+
+		cnt_out += 1;
+		ace += NACE41_LEN;
+	}
+
+	*cnt = cnt_out;
+
+	return 0;
+}
+
+static int
+convert_zfsperm_to_ntperm(u32 zfsperms, struct cifs_ace *ace)
+{
+	u32 access_mask = 0;
+	int i;
+
+	for (i = 0; i < (sizeof(nfsperm2smb) / sizeof(nfsperm2smb[0])); i++) {
+		if (zfsperms & nfsperm2smb[i].nfs_perm) {
+			access_mask |= nfsperm2smb[i].smb_perm;
+		}
+	}
+
+	ace->access_req = cpu_to_le32(access_mask);
+
+	return 0;
+}
+
+static int
+convert_zfsflag_to_ntflag(u32 zfsflags, struct cifs_ace *ace)
+{
+	u8 flags = 0;
+	int i;
+
+	for (i = 0; i < (sizeof(nfsflag2smb) / sizeof(nfsflag2smb[0])); i++) {
+
+		if (zfsflags & nfsflag2smb[i].nfs_flag) {
+			flags |= nfsflag2smb[i].smb_flag;
+		}
+	}
+
+	ace->flags = flags;
+	return 0;
+}
+
+static int
+convert_zfstype_to_nttype(u32 ace_type, struct cifs_ace *ace)
+{
+	switch (ace_type) {
+	case ACE4_ACCESS_ALLOWED_ACE_TYPE:
+		ace->type = ACCESS_ALLOWED_ACE_TYPE;
+		break;
+	case ACE4_ACCESS_DENIED_ACE_TYPE:
+		ace->type = ACCESS_DENIED_ACE_TYPE;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+convert_zfswho_to_ntsid(u32 iflag, u32 who_id, struct inode *inode, u32 flags, struct cifs_ace *ace)
+{
+
+	uint sidtype = flags & ACE4_IDENTIFIER_GROUP;
+	uid_t id;
+
+	if ((iflag & ACEI4_SPECIAL_WHO) == 0) {
+		/*
+		 * This is not a special entry (owner@, group@, everyone@)
+		 * and so we need to make go through normal conversion
+		 */
+		return id_to_sid(who_id, sidtype, &ace->sid);
+	}
+
+	switch (who_id) {
+	case ACE4_SPECIAL_EVERYONE:
+		cifs_copy_sid(&ace->sid, &sid_everyone);
+		return 0;
+		break;
+	case ACE4_SPECIAL_OWNER:
+		id = from_kuid(&init_user_ns, inode->i_uid);
+
+		if (flags & ACE4_INHERIT_ONLY_ACE) {
+			cifs_copy_sid(&ace->sid, &sid_creator_owner);
+			return 0;
+		} else {
+			return id_to_sid(id, SIDOWNER, &ace->sid);
+		}
+		break;
+	case ACE4_SPECIAL_GROUP:
+		id = from_kgid(&init_user_ns, inode->i_gid);
+		if (flags & ACE4_INHERIT_ONLY_ACE) {
+			cifs_copy_sid(&ace->sid, &sid_creator_group);
+			return 0;
+		} else {
+			return id_to_sid(id, SIDGROUP, &ace->sid);
+		}
+		break;
+	}
+	return -EINVAL;
+}
+
+#define BASE_ACE_SIZE (1 + 1 + 2 + 4) /* struct cifs_ace: type, flags, size, access_req */
+#define CIFS_ACE_SIZE(cnt) (BASE_ACE_SIZE + (CIFS_SID_BASE_SIZE + (cnt * 4)))
+
+static int
+convert_zfsace_to_cifs_aces(u32 *zfsace, char *acl_base, struct inode *inode, u16 *size)
+{
+	u32 perms, flags, iflag, who_id, ace_type;
+	int error;
+	u16 out_sz = 0, ace_sz;
+	struct cifs_ace *ace = (struct cifs_ace *)acl_base;
+
+	ace_type = ntohl(*(zfsace + NA_TYPE_OFFSET));
+	flags = ntohl(*(zfsace + NA_FLAG_OFFSET));
+	iflag = ntohl(*(zfsace + NA_IFLAG_OFFSET));
+	perms = ntohl(*(zfsace + NA_ACCESS_MASK_OFFSET));
+	who_id = ntohl(*(zfsace + NA_WHO_OFFSET));
+
+	/*
+	 * Creator-owner and Creator-owner-group SIDS are only valid
+	 * for ACES with INHERIT_ONLY set. This means that we split
+	 * inheriting owner@ and group@ entries into two separate ACEs with
+	 * an identical access mask. One is non-inheriting for the inode owner
+	 * or group, and the other is inherit-only with the special SID value.
+	 */
+	if ((iflag & ACEI4_SPECIAL_WHO) && (who_id != ACE4_SPECIAL_EVERYONE) &&
+	    S_ISDIR(inode->i_mode) && ((flags & ACE4_INHERIT_ONLY_ACE) == 0)) {
+		convert_zfsperm_to_ntperm(perms, ace);
+		convert_zfsflag_to_ntflag(flags | ACE4_INHERIT_ONLY_ACE, ace);
+		error = convert_zfstype_to_nttype(ace_type, ace);
+		if (error) {
+			return error;
+		}
+
+		error = convert_zfswho_to_ntsid(iflag,
+						who_id,
+						inode,
+						flags | ACE4_INHERIT_ONLY_ACE,
+						ace);
+		if (error) {
+			return error;
+		}
+
+		ace_sz = CIFS_ACE_SIZE(ace->sid.num_subauth);
+		ace->size = cpu_to_le16(ace_sz);
+		out_sz += ace_sz;
+
+		/* skip forward to next ACE slot */
+		ace = (struct cifs_ace *)(acl_base + ace_sz);
+		flags &= ~DIR_ONLY_FLAGS;
+
+		convert_zfsperm_to_ntperm(perms, ace);
+		convert_zfsflag_to_ntflag(flags, ace);
+		error = convert_zfstype_to_nttype(ace_type, ace);
+		if (error) {
+			return error;
+		}
+
+		error = convert_zfswho_to_ntsid(iflag,
+						who_id,
+						inode,
+						flags,
+						ace);
+		if (error) {
+			return error;
+		}
+
+		ace_sz = CIFS_ACE_SIZE(ace->sid.num_subauth);
+		ace->size = cpu_to_le16(ace_sz);
+		out_sz += ace_sz;
+	} else {
+		convert_zfsperm_to_ntperm(perms, ace);
+		convert_zfsflag_to_ntflag(flags, ace);
+		error = convert_zfstype_to_nttype(ace_type, ace);
+		if (error) {
+			return error;
+		}
+		error = convert_zfswho_to_ntsid(iflag,
+						who_id,
+						inode,
+						flags,
+						ace);
+		if (error) {
+			return error;
+		}
+
+		ace_sz = CIFS_ACE_SIZE(ace->sid.num_subauth);
+		ace->size = cpu_to_le16(ace_sz);
+		out_sz += ace_sz;
+	}
+
+	if (error) {
+		return error;
+	}
+
+	*size = out_sz;
+
+	return 0;
+}
+
+static int
+convert_zfsacl_to_cifsacl(u32 *aclbuf,
+			  u32 acecnt,
+			  struct inode *inode,
+			  struct cifs_acl *pdacl,
+			  u32 dacl_ace_cnt,
+			  u16 *pacl_size_out)
+{
+	u32 i, nsize = sizeof(struct cifs_acl);
+	char *acl_base = (char *)pdacl;
+	u16 size;
+	int error;
+
+	for (i = 0; i < acecnt; i++) {
+		u32 *zfsace = aclbuf + (i * NACE41_LEN);
+		error = convert_zfsace_to_cifs_aces(zfsace, acl_base + nsize, inode, &size);
+		if (error)
+			return error;
+
+		nsize += size;
+	}
+
+	*pacl_size_out = nsize;
+	pdacl->size = cpu_to_le16(nsize);
+	pdacl->revision = cpu_to_le16(ACL_REVISION);
+	pdacl->num_aces = cpu_to_le32(dacl_ace_cnt);
+
+	return 0;
+}
+
+static void
+force_smb3_dacl_info(struct smb3_sd *sd, u32 acl_flag)
+{
+	u16 control = ACL_CONTROL_SR | ACL_CONTROL_DP;
+
+	if (acl_flag & ACL4_PROTECTED) {
+		control |= ACL_CONTROL_PD;
+	}
+
+	/*
+	 * kzalloc call zero-initialized
+	 * sd->Sbz1, which is correct since we are not
+	 * using resource manager
+	 */
+	sd->Revision = 1;
+	sd->Control = cpu_to_le16(control);
+}
+
+/*
+ * This is special handling for either NULL or empty ACLs.
+ * Returns 0 if ACL is generated, -EAGAIN if regular parsing
+ * required, and otherwise -errno.
+ */
+static int
+parse_single_ace(u32 *zfsace, struct cifs_ntsd **ppntsd_out, u32 *acllen_out)
+{
+	u32 perms, flags, iflag, who_id, ace_type;
+	bool dacl_is_null = false, dacl_is_empty = false;
+	u32 secdesclen = sizeof(struct cifs_ntsd);
+	struct cifs_ntsd *pnntsd = NULL;
+	struct cifs_acl *dacl = NULL;
+
+	perms = ntohl(*(zfsace + NA_ACCESS_MASK_OFFSET));
+	flags = ntohl(*(zfsace + NA_FLAG_OFFSET));
+	iflag = ntohl(*(zfsace + NA_IFLAG_OFFSET));
+	who_id = ntohl(*(zfsace + NA_WHO_OFFSET));
+	ace_type = ntohl(*(zfsace + NA_TYPE_OFFSET));
+
+	if ((iflag == ACEI4_SPECIAL_WHO) && (who_id == ACE4_SPECIAL_EVERYONE) &&
+	    (perms == ACE4_ALL_PERMS) && (flags == 0) &&
+	    (ace_type == ACE4_ACCESS_ALLOWED_ACE_TYPE)) {
+		dacl_is_null = true;
+	}
+
+	if ((iflag == ACEI4_SPECIAL_WHO) && (who_id == ACE4_SPECIAL_OWNER) &&
+	    (perms == 0) && (flags == 0) &&
+	    (ace_type == ACE4_ACCESS_ALLOWED_ACE_TYPE)) {
+		dacl_is_empty = true;
+		secdesclen += sizeof(struct cifs_acl);
+	}
+
+	if (!dacl_is_null && !dacl_is_empty) {
+		return -EAGAIN;
+	}
+
+	pnntsd = kzalloc(secdesclen, GFP_KERNEL);
+	if (pnntsd == NULL) {
+		return -ENOMEM;
+	}
+
+	force_smb3_dacl_info((struct smb3_sd *)pnntsd, 0);
+
+	*ppntsd_out = pnntsd;
+	*acllen_out = secdesclen;
+
+	if (dacl_is_null) {
+		return 0;
+	}
+
+	/* dacl_is_empty */
+	pnntsd->dacloffset = cpu_to_le32(sizeof(struct cifs_ntsd));
+	dacl = (struct cifs_acl *)(pnntsd + sizeof(struct cifs_ntsd));
+	dacl->size = cpu_to_le16(sizeof(struct cifs_acl));
+	dacl->revision = cpu_to_le16(ACL_REVISION);
+	return 0;
+}
+
+/*
+ * This method converts ZFS ACL format into a Security Descriptor. The
+ * resulting SD only contains a DACL and is limited to only ALLOW and DENY
+ * entries.
+ */
+int zfsacl_xattr_to_ntsd(char *aclbuf,
+			 size_t size,
+			 struct inode *inode,
+			 struct cifs_ntsd **ppntsd_out,
+			 u32 *acllen_out)
+{
+	int error;
+	u32 *zfsacl = (u32 *)aclbuf;
+	u32 control, acecnt, dacl_ace_cnt, secdesclen;
+	struct cifs_ntsd *pnntsd = NULL;
+	struct cifs_acl *dacl = NULL;
+	u16 acl_size_out = 0;
+
+	if (!XDRSIZE_IS_VALID(size)) {
+		return -EINVAL;
+	}
+
+	control = ntohl(*(zfsacl++));
+	acecnt = ntohl(*(zfsacl++));
+
+	/*
+	 * C.f. notes about S-1-3-0 and S-1-3-1 above. There are some
+	 * circumstances when one ZFS ACL entry may need to expand to two
+	 * SMB DACL entries.
+	 */
+	error = calculate_ntsd_acecnt(zfsacl, acecnt, inode, &dacl_ace_cnt);
+	if (error) {
+		return error;
+	}
+
+	/*
+	 * Special handling for NULL or empty DACL. A single ACL entry
+	 * is unusual and so we first check to see whether it's a NULL or empty
+	 * DACL, if it isn't then the function returns -EAGAIN so that we
+	 * fall back to normal parsing.
+	 */
+	if (dacl_ace_cnt == 1) {
+		error = parse_single_ace(zfsacl, ppntsd_out, acllen_out);
+		if ((error == 0) || (error != -EAGAIN)) {
+			return error;
+		}
+	}
+
+	secdesclen = dacl_ace_cnt * sizeof(struct cifs_ace);
+	secdesclen = max_t(u32, secdesclen, DEFAULT_SEC_DESC_LEN);
+	secdesclen += sizeof(struct cifs_ntsd);
+
+	pnntsd = kzalloc(secdesclen, GFP_KERNEL);
+	if (pnntsd == NULL) {
+		return -ENOMEM;
+	}
+
+	/*
+	 * Format of Security Descriptor has changed over time. We require
+	 * support for setting ACL-wide control bits and so this method
+	 * is gated on whether connection is SMB3+. Hence, we are safe in
+	 * assuming we can recast as an smb3_sd for setting our control bits.
+	 */
+	force_smb3_dacl_info((struct smb3_sd *)pnntsd, control);
+
+	pnntsd->dacloffset = cpu_to_le32(sizeof(struct cifs_ntsd));
+
+	dacl = (struct cifs_acl *)((char*)pnntsd + pnntsd->dacloffset);
+	error = convert_zfsacl_to_cifsacl(zfsacl, acecnt, inode, dacl,
+	    dacl_ace_cnt, &acl_size_out);
+
+	dacl->size = cpu_to_le16(acl_size_out);
+	if (error) {
+		kfree(pnntsd);
+		return error;
+	}
+
+	*ppntsd_out = pnntsd;
+	*acllen_out = secdesclen;
+
+	return 0;
+}
+#endif /* CONFIG_TRUENAS */
