@@ -898,7 +898,6 @@ nfsd_open(struct svc_rqst *rqstp, struct svc_fh *fhp, umode_t type,
 	int host_err;
 	bool retried = false;
 
-	validate_process_creds();
 	/*
 	 * If we get here, then the client has already done an "open",
 	 * and (hopefully) checked permission - so allow OWNER_OVERRIDE
@@ -923,7 +922,6 @@ retry:
 		}
 		err = nfserrno(host_err);
 	}
-	validate_process_creds();
 	return err;
 }
 
@@ -940,12 +938,7 @@ int
 nfsd_open_verified(struct svc_rqst *rqstp, struct svc_fh *fhp, int may_flags,
 		   struct file **filp)
 {
-	int err;
-
-	validate_process_creds();
-	err = __nfsd_open(rqstp, fhp, S_IFREG, may_flags, filp);
-	validate_process_creds();
-	return err;
+	return __nfsd_open(rqstp, fhp, S_IFREG, may_flags, filp);
 }
 
 /*

@@ -219,9 +219,9 @@ static ssize_t dpa_resource_show(struct device *dev, struct device_attribute *at
 			    char *buf)
 {
 	struct cxl_endpoint_decoder *cxled = to_cxl_endpoint_decoder(dev);
-	u64 base = cxl_dpa_resource_start(cxled);
 
-	return sysfs_emit(buf, "%#llx\n", base);
+	guard(rwsem_read)(&cxl_dpa_rwsem);
+	return sysfs_emit(buf, "%#llx\n", (u64)cxl_dpa_resource_start(cxled));
 }
 static DEVICE_ATTR_RO(dpa_resource);
 
@@ -1242,35 +1242,39 @@ static struct device *grandparent(struct device *dev)
 	return NULL;
 }
 
+static struct device *endpoint_host(struct cxl_port *endpoint)
+{
+	struct cxl_port *port = to_cxl_port(endpoint->dev.parent);
+
+	if (is_cxl_root(port))
+		return port->uport_dev;
+	return &port->dev;
+}
+
 static void delete_endpoint(void *data)
 {
 	struct cxl_memdev *cxlmd = data;
 	struct cxl_port *endpoint = cxlmd->endpoint;
-	struct cxl_port *parent_port;
-	struct device *parent;
+	struct device *host = endpoint_host(endpoint);
 
-	parent_port = cxl_mem_find_port(cxlmd, NULL);
-	if (!parent_port)
-		goto out;
-	parent = &parent_port->dev;
-
-	device_lock(parent);
-	if (parent->driver && !endpoint->dead) {
-		devm_release_action(parent, cxl_unlink_parent_dport, endpoint);
-		devm_release_action(parent, cxl_unlink_uport, endpoint);
-		devm_release_action(parent, unregister_port, endpoint);
+	device_lock(host);
+	if (host->driver && !endpoint->dead) {
+		devm_release_action(host, cxl_unlink_parent_dport, endpoint);
+		devm_release_action(host, cxl_unlink_uport, endpoint);
+		devm_release_action(host, unregister_port, endpoint);
 	}
 	cxlmd->endpoint = NULL;
-	device_unlock(parent);
-	put_device(parent);
-out:
+	device_unlock(host);
 	put_device(&endpoint->dev);
+	put_device(host);
 }
 
 int cxl_endpoint_autoremove(struct cxl_memdev *cxlmd, struct cxl_port *endpoint)
 {
+	struct device *host = endpoint_host(endpoint);
 	struct device *dev = &cxlmd->dev;
 
+	get_device(host);
 	get_device(&endpoint->dev);
 	cxlmd->endpoint = endpoint;
 	cxlmd->depth = endpoint->depth;
