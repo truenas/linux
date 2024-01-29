@@ -816,19 +816,33 @@ static int plx_ntb_spad_count(struct ntb_dev *ntb)
 static int plx_ntb_spad_write(struct ntb_dev *ntb, int idx, u32 val)
 {
 	struct plx_ntb_dev *ndev = ntb_ndev(ntb);
-	u32 offset;
+	u32 offset, t;
 
 	if (idx < 0 || idx >= ndev->spad_cnt1 + ndev->spad_cnt2)
 		return -EINVAL;
 
-	if (idx < ndev->spad_cnt1)
+	if (idx < ndev->spad_cnt1) {
 		offset = ndev->sspad_off1 + idx * 4;
-	else
+		writel(val, ndev->self_mmio + offset);
+		return 0;
+	} else {
 		offset = ndev->sspad_off2 + (idx - ndev->spad_cnt1) * 4;
-
-	writel(val, ndev->self_mmio + offset);
-
-	return 0;
+		/*
+		 * For some reason when link goes down Test Pattern registers
+		 * we use as additional scratchpad become read-only for about
+		 * 100us.  I see no explanation in specs, so just wait a bit.
+		 */
+		for (t = 0; t <= 1000; t++) {
+			writel(val, ndev->self_mmio + offset);
+			if (readl(ndev->self_mmio + offset) == val)
+				return (0);
+			udelay(1);
+		}
+		dev_err(&ntb->dev,
+		    "Can't write Physical Layer User Test Pattern (0x%x)\n",
+		    offset);
+		return (-EIO);
+	}
 }
 
 static u32 plx_ntb_spad_read(struct ntb_dev *ntb, int idx)
