@@ -671,7 +671,7 @@ mpt3sas_get_sdev_from_target(struct MPT3SAS_ADAPTER *ioc,
 	return ret;
 }
 
-static struct _pcie_device *
+struct _pcie_device *
 __mpt3sas_get_pdev_from_target(struct MPT3SAS_ADAPTER *ioc,
 	struct MPT3SAS_TARGET *tgt_priv)
 {
@@ -1274,6 +1274,7 @@ _scsih_pcie_device_remove(struct MPT3SAS_ADAPTER *ioc,
 		update_latency = 1;
 	spin_unlock_irqrestore(&ioc->pcie_device_lock, flags);
 	if (was_on_pcie_device_list) {
+		kfree(pcie_device->nvme_elog);
 		kfree(pcie_device->serial_number);
 		pcie_device_put(pcie_device);
 	}
@@ -7972,7 +7973,7 @@ _scsih_pcie_device_remove_from_sml(struct MPT3SAS_ADAPTER *ioc,
 				    __func__,
 				    pcie_device->enclosure_level,
 				    pcie_device->connector_name));
-
+	kfree(pcie_device->nvme_elog);
 	kfree(pcie_device->serial_number);
 }
 
@@ -8213,6 +8214,13 @@ _scsih_pcie_add_device(struct MPT3SAS_ADAPTER *ioc, u16 handle)
 			    pcie_device_pg2.ControllerResetTO;
 		else
 			pcie_device->reset_timeout = 30;
+		pcie_device->nvme_elog = kzalloc(sizeof(struct nvme_effects_log),
+		    GFP_KERNEL);
+		if (pcie_device->nvme_elog && mpt3_nvme_get_effect_log(ioc,
+		    pcie_device, pcie_device->nvme_elog)) {
+			kfree(pcie_device->nvme_elog);
+			pcie_device->nvme_elog = NULL;
+		}
 	} else
 		pcie_device->reset_timeout = 30;
 
@@ -11936,12 +11944,70 @@ static struct raid_function_template mpt2sas_raid_functions = {
 	.get_state	= scsih_get_state,
 };
 
+/**
+ * scsih_ioctl() - IOCTL handler for driver
+ * @sdev: SCSI device associated with LUN.
+ * @cmd: IOCTL command.
+ * @arg: userspace ioctl data structure.
+ *
+ * This interface is used to emulate NVME functionality for the drives
+ * connected on Trimode HBA. Userspace tools can talk to NVME device
+ * through passthrough commands, e.g., nvme-cli can identify controller
+ * through `nvme id-ctrl /dev/sdX`.
+ *
+ * Return: 0 on success, -errno on failure
+ */
+int scsih_ioctl(struct scsi_device *sdev, unsigned int cmd, void __user *arg)
+{
+	if (scsih_is_nvme(&sdev->sdev_gendev)) {
+		switch (cmd) {
+		case NVME_IOCTL_ID:
+			/*
+			 * Devices are only reported for NSID 1
+			 */
+			return (1);
+		case NVME_IOCTL_ADMIN_CMD:
+			return (mpt3_nvme_user_cmd(sdev, arg, 1));
+		case NVME_IOCTL_ADMIN64_CMD:
+			return (mpt3_nvme_user_cmd64(sdev, arg, 1));
+		case NVME_IOCTL_IO_CMD:
+			return (mpt3_nvme_user_cmd(sdev, arg, 0));
+		case NVME_IOCTL_IO64_CMD:
+			return (mpt3_nvme_user_cmd64(sdev, arg, 0));
+
+		/*
+		 * NVME_IOCTL_SUBMIT_IO requires the `lba_shift` parameter
+		 * from the namespace to calculate the number of blocks.
+		 * We can obtain the namespace capabilities in the same way
+		 * we retrieve effect logs. Since it's a specific interface
+		 * for read/write operations, we may consider supporting it
+		 * in the future if it is deemed necessary.
+		 */
+		case NVME_IOCTL_SUBMIT_IO:
+		case NVME_IOCTL_IO64_CMD_VEC:
+		case NVME_IOCTL_RESCAN:
+		case NVME_IOCTL_RESET:
+		case NVME_IOCTL_SUBSYS_RESET:
+		case NVME_URING_CMD_IO:
+		case NVME_URING_CMD_IO_VEC:
+		case NVME_URING_CMD_ADMIN:
+		case NVME_URING_CMD_ADMIN_VEC:
+			return (-EOPNOTSUPP);
+		}
+	}
+	return (-EINVAL);
+}
+
 /* shost template for SAS 3.0 HBA devices */
 static const struct scsi_host_template mpt3sas_driver_template = {
 	.module				= THIS_MODULE,
 	.name				= "Fusion MPT SAS Host",
 	.proc_name			= MPT3SAS_DRIVER_NAME,
 	.queuecommand			= scsih_qcmd,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl			= scsih_ioctl,
+#endif
+	.ioctl				= scsih_ioctl,
 	.target_alloc			= scsih_target_alloc,
 	.slave_alloc			= scsih_slave_alloc,
 	.device_configure		= scsih_device_configure,

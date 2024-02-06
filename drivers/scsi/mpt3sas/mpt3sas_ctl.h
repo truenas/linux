@@ -458,4 +458,20 @@ struct mpt3_enable_diag_sbr_reload {
 	struct mpt3_ioctl_header hdr;
 };
 
+/**
+ * struct mpt3_nvme_kencap - hold nvme encap request from scsihost
+ * nvme_encap_rqst - nvme encapsulated request
+ * dout_buf  - output buffer location
+ * din_buf   - input buffer location
+ * reply_buf - reply buffer location
+ * sense_buf - sense buffer location
+ */
+struct mpt3_nvme_kencap {
+	Mpi26NVMeEncapsulatedRequest_t *nvme_encap_rqst;
+	void *dout_buf;
+	void *din_buf;
+	void *reply_buf;
+	void *sense_buf;
+};
+
 #endif /* MPT3SAS_CTL_H_INCLUDED */

@@ -660,7 +660,7 @@ _ctl_set_task_mid(struct MPT3SAS_ADAPTER *ioc, struct mpt3_ioctl_command *karg,
  */
 static long
 _ctl_do_mpt_command(struct MPT3SAS_ADAPTER *ioc, struct mpt3_ioctl_command karg,
-	void __user *mf)
+	void __user *mf, struct mpt3_nvme_kencap *kencap)
 {
 	MPI2RequestHeader_t *mpi_request = NULL, *request;
 	MPI2DefaultReply_t *mpi_reply;
@@ -707,8 +707,11 @@ _ctl_do_mpt_command(struct MPT3SAS_ADAPTER *ioc, struct mpt3_ioctl_command karg,
 		goto out;
 	}
 
-	/* copy in request message frame from user */
-	if (copy_from_user(mpi_request, mf, karg.data_sge_offset*4)) {
+	/* copy in request message frame */
+	if (kencap) {
+		memcpy(mpi_request, kencap->nvme_encap_rqst,
+		    karg.data_sge_offset*4);
+	} else if (copy_from_user(mpi_request, mf, karg.data_sge_offset*4)) {
 		pr_err("failure at %s:%d/%s()!\n", __FILE__, __LINE__,
 		    __func__);
 		ret = -EFAULT;
@@ -763,7 +766,9 @@ _ctl_do_mpt_command(struct MPT3SAS_ADAPTER *ioc, struct mpt3_ioctl_command karg,
 			mpt3sas_base_free_smid(ioc, smid);
 			goto out;
 		}
-		if (copy_from_user(data_out, karg.data_out_buf_ptr,
+		if (kencap && kencap->dout_buf) {
+			memcpy(data_out, kencap->dout_buf, data_out_sz);
+		} else if (copy_from_user(data_out, karg.data_out_buf_ptr,
 			data_out_sz)) {
 			pr_err("failure at %s:%d/%s()!\n", __FILE__,
 			    __LINE__, __func__);
@@ -1062,7 +1067,9 @@ _ctl_do_mpt_command(struct MPT3SAS_ADAPTER *ioc, struct mpt3_ioctl_command karg,
 
 	/* copy out xdata to user */
 	if (data_in_sz) {
-		if (copy_to_user(karg.data_in_buf_ptr, data_in,
+		if (kencap && kencap->din_buf) {
+			memcpy(kencap->din_buf, data_in, data_in_sz);
+		} else if (copy_to_user(karg.data_in_buf_ptr, data_in,
 		    data_in_sz)) {
 			pr_err("failure at %s:%d/%s()!\n", __FILE__,
 			    __LINE__, __func__);
@@ -1074,7 +1081,9 @@ _ctl_do_mpt_command(struct MPT3SAS_ADAPTER *ioc, struct mpt3_ioctl_command karg,
 	/* copy out reply message frame to user */
 	if (karg.max_reply_bytes) {
 		sz = min_t(u32, karg.max_reply_bytes, ioc->reply_sz);
-		if (copy_to_user(karg.reply_frame_buf_ptr, ioc->ctl_cmds.reply,
+		if (kencap) {
+			memcpy(kencap->reply_buf, ioc->ctl_cmds.reply, sz);
+		} else if (copy_to_user(karg.reply_frame_buf_ptr, ioc->ctl_cmds.reply,
 		    sz)) {
 			pr_err("failure at %s:%d/%s()!\n", __FILE__,
 			    __LINE__, __func__);
@@ -1088,7 +1097,7 @@ _ctl_do_mpt_command(struct MPT3SAS_ADAPTER *ioc, struct mpt3_ioctl_command karg,
 	    MPI2_FUNCTION_SCSI_IO_REQUEST || mpi_request->Function ==
 	    MPI2_FUNCTION_RAID_SCSI_IO_PASSTHROUGH || mpi_request->Function ==
 	    MPI2_FUNCTION_NVME_ENCAPSULATED)) {
-		if (karg.sense_data_ptr == NULL) {
+		if (!karg.sense_data_ptr && kencap && !kencap->sense_buf) {
 			ioc_info(ioc, "Response buffer provided by application is NULL; Response data will not be returned\n");
 			goto out;
 		}
@@ -1096,7 +1105,9 @@ _ctl_do_mpt_command(struct MPT3SAS_ADAPTER *ioc, struct mpt3_ioctl_command karg,
 		MPI2_FUNCTION_NVME_ENCAPSULATED) ? NVME_ERROR_RESPONSE_SIZE :
 							SCSI_SENSE_BUFFERSIZE;
 		sz = min_t(u32, karg.max_sense_bytes, sz_arg);
-		if (copy_to_user(karg.sense_data_ptr, ioc->ctl_cmds.sense,
+		if (kencap) {
+			memcpy(kencap->sense_buf, ioc->ctl_cmds.sense, sz);
+		} else if (copy_to_user(karg.sense_data_ptr, ioc->ctl_cmds.sense,
 		    sz)) {
 			pr_err("failure at %s:%d/%s()!\n", __FILE__,
 				__LINE__, __func__);
@@ -2635,7 +2646,7 @@ _ctl_compat_mpt_command(struct MPT3SAS_ADAPTER *ioc, unsigned cmd,
 	karg.data_in_buf_ptr = compat_ptr(karg32.data_in_buf_ptr);
 	karg.data_out_buf_ptr = compat_ptr(karg32.data_out_buf_ptr);
 	karg.sense_data_ptr = compat_ptr(karg32.sense_data_ptr);
-	return _ctl_do_mpt_command(ioc, karg, &uarg->mf);
+	return _ctl_do_mpt_command(ioc, karg, &uarg->mf, NULL);
 }
 #endif
 
@@ -2722,7 +2733,7 @@ _ctl_ioctl_main(struct file *file, unsigned int cmd, void __user *arg,
 		}
 		if (_IOC_SIZE(cmd) == sizeof(struct mpt3_ioctl_command)) {
 			uarg = arg;
-			ret = _ctl_do_mpt_command(ioc, karg, &uarg->mf);
+			ret = _ctl_do_mpt_command(ioc, karg, &uarg->mf, NULL);
 		}
 		break;
 	}
@@ -4246,4 +4257,307 @@ mpt3sas_ctl_exit(ushort hbas_to_enumerate)
 		misc_deregister(&ctl_dev);
 	if (hbas_to_enumerate != 2)
 		misc_deregister(&gen2_ctl_dev);
+}
+
+/**
+ * mpt3_nvme_submit_command - submit NVME encapsulated command
+ * @ioc: per adapter object
+ * @cmd: NVME Command
+ * @ubuf: user buffer
+ * @kbuf: kernel Buffer
+ * @buf_len: buffer Length
+ * @result: cqe result
+ * @is_admin: admin or IO command
+ * @handle: to distinguish target NVME device
+ * @port_num: port number
+ */
+static int mpt3_nvme_submit_command(struct MPT3SAS_ADAPTER *ioc,
+	struct nvme_command cmd, u64 ubuf, void *kbuf, u32 buf_len,
+	u64 *result, int is_admin, u16 handle, u8 port_num)
+{
+	struct mpt3_nvme_kencap kencap;
+	struct mpt3_ioctl_command karg;
+	struct nvme_completion cqe;
+	int ret;
+	Mpi26NVMeEncapsulatedRequest_t *nvme_encap_request = kzalloc(sizeof(cmd) + \
+	    sizeof(Mpi26NVMeEncapsulatedRequest_t), GFP_KERNEL);
+
+	if (!nvme_encap_request)
+		return (-ENOMEM);
+
+	memset(&karg, 0, sizeof(karg));
+	memset(&cqe, 0, sizeof(cqe));
+	memset(&kencap, 0, sizeof(kencap));
+	karg.hdr.port_number = port_num;
+	karg.timeout = 120;
+
+	/*
+	 * data_sge_offset refers to the size of both NVME Encpasulated request
+	 * header plus the NVME command in words. data_sge_offset name is a bit
+	 * misleading for NVME Encpasulated request since PRP buffers will be
+	 * allocated by DMA.
+	 */
+	karg.data_sge_offset = (sizeof(cmd) + sizeof(*nvme_encap_request)) / 4;
+	karg.max_reply_bytes = 0;
+	karg.max_sense_bytes = sizeof(cqe);
+
+	/*
+	 * We can set reply_buf to MPI26_NVME_FLAGS_READ but not required
+	 */
+	kencap.reply_buf = NULL;
+
+	/*
+	 * Firmware writes CQE to sense_buf
+	 */
+	kencap.sense_buf =  &cqe;
+	kencap.nvme_encap_rqst = nvme_encap_request;
+	nvme_encap_request->Function = MPI2_FUNCTION_NVME_ENCAPSULATED;
+	nvme_encap_request->DataLength = buf_len;
+	nvme_encap_request->EncapsulatedCommandLength = sizeof(cmd);
+	nvme_encap_request->DevHandle = handle;
+	memcpy((u8*) nvme_encap_request + offsetof(Mpi26NVMeEncapsulatedRequest_t,
+	    NVMe_Command), &cmd, sizeof(cmd));
+
+	if (is_admin) {
+		nvme_encap_request->Flags = MPI26_NVME_FLAGS_SUBMISSIONQ_ADMIN | \
+		    MPI26_NVME_FLAGS_FORCE_ADMIN_ERR_RESP;
+	}
+
+	if (buf_len && (ubuf || kbuf)) {
+
+		/* Write opcode */
+		if (cmd.common.opcode & 0x1) {
+			if (ubuf)
+				karg.data_out_buf_ptr = (void __user *) ubuf;
+			else
+				kencap.dout_buf = kbuf;
+			karg.data_out_size = buf_len;
+			nvme_encap_request->Flags |= MPI26_NVME_FLAGS_WRITE;
+		}
+
+		/* Read opcode */
+		if (cmd.common.opcode & 0x2) {
+			if (ubuf)
+				karg.data_in_buf_ptr = (void __user *) ubuf;
+			else
+				kencap.din_buf = kbuf;
+			karg.data_in_size = buf_len;
+			nvme_encap_request->Flags |= MPI26_NVME_FLAGS_READ;
+		}
+	}
+
+	/*
+	 * pci_access_mutex lock acquired by ioctl path
+	 */
+	mutex_lock(&ioc->pci_access_mutex);
+	ret = _ctl_do_mpt_command(ioc, karg, NULL, &kencap);
+	mutex_unlock(&ioc->pci_access_mutex);
+
+	if (ret)
+		return (ret);
+
+	ret = cqe.status >> 1;
+
+	if (result)
+		*result = le64_to_cpu(cqe.result.u64);
+
+	kfree(nvme_encap_request);
+	return (ret);
+}
+
+/**
+ * mpt3_nvme_user_cmd - submits NVME command request from userspace
+ * @sdev: pointer to SCSI device
+ * @ucmd: user space command
+ * @is_admin: admin or IO command
+ */
+int mpt3_nvme_user_cmd(struct scsi_device *sdev, struct nvme_passthru_cmd __user *ucmd,
+    int is_admin)
+{
+	struct Scsi_Host *shost = sdev->host;
+	struct MPT3SAS_ADAPTER *ioc = shost_priv(shost);
+	struct MPT3SAS_DEVICE *sas_device_priv_data = sdev->hostdata;
+	struct MPT3SAS_TARGET *sas_target_priv_data = sas_device_priv_data->sas_target;
+	struct _pcie_device *pcie_device;
+	struct nvme_passthru_cmd cmd;
+	struct nvme_command encap_cmd;
+	unsigned long flags;
+	u32 effects = NVME_CMD_EFFECTS_CSUPP;
+	u16	handle;
+	u8	port_num;
+	u64	result = 0;
+	int	ret = 0;
+
+	if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
+		return (-EFAULT);
+
+	if (cmd.flags)
+		return (-EINVAL);
+
+	/*
+	 * Metadata is not supported according to MPI 2.6 specs
+	 */
+	if (cmd.metadata_len > 0)
+		return (-EOPNOTSUPP);
+
+	spin_lock_irqsave(&ioc->pcie_device_lock, flags);
+	pcie_device = __mpt3sas_get_pdev_from_target(ioc, sas_target_priv_data);
+
+	if (pcie_device) {
+		handle = pcie_device->handle;
+		port_num = pcie_device->port_num;
+		if (pcie_device->nvme_elog) {
+			if (is_admin)
+				effects = pcie_device->nvme_elog->acs[cmd.opcode];
+			else
+				effects = pcie_device->nvme_elog->iocs[cmd.opcode];
+		}
+	} else {
+		spin_unlock_irqrestore(&ioc->pcie_device_lock, flags);
+		return (-ENXIO);
+	}
+
+	spin_unlock_irqrestore(&ioc->pcie_device_lock, flags);
+
+	/*
+	 * pci_access_mutex lock should already take care of
+	 * NVME_CMD_EFFECTS_CSE_MASK and other effects are related
+	 * to the namespace management, which isn't supported
+	 */
+	if (!(effects & NVME_CMD_EFFECTS_CSUPP))
+		return (-EOPNOTSUPP);
+
+	memset(&encap_cmd, 0, sizeof(encap_cmd));
+	encap_cmd.common.opcode = cmd.opcode;
+	encap_cmd.common.flags = cmd.flags;
+	encap_cmd.common.nsid = cpu_to_le32(cmd.nsid);
+	encap_cmd.common.cdw2[0] = cpu_to_le32(cmd.cdw2);
+	encap_cmd.common.cdw2[1] = cpu_to_le32(cmd.cdw3);
+	encap_cmd.common.cdw10 = cpu_to_le32(cmd.cdw10);
+	encap_cmd.common.cdw11 = cpu_to_le32(cmd.cdw11);
+	encap_cmd.common.cdw12 = cpu_to_le32(cmd.cdw12);
+	encap_cmd.common.cdw13 = cpu_to_le32(cmd.cdw13);
+	encap_cmd.common.cdw14 = cpu_to_le32(cmd.cdw14);
+	encap_cmd.common.cdw15 = cpu_to_le32(cmd.cdw15);
+	ret = mpt3_nvme_submit_command(ioc, encap_cmd, cmd.addr, NULL, cmd.data_len,
+	    &result, is_admin, handle, port_num);
+
+	if (ret >= 0) {
+		if (put_user(result, &ucmd->result))
+			return (-EFAULT);
+	}
+
+	return (ret);
+}
+
+/**
+ * mpt3_nvme_user_cmd64 - submits 64-bit NVME command request from userspace
+ * @sdev: pointer to SCSI device
+ * @ucmd: 64-bit user space command
+ * @is_admin: admin or IO command
+ */
+int mpt3_nvme_user_cmd64(struct scsi_device *sdev, struct nvme_passthru_cmd64 __user *ucmd,
+    int is_admin)
+{
+	struct Scsi_Host *shost = sdev->host;
+	struct MPT3SAS_ADAPTER *ioc = shost_priv(shost);
+	struct MPT3SAS_DEVICE *sas_device_priv_data = sdev->hostdata;
+	struct MPT3SAS_TARGET *sas_target_priv_data = sas_device_priv_data->sas_target;
+	struct _pcie_device *pcie_device;
+	struct nvme_passthru_cmd cmd;
+	struct nvme_command encap_cmd;
+	unsigned long flags;
+	u32 effects = NVME_CMD_EFFECTS_CSUPP;
+	u16	handle;
+	u8	port_num;
+	u64	result = 0;
+	int	ret = 0;
+
+	if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
+		return (-EFAULT);
+
+	if (cmd.flags)
+		return (-EINVAL);
+
+	/*
+	 * Metadata is not supported according to MPI 2.6 specs
+	 */
+	if (cmd.metadata_len > 0)
+		return (-EOPNOTSUPP);
+
+	spin_lock_irqsave(&ioc->pcie_device_lock, flags);
+	pcie_device = __mpt3sas_get_pdev_from_target(ioc, sas_target_priv_data);
+
+	if (pcie_device) {
+		handle = pcie_device->handle;
+		port_num = pcie_device->port_num;
+		if (pcie_device->nvme_elog) {
+			if (is_admin)
+				effects = pcie_device->nvme_elog->acs[cmd.opcode];
+			else
+				effects = pcie_device->nvme_elog->iocs[cmd.opcode];
+		}
+	} else {
+		spin_unlock_irqrestore(&ioc->pcie_device_lock, flags);
+		return (-ENXIO);
+	}
+
+	spin_unlock_irqrestore(&ioc->pcie_device_lock, flags);
+
+	/*
+	 * pci_access_mutex lock should already take care of
+	 * NVME_CMD_EFFECTS_CSE_MASK and other effects are related
+	 * to the namespace management, which isn't supported
+	 */
+	if (!(effects & NVME_CMD_EFFECTS_CSUPP))
+		return (-EOPNOTSUPP);
+
+	memset(&encap_cmd, 0, sizeof(encap_cmd));
+	encap_cmd.common.opcode = cmd.opcode;
+	encap_cmd.common.flags = cmd.flags;
+	encap_cmd.common.nsid = cpu_to_le32(cmd.nsid);
+	encap_cmd.common.cdw2[0] = cpu_to_le32(cmd.cdw2);
+	encap_cmd.common.cdw2[1] = cpu_to_le32(cmd.cdw3);
+	encap_cmd.common.cdw10 = cpu_to_le32(cmd.cdw10);
+	encap_cmd.common.cdw11 = cpu_to_le32(cmd.cdw11);
+	encap_cmd.common.cdw12 = cpu_to_le32(cmd.cdw12);
+	encap_cmd.common.cdw13 = cpu_to_le32(cmd.cdw13);
+	encap_cmd.common.cdw14 = cpu_to_le32(cmd.cdw14);
+	encap_cmd.common.cdw15 = cpu_to_le32(cmd.cdw15);
+	ret = mpt3_nvme_submit_command(ioc, encap_cmd, cmd.addr, NULL, cmd.data_len,
+	    &result, is_admin, handle, port_num);
+
+	if (ret >= 0) {
+		if (put_user(result, &ucmd->result))
+			return (-EFAULT);
+	}
+
+	return (ret);
+}
+
+/**
+ * mpt3_nvme_get_effect_log -read effect logs
+ * @ioc: per adapter object
+ * @pcie_device: NVME PCIE device
+ * @nvme_elog: nvme_effect_log to be populated
+ */
+int mpt3_nvme_get_effect_log(struct MPT3SAS_ADAPTER *ioc, struct _pcie_device *pcie_device,
+	struct nvme_effects_log *nvme_elog)
+{
+	struct nvme_command c;
+
+	/*
+	 * Convert byte length to nvme's 0-based num dwords
+	 */
+	u32 dwlen = (sizeof(*nvme_elog) >> 2) - 1;
+	memset(&c, 0, sizeof(c));
+	c.get_log_page.opcode = nvme_admin_get_log_page;
+	c.get_log_page.nsid = 1;
+	c.get_log_page.lid = NVME_LOG_CMD_EFFECTS;
+	c.get_log_page.numdl = cpu_to_le16(dwlen & ((1 << 16) - 1));
+	c.get_log_page.numdu = cpu_to_le16(dwlen >> 16);
+	c.get_log_page.csi = NVME_CSI_NVM;
+
+	return (mpt3_nvme_submit_command(ioc, c, 0, nvme_elog, sizeof(*nvme_elog),
+	    NULL, 1, pcie_device->handle, pcie_device->port_num));
 }

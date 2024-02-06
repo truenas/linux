@@ -68,6 +68,8 @@
 #include <linux/pci.h>
 #include <linux/poll.h>
 #include <linux/irq_poll.h>
+#include <linux/nvme.h>
+#include <linux/nvme_ioctl.h>
 
 #include "mpt3sas_debug.h"
 #include "mpt3sas_trigger_diag.h"
@@ -625,6 +627,7 @@ static inline void sas_device_put(struct _sas_device *s)
 struct _pcie_device {
 	struct list_head list;
 	struct scsi_target *starget;
+	struct nvme_effects_log *nvme_elog;
 	u64	wwid;
 	u16	handle;
 	u32	device_info;
@@ -1844,6 +1847,9 @@ mpt3sas_raid_device_find_by_handle(struct MPT3SAS_ADAPTER *ioc, u16 handle);
 void mpt3sas_scsih_change_queue_depth(struct scsi_device *sdev, int qdepth);
 struct _sas_device *
 __mpt3sas_get_sdev_by_rphy(struct MPT3SAS_ADAPTER *ioc, struct sas_rphy *rphy);
+struct _pcie_device *
+__mpt3sas_get_pdev_from_target(struct MPT3SAS_ADAPTER *ioc,
+	struct MPT3SAS_TARGET *tgt_priv);
 struct virtual_phy *
 mpt3sas_get_vphy_by_phy(struct MPT3SAS_ADAPTER *ioc,
 	struct hba_port *port, u32 phy);
@@ -2050,6 +2056,14 @@ void mpt3sas_setup_debugfs(struct MPT3SAS_ADAPTER *ioc);
 void mpt3sas_destroy_debugfs(struct MPT3SAS_ADAPTER *ioc);
 void mpt3sas_init_debugfs(void);
 void mpt3sas_exit_debugfs(void);
+
+/* NVME Encapsulation */
+int mpt3_nvme_user_cmd(struct scsi_device *sdev,
+	struct nvme_passthru_cmd __user *ucmd, int is_admin);
+int mpt3_nvme_user_cmd64(struct scsi_device *sdev,
+	struct nvme_passthru_cmd64 __user *ucmd, int is_admin);
+int mpt3_nvme_get_effect_log(struct MPT3SAS_ADAPTER *ioc,
+	struct _pcie_device *pcie_device, struct nvme_effects_log *nvme_elog);
 
 /**
  * _scsih_is_pcie_scsi_device - determines if device is an pcie scsi device
