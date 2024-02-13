@@ -448,4 +448,20 @@ struct mpt3_addnl_diag_query {
 	uint32_t reserved2[2];
 };
 
+/**
+ * struct mpt3_nvme_kencap - hold nvme encap request from scsihost
+ * nvme_encap_rqst - nvme encapsulated request
+ * dout_buf  - output buffer location
+ * din_buf   - input buffer location
+ * reply_buf - reply buffer location
+ * sense_buf - sense buffer location
+ */
+struct mpt3_nvme_kencap {
+	Mpi26NVMeEncapsulatedRequest_t *nvme_encap_rqst;
+	void *dout_buf;
+	void *din_buf;
+	void *reply_buf;
+	void *sense_buf;
+};
+
 #endif /* MPT3SAS_CTL_H_INCLUDED */
