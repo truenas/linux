@@ -1,8 +1,14 @@
+linux-6.1.79+truenas (6.1.79+truenas-1) sid; urgency=low
+
+  * Merge upstream v6.1.79 release
+
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 1 Mar 2024 15:30:00 +0500
+
 linux-6.1.74+truenas (6.1.74+truenas-1) sid; urgency=low
 
   * Merge upstream v6.1.74 release
 
- -- iXsystems engineering team <dev@ixsystems.com>  Tue, 23 Jan 2023 01:00:00 +0500
+ -- iXsystems engineering team <dev@ixsystems.com>  Tue, 23 Jan 2024 01:00:00 +0500
 
 linux-6.1.63+truenas (6.1.63+truenas-1) sid; urgency=low
 
