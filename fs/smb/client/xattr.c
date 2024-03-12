@@ -20,6 +20,7 @@
 #include "cifs_ioctl.h"
 #ifdef CONFIG_TRUENAS
 #include "nfs41acl_xdr.h"
+#include "truenas_streams.h"
 #endif
 
 #define MAX_EA_VALUE_SIZE CIFSMaxBufSize
@@ -159,7 +160,13 @@ static int cifs_xattr_set(const struct xattr_handler *handler,
 		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
 			goto out;
 
-		if (pTcon->ses->server->ops->set_EA) {
+#ifdef CONFIG_TRUENAS
+		if ((pTcon->ses->server->dialect > SMB30_PROT_ID) &&
+		    (strncmp(name, STREAM_XATTR, STREAM_XATTR_LEN) == 0)) {
+			rc = set_stream_xattr(dentry, full_path, xid, pTcon,
+					      name, value, size, flags);
+#endif /* CONFIG_TRUENAS */
+		} else if (pTcon->ses->server->ops->set_EA) {
 			rc = pTcon->ses->server->ops->set_EA(xid, pTcon,
 				full_path, name, value, (__u16)size,
 				cifs_sb->local_nls, cifs_sb);
@@ -349,6 +356,15 @@ static int cifs_xattr_get(const struct xattr_handler *handler,
 		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
 			goto out;
 
+#ifdef CONFIG_TRUENAS
+		if ((pTcon->ses->server->dialect > SMB30_PROT_ID) &&
+		    (strncmp(name, STREAM_XATTR, STREAM_XATTR_LEN) == 0)) {
+			rc = get_stream_xattr(dentry, full_path, xid, pTcon,
+					      name, value, size);
+			break;
+		}
+
+#endif /* CONFIG_TRUENAS */
 		if (pTcon->ses->server->ops->query_all_EAs)
 			rc = pTcon->ses->server->ops->query_all_EAs(xid, pTcon,
 				full_path, name, value, size, cifs_sb);
@@ -511,6 +527,19 @@ ssize_t cifs_listxattr(struct dentry *direntry, char *data, size_t buf_size)
 		}
 
 		rc += sizeof(CIFS_XATTR_ZFS_ACL);
+	}
+
+	// For now we will limit ADS support to SMB3 or greater
+	if (pTcon->ses->server->dialect >= SMB30_PROT_ID) {
+		int res;
+		res = list_streams_xattr(direntry, full_path, xid, pTcon,
+					 data ? data + rc : data,
+					 buf_size ? buf_size - rc : 0);
+		if (res < 0) {
+			rc = res;
+		} else {
+			rc += res;
+		}
 	}
 #endif /* CONFIG_TRUENAS */
 

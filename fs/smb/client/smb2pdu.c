@@ -3772,6 +3772,20 @@ int SMB2_query_info(const unsigned int xid, struct cifs_tcon *tcon,
 			  NULL);
 }
 
+#ifdef CONFIG_TRUENAS
+int SMB2_query_streams(const unsigned int xid, struct cifs_tcon *tcon,
+	u64 persistent_fid, u64 volatile_fid, struct smb2_file_stream_info **data,
+	u32 *plen)
+{
+	*plen = 0;
+	return query_info(xid, tcon, persistent_fid, volatile_fid,
+			  FILE_STREAM_INFORMATION, SMB2_O_INFO_FILE, 0,
+			  (sizeof(struct smb2_file_stream_info) + 255) * 32,
+			  sizeof(struct smb2_file_stream_info), (void **)data,
+			  plen);
+}
+#endif
+
 #if 0
 /* currently unused, as now we are doing compounding instead (see smb311_posix_query_path_info) */
 int

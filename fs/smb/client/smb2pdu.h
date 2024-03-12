@@ -413,4 +413,14 @@ struct smb2_posix_info_parsed {
 	const u8 *name;
 };
 
+#ifdef CONFIG_TRUENAS
+struct smb2_file_stream_info {
+	__le32  NextEntryOffset;
+	__le32  StreamNameLength;
+	__le64 StreamSize;
+	__le64 StreamAllocationSize;
+	char   StreamName[];
+} __packed;
+#endif /* CONFIG_TRUENAS */
+
 #endif				/* _SMB2PDU_H */
