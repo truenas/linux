@@ -46,7 +46,7 @@
  * configuration, xattrs up to a certain size are written as SA, and larger
  * xattrs are written as files. The practical result of this is that
  * TrueNAS can support extended attributes that are much greater in size
- * than a traditional Linux file server. Unforutnately, due to inability
+ * than a traditional Linux file server. Unfortunately, due to inability
  * to perform partial reads and writes on extended attributes a 2 MiB
  * upper bound is placed as the maximum size of a single extended attribute
  * / named stream in TrueNAS.

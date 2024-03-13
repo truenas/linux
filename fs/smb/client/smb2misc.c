@@ -499,7 +499,15 @@ get_start_of_path(const char *from, struct cifs_sb_info *cifs_sb)
 	return from;
 }
 
-/* Note: caller must free return buffer */
+/*
+ * This is a variant of cifs_convert_path_to_utf16() for generating a UTF16
+ * path name for a named stream. File name and stream name are separated by the
+ * colon character ":". Since this separator must be preserved in an unaltered
+ * form, the normal path conversion function may not be used to generate a
+ * full stream path.
+ *
+ * Note: caller must free return buffer
+ */
 __le16 *
 cifs_convert_stream_path_to_utf16(const char *from, const char *stream, struct cifs_sb_info *cifs_sb)
 {
@@ -544,10 +552,10 @@ cifs_convert_stream_path_to_utf16(const char *from, const char *stream, struct c
 
 	memcpy(buf, file_buf, file_len);
 
-	// cifs_strndup_to_utff16 appends two zero bytes
-	// to end of string. We take advantage of this and replace
-	// with UTF-16 colon (separator for file and stream names in
-	// SMB protocol).
+	// cifs_strndup_to_utf16() appends a UTF16 NULL character to end of
+	// string. We take advantage of this and replace with UTF-16 colon
+	// (separator for file and stream names in SMB protocol) for
+	// concatenating the full stream name.
 	pbuf = buf + (file_len - 2);
 	*pbuf++ = ':';
 	*pbuf++ = '\0';
