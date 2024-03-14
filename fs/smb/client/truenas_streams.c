@@ -535,6 +535,9 @@ get_stream_name(const char *name_in, char **name_out)
 	 * This format matches standard naming convention in Samba's
 	 * vfs_streams_xattr.
 	 *
+	 * `name_out` will contain only the <stream name> portion of `name_in`
+	 * NOTE: caller must free `name_out`.
+	 *
 	 * Some care needs to be taken here because of the following edge case
 	 * Both <filename> and <filename>::$DATA may be used to open the default
 	 * data stream for a file. We need to guard against ever generating the
@@ -568,12 +571,12 @@ get_stream_name(const char *name_in, char **name_out)
 
 	suffix = strstr(stream_name, STREAM_SUFFIX);
 	if (suffix == NULL) {
-		// malformed stream name (no :DATA suffix)
+		// malformed stream name (no :$DATA suffix)
 		kfree(stream_name);
 		return -EINVAL;
 	}
 
-	// chop off :DATA suffix before sending the open request
+	// Remove the stream type suffix and separator ":$DATA"
 	*suffix = '\0';
 	*name_out = stream_name;
 	return 0;

@@ -165,8 +165,9 @@ static int cifs_xattr_set(const struct xattr_handler *handler,
 		    (strncmp(name, STREAM_XATTR, STREAM_XATTR_LEN) == 0)) {
 			rc = set_stream_xattr(dentry, full_path, xid, pTcon,
 					      name, value, size, flags);
+		} else
 #endif /* CONFIG_TRUENAS */
-		} else if (pTcon->ses->server->ops->set_EA) {
+		if (pTcon->ses->server->ops->set_EA) {
 			rc = pTcon->ses->server->ops->set_EA(xid, pTcon,
 				full_path, name, value, (__u16)size,
 				cifs_sb->local_nls, cifs_sb);
