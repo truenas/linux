@@ -106,20 +106,22 @@ parse_to_xat_buf(struct cifs_sb_info *cifs_sb,
 		 */
 		name = (char *)stream + sizeof(struct smb2_file_stream_info);
 
-		stream_name = cifs_strndup_from_utf16(name, stream->StreamNameLength, true,
-						      cifs_sb->local_nls);
+		stream_name = cifs_strndup_from_utf16(name,
+		    stream->StreamNameLength, true, cifs_sb->local_nls);
 		if (stream_name == NULL) {
 			error = -ENOMEM;
 			break;
 		}
 		namelen = strlen(stream_name);
 
-		// skip default data stream. get_next_stream already verified namelen
+		// skip default data stream.
 		if (strcmp(stream_name, DEFAULT_DATA_STREAM) == 0) {
 			kfree(stream_name);
 			continue;
 		}
 
+		// dstsz == 0 means that caller is trying to figure out buffer
+		// size needed for the xattr names. See man(2) listxattr.
 		if (dstsz == 0) {
 			used += (namelen + STREAM_XATTR_PREFIXLEN + 1);
 			kfree(stream_name);
@@ -512,11 +514,6 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 			break;
 	}
 
-	if (streams_samba_compat_enabled) {
-		// Append terminating NULL to match Samba behavior
-		*(dst + total_read + 1) = '\0';
-	}
-
 	SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
 	if (rc == 0) {
 		if (streams_samba_compat_enabled) {
@@ -533,12 +530,37 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 static int
 get_stream_name(const char *name_in, char **name_out)
 {
+	/*
+	 * `name_in` will be of format: "user.DosStream.<stream name>:$DATA".
+	 * This format matches standard naming convention in Samba's
+	 * vfs_streams_xattr.
+	 *
+	 * Some care needs to be taken here because of the following edge case
+	 * Both <filename> and <filename>::$DATA may be used to open the default
+	 * data stream for a file. We need to guard against ever generating the
+	 * latter as a path for getting or setting named streams via an xattr
+	 * handler.
+	 *
+	 * <filename>:$DATA:$DATA is also a valid stream name and so strstr
+	 * and similar string-related functions operating "$DATA" should be
+	 * used in a way that avoids or handles this edge case. We avoid
+	 * this here by not including the stream separator as part of the
+	 * xattr name and trimming off sufix starting with the separator ":"
+	 * for the stream suffix.
+	 */
 	char *stream_name, *suffix;
 
 	if (strcmp(name_in, DEFAULT_DATA_STREAM) == 0) {
+		// This is our default data stream "<filename>::$DATA"
 		return -EINVAL;
 	}
 
+	if (strncmp(name_in, STREAM_XATTR, STREAM_XATTR_LEN) != 0) {
+		// `name_in` does not start with "user.DosStream."
+		return -EINVAL;
+	}
+
+	// Remove the user.DosStream. prefix
 	stream_name = kstrdup(name_in + STREAM_XATTR_LEN, GFP_KERNEL);
 	if (stream_name == NULL) {
 		return -ENOMEM;
@@ -554,7 +576,6 @@ get_stream_name(const char *name_in, char **name_out)
 	// chop off :DATA suffix before sending the open request
 	*suffix = '\0';
 	*name_out = stream_name;
-
 	return 0;
 }
 
@@ -571,7 +592,7 @@ int set_stream_xattr(struct dentry *dentry, const char *full_path,
 		return rc;
 	}
 
-	if ((value == NULL) && (size == 0)) {
+	if ((value == NULL) || (size == 0)) {
 		rc = delete_stream(dentry, tcon, xid, full_path, stream_name);
 	} else {
 		rc = write_stream(dentry, tcon, value, size, flags, xid,
