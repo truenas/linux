@@ -123,7 +123,7 @@ parse_to_xat_buf(struct cifs_sb_info *cifs_sb,
 		// dstsz == 0 means that caller is trying to figure out buffer
 		// size needed for the xattr names. See man(2) listxattr.
 		if (dstsz == 0) {
-			used += (namelen + STREAM_XATTR_PREFIXLEN + 1);
+			used += (namelen + STREAM_XATTR_PREFIXLEN);
 			kfree(stream_name);
 			continue;
 		}
@@ -387,9 +387,9 @@ write_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 	// smaller than this.
 	wsize = tcon->ses->server->ops->wp_retry_size(d_inode(dentry));
 
-	// vfs_streams_xattr in Samba appends an extra NULL byte to stream
+	// See "Samba background" note in truenas_streams.h
 	if (streams_samba_compat_enabled) {
-		sz -= streams_samba_compat_enabled;
+		sz -= 1; /* Remove NULL appended by samba */
 	}
 	rc = do_stream_open(tcon, CIFS_SB(dentry->d_sb), STREAM_OPEN_WRITE,
 			    xid, path, stream, flags, &fid, &info);
@@ -516,8 +516,9 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 
 	SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
 	if (rc == 0) {
+		// See "Samba background" note in truenas_streams.h
 		if (streams_samba_compat_enabled) {
-			*pused = total_read + streams_samba_compat_enabled;
+			*pused = total_read + 1;
 			*(dst + total_read) = '\0';
 		} else {
 			*pused = total_read;
