@@ -381,6 +381,11 @@ write_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 	unsigned int written = 0;
 	unsigned int total_written;
 	unsigned int wsize;
+	struct TCP_Server_Info *server;
+
+	server = cifs_pick_channel(tcon->ses);
+	if (!server->ops->sync_write)
+		return -ENOSYS;
 
 	// We will potentially need to break up stream write into chunks.
 	// Typical IO size in SMB is 1 MiB and typical streams are much
@@ -410,6 +415,7 @@ write_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 			.volatile_fid = fid.volatile_fid,
 			.pid = current->tgid,
 			.tcon = tcon,
+			.server = server,
 			.offset = total_written,
 			.length = len,
 		};
@@ -417,7 +423,8 @@ write_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 		iov[1].iov_base = (char *)data + total_written;
 		iov[1].iov_len = len;
 		while ((rc == -EAGAIN) && ((retries += 1) < STREAM_MAX_RETRIES)) {
-			rc = SMB2_write(xid, &io_parms, &written, iov, 1);
+			rc = server->ops->sync_write(xid, &fid, &io_parms,
+						     &written, iov, 1);
 		}
 
 		if (rc || (written == 0)) {
@@ -432,7 +439,7 @@ write_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 		    fid.volatile_fid, current->tgid, &eof);
 	}
 
-	SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
+	server->ops->close(xid, tcon, &fid);
 	if (rc) {
 		return rc;
 	}
@@ -450,8 +457,13 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 	struct cifs_io_parms io_parms;
 	struct smb2_file_all_info info;
 	unsigned int bytes_read = 0;
-	unsigned int rsize, total_read;
+	unsigned int total_read;
 	u32 to_read;
+	struct TCP_Server_Info *server;
+
+	server = cifs_pick_channel(tcon->ses);
+	if (!server->ops->sync_read)
+		return -ENOSYS;
 
 	rc = do_stream_open(tcon, CIFS_SB(dentry->d_sb), STREAM_OPEN_READ, xid,
 	    path, stream, 0, &fid, &info);
@@ -460,7 +472,7 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
         }
 
 	if (dstsz == 0) {
-		SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
+		server->ops->close(xid, tcon, &fid);
 		*pused = le64_to_cpu(info.EndOfFile) + streams_samba_compat_enabled;
 		return 0;
 	}
@@ -482,15 +494,12 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 		 * Typically an alternate data stream will be less than 1 KiB.
 		 */
 
-		SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
+		server->ops->close(xid, tcon, &fid);
 		return -ERANGE;
 	}
 
-	rsize = tcon->ses->server->ops->negotiate_rsize(tcon,
-	    CIFS_SB(dentry->d_sb)->ctx);
-
 	for (total_read = 0; to_read > total_read; total_read += bytes_read) {
-		unsigned int len = min(to_read, rsize);
+		unsigned int len = min(to_read, CIFSMaxBufSize);
 		unsigned int retries = 0;
 		rc = -EAGAIN;
 		char *pbuf = dst + total_read;
@@ -500,13 +509,15 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 			.volatile_fid = fid.volatile_fid,
 			.pid = current->tgid,
 			.tcon = tcon,
+			.server = server,
 			.offset = total_read,
 			.length = len,
 		};
 
-		while ((rc == -EAGAIN) && ((retries += 1) < STREAM_MAX_RETRIES)) {
-			rc = SMB2_read(xid, &io_parms, &bytes_read, &pbuf,
-			    &buf_type);
+		while ((rc == -EAGAIN) &&
+		       ((retries += 1) < STREAM_MAX_RETRIES)) {
+			rc = server->ops->sync_read(xid, &fid, &io_parms,
+			    &bytes_read, &pbuf, &buf_type);
 		}
 
 		// If we've read to end of stream, rc will be 0 and bytes_read 0
@@ -514,7 +525,7 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 			break;
 	}
 
-	SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
+	server->ops->close(xid, tcon, &fid);
 	if (rc == 0) {
 		// See "Samba background" note in truenas_streams.h
 		if (streams_samba_compat_enabled) {
