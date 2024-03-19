@@ -132,7 +132,12 @@ static int cifs_xattr_set(const struct xattr_handler *handler,
 	/* if proc/fs/cifs/streamstoxattr is set then
 		search server for EAs or streams to
 		returns as xattrs */
+#ifdef CONFIG_TRUENAS
+	if ((size > MAX_EA_VALUE_SIZE) &&
+	    (strncmp(name, STREAM_XATTR, STREAM_XATTR_LEN) != 0)) {
+#else
 	if (size > MAX_EA_VALUE_SIZE) {
+#endif /* CONFIG_TRUENAS */
 		cifs_dbg(FYI, "size of EA value too large\n");
 		rc = -EOPNOTSUPP;
 		goto out;
