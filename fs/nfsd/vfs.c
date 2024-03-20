@@ -1238,9 +1238,11 @@ __be32 nfsd_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		return err;
 
 	file = nf->nf_file;
+#if 0
 	if (file->f_op->splice_read && test_bit(RQ_SPLICE_OK, &rqstp->rq_flags))
 		err = nfsd_splice_read(rqstp, fhp, file, offset, count, eof);
 	else
+#endif
 		err = nfsd_iter_read(rqstp, fhp, file, offset, count, 0, eof);
 
 	nfsd_file_put(nf);
