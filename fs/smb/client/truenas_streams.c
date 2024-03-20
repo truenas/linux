@@ -658,9 +658,11 @@ int list_streams_xattr(struct dentry *dentry, const char *path,
 	if (error)
 		return error;
 
-	error = parse_to_xat_buf(CIFS_SB(dentry->d_sb), dst, dstsz,
-				 streams, (char *)streams + slen,
-				 &slen);
+	if (slen) {
+		error = parse_to_xat_buf(CIFS_SB(dentry->d_sb), dst, dstsz,
+					 streams, (char *)streams + slen,
+					 &slen);
+	}
 	kfree(streams);
 	if (error)
 		return error;
