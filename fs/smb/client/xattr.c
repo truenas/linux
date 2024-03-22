@@ -166,7 +166,7 @@ static int cifs_xattr_set(const struct xattr_handler *handler,
 			goto out;
 
 #ifdef CONFIG_TRUENAS
-		if ((pTcon->ses->server->dialect > SMB30_PROT_ID) &&
+		if ((pTcon->ses->server->dialect >= SMB21_PROT_ID) &&
 		    (strncmp(name, STREAM_XATTR, STREAM_XATTR_LEN) == 0)) {
 			rc = set_stream_xattr(dentry, full_path, xid, pTcon,
 					      name, value, size, flags);
@@ -363,7 +363,7 @@ static int cifs_xattr_get(const struct xattr_handler *handler,
 			goto out;
 
 #ifdef CONFIG_TRUENAS
-		if ((pTcon->ses->server->dialect > SMB30_PROT_ID) &&
+		if ((pTcon->ses->server->dialect >= SMB21_PROT_ID) &&
 		    (strncmp(name, STREAM_XATTR, STREAM_XATTR_LEN) == 0)) {
 			rc = get_stream_xattr(dentry, full_path, xid, pTcon,
 					      name, value, size);
@@ -535,8 +535,8 @@ ssize_t cifs_listxattr(struct dentry *direntry, char *data, size_t buf_size)
 		rc += sizeof(CIFS_XATTR_ZFS_ACL);
 	}
 
-	// For now we will limit ADS support to SMB3 or greater
-	if (pTcon->ses->server->dialect >= SMB30_PROT_ID) {
+	// For now we will limit ADS support to SMB 2.10 or greater
+	if (pTcon->ses->server->dialect >= SMB21_PROT_ID) {
 		int res;
 		res = list_streams_xattr(direntry, full_path, xid, pTcon,
 					 data ? data + rc : data,
