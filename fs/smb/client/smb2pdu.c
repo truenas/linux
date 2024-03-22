@@ -3919,6 +3919,36 @@ int SMB2_query_info(const unsigned int xid, struct cifs_tcon *tcon,
 			  NULL);
 }
 
+#ifdef CONFIG_TRUENAS
+int SMB2_query_streams(const unsigned int xid, struct cifs_tcon *tcon,
+	u64 persistent_fid, u64 volatile_fid, struct smb2_file_stream_info **data,
+	u32 *plen)
+{
+	/*
+	 * Each returned data stream name will be of form ":<stream name>:$DATA"
+	 *
+	 * Per MS-FSCC 2.1.5.3 a stream name must be no more than 255 characters.
+	 * Total calculation for maximum length of response though needs to
+	 * include the separator characters and string indicating that it's a
+	 * data stream. There is no documented limit on number of named streams
+	 * a file may have and so we pass CIFSMaxBufSize as the maximum response
+	 * size. Memory allocation for data out is based on OutputBufferLength
+	 * in SMB2 response.
+	 *
+	 * NOTE: caller must free `data` on success.
+	 */
+
+	// force memory allocation
+	*plen = 0;
+	*data = NULL;
+	return query_info(xid, tcon, persistent_fid, volatile_fid,
+			  FILE_STREAM_INFORMATION, SMB2_O_INFO_FILE, 0,
+			  CIFSMaxBufSize,
+			  sizeof(struct smb2_file_stream_info), (void **)data,
+			  plen);
+}
+#endif /* CONFIG_TRUENAS */
+
 #if 0
 /* currently unused, as now we are doing compounding instead (see smb311_posix_query_path_info) */
 int

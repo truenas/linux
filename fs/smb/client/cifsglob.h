@@ -2062,6 +2062,7 @@ extern atomic_t mid_count;
 
 #ifdef CONFIG_TRUENAS
 extern unsigned int global_zfsaclflags;
+extern unsigned int streams_samba_compat_enabled;
 #endif
 
 void cifs_oplock_break(struct work_struct *work);

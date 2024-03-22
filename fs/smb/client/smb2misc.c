@@ -482,6 +482,92 @@ cifs_convert_path_to_utf16(const char *from, struct cifs_sb_info *cifs_sb)
 	return to;
 }
 
+#ifdef CONFIG_TRUENAS
+static const char *
+get_start_of_path(const char *from, struct cifs_sb_info *cifs_sb)
+{
+	/* Windows doesn't allow paths beginning with \ */
+	if (from[0] == '\\')
+		return from + 1;
+
+	/* SMB311 POSIX extensions paths do not include leading slash */
+	else if (cifs_sb_master_tlink(cifs_sb) &&
+		 cifs_sb_master_tcon(cifs_sb)->posix_extensions &&
+		 (from[0] == '/')) {
+		return from + 1;
+	}
+	return from;
+}
+
+/*
+ * This is a variant of cifs_convert_path_to_utf16() for generating a UTF16
+ * path name for a named stream. File name and stream name are separated by the
+ * colon character ":". Since this separator must be preserved in an unaltered
+ * form, the normal path conversion function may not be used to generate a
+ * full stream path.
+ *
+ * Note: caller must free return buffer
+ */
+__le16 *
+cifs_convert_stream_path_to_utf16(const char *from, const char *stream, struct cifs_sb_info *cifs_sb)
+{
+	int file_len, stream_len;
+	const char *start_of_path;
+	int map_type;
+	char *buf = NULL, *pbuf;
+	__le16 *file_buf = NULL, *stream_buf = NULL;
+
+	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MAP_SFM_CHR)
+		map_type = SFM_MAP_UNI_RSVD;
+	else if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MAP_SPECIAL_CHR)
+		map_type = SFU_MAP_UNI_RSVD;
+	else
+		map_type = NO_MAP_UNI_RSVD;
+
+	start_of_path = get_start_of_path(from, cifs_sb);
+
+	file_buf = cifs_strndup_to_utf16(start_of_path, PATH_MAX, &file_len,
+					 cifs_sb->local_nls, map_type);
+
+	if (file_buf == NULL) {
+		return NULL;
+	}
+
+
+	start_of_path = get_start_of_path(stream, cifs_sb);
+
+	stream_buf = cifs_strndup_to_utf16(start_of_path, PATH_MAX, &stream_len,
+					   cifs_sb->local_nls, map_type);
+	if (stream_buf == NULL) {
+		kfree(file_buf);
+		return NULL;
+	}
+
+	buf = kzalloc(file_len + stream_len, GFP_KERNEL);
+	if (buf == NULL) {
+		kfree(file_buf);
+		kfree(stream_buf);
+		return NULL;
+	}
+
+	memcpy(buf, file_buf, file_len);
+
+	// cifs_strndup_to_utf16() appends a UTF16 NULL character to end of
+	// string. We take advantage of this and replace with UTF-16 colon
+	// (separator for file and stream names in SMB protocol) for
+	// concatenating the full stream name.
+	pbuf = buf + (file_len - 2);
+	*pbuf++ = ':';
+	*pbuf++ = '\0';
+
+	memcpy(pbuf, stream_buf, stream_len);
+	kfree(file_buf);
+	kfree(stream_buf);
+
+	return (__le16 *)buf;
+}
+#endif
+
 __le32
 smb2_get_lease_state(struct cifsInodeInfo *cinode)
 {

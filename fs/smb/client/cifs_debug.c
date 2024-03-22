@@ -850,6 +850,7 @@ static const struct proc_ops cifs_mount_params_proc_ops;
 
 #ifdef CONFIG_TRUENAS
 static const struct proc_ops cifs_zfsacl_flags_proc_ops;
+static const struct proc_ops cifs_stream_samba_compat;
 #endif
 
 void
@@ -880,6 +881,9 @@ cifs_proc_init(void)
 #ifdef CONFIG_TRUENAS
 	proc_create("zfsacl_configuration_flags", 0644, proc_fs_cifs,
 		    &cifs_zfsacl_flags_proc_ops);
+
+	proc_create("stream_samba_compat", 0644, proc_fs_cifs,
+		    &cifs_stream_samba_compat);
 #endif
 
 #ifdef CONFIG_CIFS_DFS_UPCALL
@@ -924,6 +928,7 @@ cifs_proc_clean(void)
 
 #ifdef CONFIG_TRUENAS
 	remove_proc_entry("zfsacl_configuration_flags", proc_fs_cifs);
+	remove_proc_entry("stream_samba_compat", proc_fs_cifs);
 #endif
 
 #ifdef CONFIG_CIFS_DFS_UPCALL
@@ -1179,6 +1184,56 @@ static const struct proc_ops cifs_security_flags_proc_ops = {
 };
 
 #ifdef CONFIG_TRUENAS
+static int cifs_stream_compat_proc_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", streams_samba_compat_enabled);
+	return 0;
+}
+
+static int cifs_stream_compat_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cifs_stream_compat_proc_show, NULL);
+}
+
+static ssize_t cifs_stream_compat_proc_write(struct file *file,
+					     const char __user *buffer,
+					     size_t count,
+					     loff_t *ppos)
+{
+	int rc;
+	unsigned int enabled;
+	char enabled_string[4] = { 0 };
+
+	if (count >= sizeof(enabled_string))
+		return -EINVAL;
+
+	if (copy_from_user(enabled_string, buffer, count))
+		return -EFAULT;
+
+	rc = kstrtouint(enabled_string, 0, &enabled);
+	if (rc) {
+		cifs_dbg(VFS, "failed to convert value [%s] to int\n",
+			 enabled_string);
+		return rc;
+	}
+
+	if (enabled > 1) {
+		cifs_dbg(VFS, "Value must be 1 or 0\n");
+		return -EINVAL;
+	}
+
+	streams_samba_compat_enabled = enabled;
+	return count;
+}
+
+static const struct proc_ops cifs_stream_samba_compat = {
+	.proc_open	= cifs_stream_compat_proc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= cifs_stream_compat_proc_write,
+};
+
 static int cifs_zfsacl_flags_proc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "0x%x\n", global_zfsaclflags);

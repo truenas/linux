@@ -197,6 +197,13 @@ extern int SMB311_posix_query_info(const unsigned int xid, struct cifs_tcon *tco
 extern int SMB2_query_info(const unsigned int xid, struct cifs_tcon *tcon,
 			   u64 persistent_file_id, u64 volatile_file_id,
 			   struct smb2_file_all_info *data);
+#ifdef CONFIG_TRUENAS
+extern int SMB2_query_streams(const unsigned int xid, struct cifs_tcon *tcon,
+			      u64 persistent_fid, u64 volatile_fid,
+			      struct smb2_file_stream_info **data, u32 *plen);
+__le16 *
+cifs_convert_stream_path_to_utf16(const char *from, const char *stream, struct cifs_sb_info *cifs_sb);
+#endif
 extern int SMB2_query_info_init(struct cifs_tcon *tcon,
 				struct TCP_Server_Info *server,
 				struct smb_rqst *rqst,
