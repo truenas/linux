@@ -82,6 +82,7 @@ static inline void nfsd_attrs_free(struct nfsd_attrs *attrs)
 	attrs->na_acltype = ACL_TYPE_NONE;
 }
 
+__be32		nfserrno (int errno);
 int		nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 		                struct svc_export **expp);
 __be32		nfsd_lookup(struct svc_rqst *, struct svc_fh *,
