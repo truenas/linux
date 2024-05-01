@@ -1,3 +1,9 @@
+linux-6.1.89+truenas (6.1.89+truenas-1) sid; urgency=low
+
+  * Merge upstream v6.1.89 release.
+
+ -- Debian Packages List <debian.packages@ixsystems.com>  Wed, 1 May 2024 22:30:00 +0500
+
 linux-6.1.79+truenas (6.1.79+truenas-1) sid; urgency=low
 
   * Merge upstream v6.1.79 release
