@@ -2721,6 +2721,8 @@ static struct nvme_subsystem *__nvme_find_get_subsystem(const char *subsysnqn)
 	list_for_each_entry(subsys, &nvme_subsystems, entry) {
 		if (strcmp(subsys->subnqn, subsysnqn))
 			continue;
+		if (list_empty(&subsys->ctrls))
+			continue;
 		if (!kref_get_unless_zero(&subsys->ref))
 			continue;
 		return subsys;
