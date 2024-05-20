@@ -178,6 +178,45 @@ static ssize_t queue_max_discard_sectors_store(struct gendisk *disk,
 	return ret;
 }
 
+static ssize_t queue_copy_hw_max_show(struct gendisk *disk, char *page)
+{
+	return sprintf(page, "%llu\n", (unsigned long long)
+		       disk->queue->limits.max_copy_hw_sectors << SECTOR_SHIFT);
+}
+
+static ssize_t queue_copy_max_show(struct gendisk *disk, char *page)
+{
+	return sprintf(page, "%llu\n", (unsigned long long)
+		       disk->queue->limits.max_copy_sectors << SECTOR_SHIFT);
+}
+
+static ssize_t queue_copy_max_store(struct gendisk *disk, const char *page,
+				    size_t count)
+{
+	unsigned long max_copy_bytes;
+	struct queue_limits lim;
+	ssize_t ret;
+	int err;
+	struct request_queue *q = disk->queue;
+
+	ret = queue_var_store(&max_copy_bytes, page, count);
+	if (ret < 0)
+		return ret;
+
+	if (max_copy_bytes & (queue_logical_block_size(q) - 1))
+		return -EINVAL;
+
+	blk_mq_freeze_queue(q);
+	lim = queue_limits_start_update(q);
+	lim.max_user_copy_sectors = max_copy_bytes >> SECTOR_SHIFT;
+	err = queue_limits_commit_update(q, &lim);
+	blk_mq_unfreeze_queue(q);
+
+	if (err)
+		return err;
+	return count;
+}
+
 /*
  * For zone append queue_max_zone_append_sectors does not just return the
  * underlying queue limits, but actually contains a calculation.  Because of
@@ -459,6 +498,9 @@ QUEUE_RO_ENTRY(queue_nr_zones, "nr_zones");
 QUEUE_RO_ENTRY(queue_max_open_zones, "max_open_zones");
 QUEUE_RO_ENTRY(queue_max_active_zones, "max_active_zones");
 
+QUEUE_RO_ENTRY(queue_copy_hw_max, "copy_max_hw_bytes");
+QUEUE_RW_ENTRY(queue_copy_max, "copy_max_bytes");
+
 QUEUE_RW_ENTRY(queue_nomerges, "nomerges");
 QUEUE_RW_ENTRY(queue_rq_affinity, "rq_affinity");
 QUEUE_RW_ENTRY(queue_poll, "io_poll");
@@ -572,6 +614,8 @@ static struct attribute *queue_attrs[] = {
 	&queue_max_discard_sectors_entry.attr,
 	&queue_max_hw_discard_sectors_entry.attr,
 	&queue_discard_zeroes_data_entry.attr,
+	&queue_copy_hw_max_entry.attr,
+	&queue_copy_max_entry.attr,
 	&queue_atomic_write_max_sectors_entry.attr,
 	&queue_atomic_write_boundary_sectors_entry.attr,
 	&queue_atomic_write_unit_min_entry.attr,
