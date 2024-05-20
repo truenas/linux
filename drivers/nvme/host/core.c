@@ -2721,8 +2721,22 @@ static struct nvme_subsystem *__nvme_find_get_subsystem(const char *subsysnqn)
 	list_for_each_entry(subsys, &nvme_subsystems, entry) {
 		if (strcmp(subsys->subnqn, subsysnqn))
 			continue;
+		printk(KERN_ERR "%s(): subnqnq matched, list:%d\n", __func__,
+		    list_empty(&subsys->ctrls));
 		if (list_empty(&subsys->ctrls))
 			continue;
+		struct nvme_ctrl *tmp;
+		list_for_each_entry(tmp, &subsys->ctrls, subsys_entry) {
+			if (tmp)
+				printk(KERN_ERR "%s()-2: ctrl->name:%s, ctrl->instance:%d\n", __func__,
+					tmp->name, tmp->instance);
+			else
+				printk(KERN_ERR "%s()-3: ctrl is empty\n", __func__);
+		}
+
+
+
+
 		if (!kref_get_unless_zero(&subsys->ref))
 			continue;
 		return subsys;
@@ -2843,6 +2857,7 @@ static int nvme_init_subsystem(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
 	if (!found)
 		subsys->instance = ctrl->instance;
 	ctrl->subsys = subsys;
+	printk(KERN_ERR "%s(): %p, list_add_tail...\n", __func__, &subsys->ctrls);
 	list_add_tail(&ctrl->subsys_entry, &subsys->ctrls);
 	mutex_unlock(&nvme_subsystems_lock);
 	return 0;
@@ -4444,16 +4459,25 @@ static void nvme_free_ctrl(struct device *dev)
 	free_opal_dev(ctrl->opal_dev);
 
 	if (subsys) {
+		printk(KERN_ERR "%s()-1: %p, list_del, before empty:%d...\n", __func__,
+		    &subsys->ctrls, list_empty(&subsys->ctrls));
 		mutex_lock(&nvme_subsystems_lock);
 		list_del(&ctrl->subsys_entry);
 		sysfs_remove_link(&subsys->dev.kobj, dev_name(ctrl->device));
 		mutex_unlock(&nvme_subsystems_lock);
+		printk(KERN_ERR "%s()-2: %p, list_del, after empty:%d...\n", __func__,
+		    &subsys->ctrls, list_empty(&subsys->ctrls));
 	}
 
 	ctrl->ops->free_ctrl(ctrl);
 
-	if (subsys)
+	if (subsys) {
+		printk(KERN_ERR "%s()-3: %p, list_del, before empty:%d...\n", __func__,
+		    &subsys->ctrls, list_empty(&subsys->ctrls));
 		nvme_put_subsystem(subsys);
+		printk(KERN_ERR "%s()-4: %p, list_del, after empty:%d...\n", __func__,
+		    &subsys->ctrls, list_empty(&subsys->ctrls));
+	}
 }
 
 /*
