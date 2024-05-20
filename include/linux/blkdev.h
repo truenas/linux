@@ -398,6 +398,10 @@ struct queue_limits {
 	unsigned int		discard_alignment;
 	unsigned int		zone_write_granularity;
 
+	unsigned int		max_copy_hw_sectors;
+	unsigned int		max_copy_sectors;
+	unsigned int		max_user_copy_sectors;
+
 	/* atomic write limits */
 	unsigned int		atomic_write_hw_max;
 	unsigned int		atomic_write_max_sectors;
@@ -1116,6 +1120,8 @@ static inline void blk_queue_disable_write_zeroes(struct request_queue *q)
 /*
  * Access functions for manipulating queue properties
  */
+extern void blk_queue_max_copy_hw_sectors(struct request_queue *q,
+					  unsigned int max_copy_sectors);
 extern void blk_set_queue_depth(struct request_queue *q, unsigned int depth);
 extern void blk_set_stacking_limits(struct queue_limits *lim);
 extern int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
@@ -1425,6 +1431,14 @@ static inline unsigned int bdev_max_discard_sectors(struct block_device *bdev)
 static inline unsigned int bdev_discard_granularity(struct block_device *bdev)
 {
 	return bdev_limits(bdev)->discard_granularity;
+}
+
+/* maximum copy offload length, this is set to 128MB based on current testing */
+#define BLK_COPY_MAX_BYTES		(1 << 27)
+
+static inline unsigned int bdev_max_copy_sectors(struct block_device *bdev)
+{
+	return bdev_get_queue(bdev)->limits.max_copy_sectors;
 }
 
 static inline unsigned int
