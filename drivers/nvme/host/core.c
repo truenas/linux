@@ -2719,7 +2719,20 @@ static struct nvme_subsystem *__nvme_find_get_subsystem(const char *subsysnqn)
 		return NULL;
 
 	list_for_each_entry(subsys, &nvme_subsystems, entry) {
+		bool valid_ctrl = false;
+		struct nvme_ctrl *ctrl;
+
 		if (strcmp(subsys->subnqn, subsysnqn))
+			continue;
+		if (list_empty(&subsys->ctrls))
+			continue;
+		list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry) {
+			if (!nvme_state_terminal(ctrl)) {
+				valid_ctrl = true;
+				break;
+			}
+		}
+		if (!valid_ctrl)
 			continue;
 		if (!kref_get_unless_zero(&subsys->ref))
 			continue;
