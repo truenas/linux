@@ -11957,7 +11957,7 @@ static struct raid_function_template mpt2sas_raid_functions = {
  *
  * Return: 0 on success, -errno on failure
  */
-int scsih_ioctl(struct scsi_device *sdev, unsigned int cmd, void __user *arg)
+static int scsih_ioctl(struct scsi_device *sdev, unsigned int cmd, void __user *arg)
 {
 	if (scsih_is_nvme(&sdev->sdev_gendev)) {
 		switch (cmd) {
