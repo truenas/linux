@@ -696,10 +696,33 @@ static void ses_match_to_enclosure(struct enclosure_device *edev,
 	if (refresh)
 		ses_enclosure_data_process(edev, edev_sdev, 0);
 
-	if (scsi_is_sas_rphy(sdev->sdev_target->dev.parent))
+	if (scsi_is_sas_rphy(sdev->sdev_target->dev.parent)) {
 		efd.addr = sas_get_address(sdev);
-	else if (scsi_is_ata(sdev))
+	} else if (scsi_is_ata(sdev)) {
 		efd.addr = sdev->host->host_no + 1;
+	} else {
+		const unsigned char *d;
+		const struct scsi_vpd *vpd_pg83;
+		rcu_read_lock();
+		if ((vpd_pg83 = rcu_dereference(sdev->vpd_pg83)) != NULL) {
+			d = vpd_pg83->data + 4;
+			while (d + 12 <= vpd_pg83->data + vpd_pg83->len) {
+				enum scsi_protocol proto = d[0] >> 4;
+				u8 code_set = d[0] & 0x0f;
+				u8 piv = d[1] & 0x80;
+				u8 assoc = (d[1] & 0x30) >> 4;
+				u8 type = d[1] & 0x0f;
+				u8 len = d[3];
+				if (piv && code_set == 1 && assoc == 1 && proto ==
+				    SCSI_PROTOCOL_SAS && type == 3 && len == 8) {
+					efd.addr = get_unaligned_be64(&d[4]);
+					break;
+				}
+				d += len + 4;
+			}
+		}
+		rcu_read_unlock();
+	}
 
 	if (efd.addr) {
 		efd.dev = &sdev->sdev_gendev;
