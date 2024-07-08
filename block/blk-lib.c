@@ -22,6 +22,7 @@ struct blkdev_copy_io {
 
 /* Keeps track of single outstanding copy offload IO */
 struct blkdev_copy_offload_io {
+	void   *driver_private;
 	struct blkdev_copy_io *cio;
 	loff_t offset;
 };
@@ -228,7 +229,7 @@ static void blkdev_copy_offload_src_endio(struct bio *bio)
 ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 			    loff_t pos_out, size_t len,
 			    void (*endio)(void *, int, ssize_t),
-			    void *private, gfp_t gfp)
+			    void *private, gfp_t gfp, struct block_device *bdev_out)
 {
 	struct blkdev_copy_io *cio;
 	struct blkdev_copy_offload_io *offload_io;
@@ -238,7 +239,7 @@ ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 	ssize_t ret;
 	struct blk_plug plug;
 
-	if (!max_copy_bytes)
+	if (!max_copy_bytes || bdev->bd_queue->mq_ops == NULL)
 		return -EOPNOTSUPP;
 
 	ret = blkdev_copy_sanity_check(bdev, pos_in, bdev, pos_out, len);
@@ -270,6 +271,8 @@ ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 		 * successful copy length
 		 */
 		offload_io->offset = len - rem;
+		if (bdev_out)
+			offload_io->driver_private = bdev_out->bd_queue->queuedata;
 
 		dst_bio = bio_alloc(bdev, 0, REQ_OP_COPY_DST, gfp);
 		if (!dst_bio)

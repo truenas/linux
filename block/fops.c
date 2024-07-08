@@ -743,11 +743,11 @@ static ssize_t blkdev_copy_file_range(struct file *file_in, loff_t pos_in,
 	struct block_device *out_bdev = I_BDEV(bdev_file_inode(file_out));
 	ssize_t copied = 0;
 
-	if ((in_bdev == out_bdev) && bdev_max_copy_sectors(in_bdev) &&
+	if (/*(in_bdev == out_bdev) &&*/ bdev_max_copy_sectors(in_bdev) &&
 	    (file_in->f_iocb_flags & IOCB_DIRECT) &&
 	    (file_out->f_iocb_flags & IOCB_DIRECT)) {
 		copied = blkdev_copy_offload(in_bdev, pos_in, pos_out, len,
-					     NULL, NULL, GFP_KERNEL);
+					     NULL, NULL, GFP_KERNEL, out_bdev);
 		if (copied < 0)
 			copied = 0;
 	} else {

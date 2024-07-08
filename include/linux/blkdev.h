@@ -1059,7 +1059,8 @@ int blkdev_issue_secure_erase(struct block_device *bdev, sector_t sector,
 ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 			    loff_t pos_out, size_t len,
 			    void (*endio)(void *, int, ssize_t),
-			    void *private, gfp_t gfp_mask);
+			    void *private, gfp_t gfp_mask,
+			    struct block_device *bdev_out);
 
 #define BLKDEV_ZERO_NOUNMAP	(1 << 0)  /* do not free blocks */
 #define BLKDEV_ZERO_NOFALLBACK	(1 << 1)  /* don't write explicit zeroes */
@@ -1234,8 +1235,8 @@ static inline unsigned int bdev_discard_granularity(struct block_device *bdev)
 	return bdev_get_queue(bdev)->limits.discard_granularity;
 }
 
-/* maximum copy offload length, this is set to 128MB based on current testing */
-#define BLK_COPY_MAX_BYTES		(1 << 27)
+/* Tested till 2GB with zvol testing */
+#define BLK_COPY_MAX_BYTES		(1 << 31)
 
 static inline unsigned int bdev_max_copy_sectors(struct block_device *bdev)
 {
