@@ -840,6 +840,11 @@ void submit_bio_noacct(struct bio *bio)
 		if (!bdev_is_zoned(bio->bi_bdev))
 			goto not_supported;
 		break;
+	case REQ_OP_COPY_SRC:
+	case REQ_OP_COPY_DST:
+		if (!q->limits.max_copy_sectors)
+			goto not_supported;
+		break;
 	case REQ_OP_DRV_IN:
 	case REQ_OP_DRV_OUT:
 		/*
@@ -847,11 +852,6 @@ void submit_bio_noacct(struct bio *bio)
 		 * requests.
 		 */
 		fallthrough;
-	case REQ_OP_COPY_SRC:
-	case REQ_OP_COPY_DST:
-		if (!q->limits.max_copy_sectors)
-			goto not_supported;
-		break;
 	default:
 		goto not_supported;
 	}
