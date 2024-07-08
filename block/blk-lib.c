@@ -10,22 +10,6 @@
 
 #include "blk.h"
 
-/* Keeps track of all outstanding copy IO */
-struct blkdev_copy_io {
-	atomic_t refcount;
-	ssize_t copied;
-	int status;
-	struct task_struct *waiter;
-	void (*endio)(void *private, int status, ssize_t copied);
-	void *private;
-};
-
-/* Keeps track of single outstanding copy offload IO */
-struct blkdev_copy_offload_io {
-	struct blkdev_copy_io *cio;
-	loff_t offset;
-};
-
 static sector_t bio_discard_limit(struct block_device *bdev, sector_t sector)
 {
 	unsigned int discard_granularity = bdev_discard_granularity(bdev);
@@ -180,6 +164,9 @@ static void blkdev_copy_offload_src_endio(struct bio *bio)
 			cio->status = blk_status_to_errno(bio->bi_status);
 	}
 	bio_put(bio);
+	if (offload_io->dst_bio)
+		bio_put(offload_io->dst_bio);
+
 	kfree(offload_io);
 
 	if (atomic_dec_and_test(&cio->refcount))
@@ -187,7 +174,7 @@ static void blkdev_copy_offload_src_endio(struct bio *bio)
 }
 
 /*
- * @bdev:	block device
+ * @bdev:	source block device
  * @pos_in:	source offset
  * @pos_out:	destination offset
  * @len:	length in bytes to be copied
@@ -196,6 +183,7 @@ static void blkdev_copy_offload_src_endio(struct bio *bio)
  * @private:	endio function will be called with this private data,
  *		for synchronous operation this should be NULL
  * @gfp_mask:	memory allocation flags (for bio_alloc)
+ * @bdev_out:	destination block device
  *
  * For synchronous operation returns the length of bytes copied or error
  * For asynchronous operation returns -EIOCBQUEUED or error
@@ -216,20 +204,44 @@ static void blkdev_copy_offload_src_endio(struct bio *bio)
 ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 			    loff_t pos_out, size_t len,
 			    void (*endio)(void *, int, ssize_t),
-			    void *private, gfp_t gfp)
+			    void *private, gfp_t gfp, struct block_device *bdev_out)
 {
 	struct blkdev_copy_io *cio;
 	struct blkdev_copy_offload_io *offload_io;
 	struct bio *src_bio, *dst_bio;
 	size_t rem, chunk;
-	size_t max_copy_bytes = bdev_max_copy_sectors(bdev) << SECTOR_SHIFT;
 	ssize_t ret;
 	struct blk_plug plug;
+	int is_mq = 0;
+	size_t max_copy_bytes = min(bdev_max_copy_sectors(bdev) << SECTOR_SHIFT,
+	    bdev_max_copy_sectors(bdev_out) << SECTOR_SHIFT);
 
 	if (!max_copy_bytes)
 		return -EOPNOTSUPP;
 
-	ret = blkdev_copy_sanity_check(bdev, pos_in, bdev, pos_out, len);
+	if (queue_is_mq(bdev->bd_queue)) {
+		if (bdev->bd_queue->mq_ops != bdev_out->bd_queue->mq_ops)
+			return -EOPNOTSUPP;
+		is_mq = 1;
+	} else if (!bdev->bd_disk->fops->submit_bio ||
+	    bdev->bd_disk->fops->submit_bio != bdev_out->bd_disk->fops->submit_bio) {
+			return -EOPNOTSUPP;
+	}
+
+	/*
+	 * Single queue only supported for zvols
+	 */
+	if (!is_mq && strncmp(bdev->bd_disk->disk_name, "zd", 2))
+		return -EOPNOTSUPP;
+
+	/*
+	 * Cross device copy only supported for zvols
+	 */
+	if (bdev != bdev_out && strncmp(bdev_out->bd_disk->disk_name, "zd", 2))
+		return -EOPNOTSUPP;
+
+	ret = blkdev_copy_sanity_check(bdev, pos_in, bdev_out, pos_out, len);
+
 	if (ret)
 		return ret;
 
@@ -258,6 +270,7 @@ ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 		 * successful copy length
 		 */
 		offload_io->offset = len - rem;
+		offload_io->driver_private = bdev_out->bd_queue->queuedata;
 
 		dst_bio = bio_alloc(bdev, 0, REQ_OP_COPY_DST, gfp);
 		if (!dst_bio)
@@ -265,18 +278,24 @@ ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 		dst_bio->bi_iter.bi_size = chunk;
 		dst_bio->bi_iter.bi_sector = pos_out >> SECTOR_SHIFT;
 
-		blk_start_plug(&plug);
-		src_bio = blk_next_bio(dst_bio, bdev, 0, REQ_OP_COPY_SRC, gfp);
+		if (is_mq) {
+			blk_start_plug(&plug);
+			src_bio = blk_next_bio(dst_bio, bdev, 0, REQ_OP_COPY_SRC, gfp);
+		} else {
+			src_bio = bio_alloc(bdev, 0, REQ_OP_COPY_SRC, gfp);
+		}
 		if (!src_bio)
 			goto err_free_dst_bio;
 		src_bio->bi_iter.bi_size = chunk;
 		src_bio->bi_iter.bi_sector = pos_in >> SECTOR_SHIFT;
 		src_bio->bi_end_io = blkdev_copy_offload_src_endio;
 		src_bio->bi_private = offload_io;
+		offload_io->dst_bio = (is_mq) ? NULL : dst_bio;
 
 		atomic_inc(&cio->refcount);
 		submit_bio(src_bio);
-		blk_finish_plug(&plug);
+		if (is_mq)
+			blk_finish_plug(&plug);
 		pos_in += chunk;
 		pos_out += chunk;
 	}
@@ -289,6 +308,8 @@ ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 	return blkdev_copy_wait_for_completion_io(cio);
 
 err_free_dst_bio:
+	if (is_mq)
+		blk_finish_plug(&plug);
 	bio_put(dst_bio);
 err_free_offload_io:
 	kfree(offload_io);
