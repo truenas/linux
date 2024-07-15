@@ -434,9 +434,8 @@ write_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 
 	if (total_written < le64_to_cpu(info.EndOfFile)) {
 		int err;
-		__le64 eof = cpu_to_le64(total_written);
 		err = SMB2_set_eof(xid, tcon, fid.persistent_fid,
-		    fid.volatile_fid, current->tgid, &eof);
+		    fid.volatile_fid, current->tgid, total_written);
 	}
 
 	server->ops->close(xid, tcon, &fid);
