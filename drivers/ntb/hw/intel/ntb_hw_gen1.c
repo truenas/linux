@@ -1778,7 +1778,6 @@ static int intel_ntb_init_pci(struct intel_ntb_dev *ndev, struct pci_dev *pdev)
 	return 0;
 
 err_mmio:
-err_dma_mask:
 	pci_release_regions(pdev);
 err_pci_regions:
 	pci_disable_device(pdev);
