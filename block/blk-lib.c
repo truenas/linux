@@ -239,10 +239,15 @@ ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
 	ssize_t ret;
 	struct blk_plug plug;
 
-	if (!max_copy_bytes || bdev->bd_queue->mq_ops == NULL)
+	if (!max_copy_bytes || bdev->bd_queue->mq_ops == NULL ||
+	    bdev->bd_queue->mq_ops != bdev_out->bd_queue->mq_ops)
 		return -EOPNOTSUPP;
 
 	ret = blkdev_copy_sanity_check(bdev, pos_in, bdev, pos_out, len);
+
+	if (ret == 0)
+		ret = blkdev_copy_sanity_check(bdev_out, pos_in, bdev, pos_out, len);
+
 	if (ret)
 		return ret;
 
