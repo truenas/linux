@@ -53,7 +53,7 @@
 /*
  * Macros for sanity checks related to XDR and ACL buffer sizes
  */
-#define NFS41ACL_MAX_ENTRIES	128
+#define NFS41ACL_MAX_ENTRIES	1024
 #define ACE4SIZE                (NACE41_LEN * sizeof(u32))
 #define XDRBASE                 (2 * sizeof (u32))
 
