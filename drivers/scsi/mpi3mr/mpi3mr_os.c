@@ -4896,11 +4896,435 @@ out:
 	return retval;
 }
 
+static long mpi3mr_process_nvme_cmd(struct mpi3mr_ioc *mrioc, struct mpi3_nvme_kencap *kencap) {
+	struct mpi3_request_header *mpi_header = NULL;
+	long rval = -EINVAL;
+	u8 nvme_fmt = 0;
+	u8 *mpi_req = kzalloc(MPI3MR_ADMIN_REQ_FRAME_SZ, GFP_KERNEL);
+	if (!mpi_req)
+		return -ENOMEM;
+	mpi_header = (struct mpi3_request_header *)mpi_req;
+	memcpy(mpi_req, kencap->nvme_encap_rqst, sizeof(struct mpi3_nvme_encapsulated_request));
+	struct mpi3mr_buf_map *drv_buf = NULL;
+	drv_buf = kzalloc(sizeof(*drv_buf), GFP_KERNEL);
+	if (kencap->size) {
+		drv_buf->data_dir = kencap->dir;
+		drv_buf->kern_buf_len = kencap->size;
+		drv_buf->kern_buf = dma_alloc_coherent(&mrioc->pdev->dev,
+				drv_buf->kern_buf_len, &drv_buf->kern_buf_dma,
+		    GFP_KERNEL);
+		if (drv_buf->data_dir == DMA_TO_DEVICE)
+			memcpy(drv_buf->kern_buf, kencap->dbuf, kencap->size);
+	}
+
+	if (mutex_lock_interruptible(&mrioc->bsg_cmds.mutex)) {
+		rval = -ERESTARTSYS;
+		goto out;
+	}
+	if (mrioc->bsg_cmds.state & MPI3MR_CMD_PENDING) {
+		rval = -EAGAIN;
+		dprint_bsg_err(mrioc, "%s: command is in use\n", __func__);
+		mutex_unlock(&mrioc->bsg_cmds.mutex);
+		goto out;
+	}
+	if (mrioc->unrecoverable) {
+		dprint_bsg_err(mrioc, "%s: unrecoverable controller\n",
+		    __func__);
+		rval = -EFAULT;
+		mutex_unlock(&mrioc->bsg_cmds.mutex);
+		goto out;
+	}
+	if (mrioc->reset_in_progress) {
+		dprint_bsg_err(mrioc, "%s: reset in progress\n", __func__);
+		rval = -EAGAIN;
+		mutex_unlock(&mrioc->bsg_cmds.mutex);
+		goto out;
+	}
+	if (mrioc->stop_bsgs) {
+		dprint_bsg_err(mrioc, "%s: bsgs are blocked\n", __func__);
+		rval = -EAGAIN;
+		mutex_unlock(&mrioc->bsg_cmds.mutex);
+		goto out;
+	}
+	if (mpi_header->function == MPI3_BSG_FUNCTION_NVME_ENCAPSULATED) {
+		nvme_fmt = mpi3mr_get_nvme_data_fmt(
+			(struct mpi3_nvme_encapsulated_request *)mpi_req);
+		if (nvme_fmt == MPI3MR_NVME_DATA_FORMAT_PRP) {
+			if (mpi3mr_build_nvme_prp(mrioc,
+			    (struct mpi3_nvme_encapsulated_request *)mpi_req,
+				drv_buf, 1)) {
+				rval = -ENOMEM;
+				mutex_unlock(&mrioc->bsg_cmds.mutex);
+				goto out;
+			}
+		} else if (nvme_fmt == MPI3MR_NVME_DATA_FORMAT_SGL1 ||
+			nvme_fmt == MPI3MR_NVME_DATA_FORMAT_SGL2) {
+			if (mpi3mr_build_nvme_sgl(mrioc,
+			    (struct mpi3_nvme_encapsulated_request *)mpi_req,
+				drv_buf, 1)) {
+				rval = -EINVAL;
+				mutex_unlock(&mrioc->bsg_cmds.mutex);
+				goto out;
+			}
+		} else {
+			dprint_bsg_err(mrioc,
+			    "%s:invalid NVMe command format\n", __func__);
+			rval = -EINVAL;
+			mutex_unlock(&mrioc->bsg_cmds.mutex);
+			goto out;
+		}
+	}
+	mrioc->bsg_cmds.state = MPI3MR_CMD_PENDING;
+	mrioc->bsg_cmds.is_waiting = 1;
+	mrioc->bsg_cmds.callback = NULL;
+	mrioc->bsg_cmds.is_sense = 0;
+	mrioc->bsg_cmds.sensebuf = NULL;
+	memset(mrioc->bsg_cmds.reply, 0, mrioc->reply_sz);
+	mpi_header->host_tag = cpu_to_le16(MPI3MR_HOSTTAG_BSG_CMDS);
+	init_completion(&mrioc->bsg_cmds.done);
+	rval = mpi3mr_admin_request_post(mrioc, mpi_req,
+	    MPI3MR_ADMIN_REQ_FRAME_SZ, 0);
+	if (rval) {
+		mrioc->bsg_cmds.is_waiting = 0;
+		dprint_bsg_err(mrioc,
+		    "%s: posting bsg request is failed\n", __func__);
+		rval = -EAGAIN;
+		goto out_unlock;
+	}
+	wait_for_completion_timeout(&mrioc->bsg_cmds.done,
+	    (120 * HZ));
+	if (mrioc->prp_list_virt) {
+		dma_free_coherent(&mrioc->pdev->dev, mrioc->prp_sz,
+		    mrioc->prp_list_virt, mrioc->prp_list_dma);
+		mrioc->prp_list_virt = NULL;
+	}
+	if (drv_buf->data_dir == DMA_FROM_DEVICE) {
+		memcpy(kencap->dbuf,
+				drv_buf->kern_buf, drv_buf->kern_buf_len);
+	}
+out_unlock:
+	mrioc->bsg_cmds.is_sense = 0;
+	mrioc->bsg_cmds.sensebuf = NULL;
+	mrioc->bsg_cmds.state = MPI3MR_CMD_NOTUSED;
+	mutex_unlock(&mrioc->bsg_cmds.mutex);
+out:
+	if (drv_buf->kern_buf && drv_buf->kern_buf_dma)
+		dma_free_coherent(&mrioc->pdev->dev,
+			drv_buf->kern_buf_len,
+			drv_buf->kern_buf,
+			drv_buf->kern_buf_dma);
+	kfree(drv_buf);
+	return rval;
+}
+
+
+/**
+ * mpi3_nvme_submit_command - submit NVME encapsulated command
+ * @ioc: per adapter object
+ * @cmd: NVME Command
+ * @ubuf: user buffer
+ * @kbuf: kernel Buffer
+ * @buf_len: buffer Length
+ * @result: cqe result
+ * @is_admin: admin or IO command
+ * @handle: to distinguish target NVME device
+ * @port_num: port number
+ */
+static int mpi3_nvme_submit_command(struct mpi3mr_ioc *ioc,
+	struct nvme_command cmd, u64 ubuf, void *kbuf, u32 buf_len,
+	u64 *result, int is_admin, u16 handle)
+{
+	struct mpi3_nvme_kencap kencap;
+	struct nvme_completion cqe;
+	int ret;
+	struct mpi3_nvme_encapsulated_request *nvme_encap_request = kzalloc(sizeof(cmd) + \
+	    sizeof(struct mpi3_nvme_encapsulated_request), GFP_KERNEL);
+
+	if (!nvme_encap_request)
+		return (-ENOMEM);
+
+	memset(&cqe, 0, sizeof(cqe));
+	memset(&kencap, 0, sizeof(kencap));
+
+	/*
+	 * data_sge_offset refers to the size of both NVME Encpasulated request
+	 * header plus the NVME command in words. data_sge_offset name is a bit
+	 * misleading for NVME Encpasulated request since PRP buffers will be
+	 * allocated by DMA.
+	 */
+
+	/*
+	 * We can set reply_buf to MPI26_NVME_FLAGS_READ but not required
+	 */
+	kencap.reply_buf = NULL;
+
+	/*
+	 * Firmware writes CQE to sense_buf
+	 */
+	kencap.sense_buf =  &cqe;
+	kencap.nvme_encap_rqst = nvme_encap_request;
+	nvme_encap_request->function = MPI3_BSG_FUNCTION_NVME_ENCAPSULATED;
+	nvme_encap_request->data_length = buf_len;
+	nvme_encap_request->encapsulated_command_length = sizeof(cmd);
+	nvme_encap_request->dev_handle = handle;
+	memcpy((u8*) nvme_encap_request + offsetof(struct mpi3_nvme_encapsulated_request,
+		command), &cmd, sizeof(cmd));
+
+	if (is_admin) {
+		nvme_encap_request->flags = MPI3_NVME_FLAGS_SUBMISSIONQ_ADMIN | \
+			MPI3_NVME_FLAGS_FORCE_ADMIN_ERR_REPLY_ALL;
+	}
+
+	if (buf_len && (ubuf || kbuf)) {
+
+		/* Write opcode */
+		if (cmd.common.opcode & 0x1) {
+			if (ubuf) {
+				if (copy_from_user(kencap.dbuf, (void __user *) ubuf, buf_len)) {
+					return (-EFAULT);
+				}
+			} else {
+				memcpy(&kencap.dbuf, kbuf, buf_len);
+			}
+			kencap.size = buf_len;
+			/*
+			 * Should flag read/write flag. Need to check datasheet.
+			 */
+//			nvme_encap_request->flags |= ;
+		} else if (cmd.common.opcode & 0x2) {
+			kencap.size = buf_len;
+			/*
+			 * Should flag read/write flag. Need to check datasheet.
+			 */
+//			nvme_encap_request->flags |= ;
+		}
+	}
+
+	/*
+	 * pci_access_mutex lock acquired by ioctl path
+	 */
+	spin_lock(&ioc->admin_req_lock);
+	ret = mpi3mr_process_nvme_cmd(ioc, &kencap);
+	spin_unlock(&ioc->admin_req_lock);
+
+	if (ret)
+		return (ret);
+
+	ret = cqe.status >> 1;
+
+	if (result)
+		*result = le64_to_cpu(cqe.result.u64);
+
+	kfree(nvme_encap_request);
+	return (ret);
+}
+/**
+ * mpi3_nvme_user_cmd - submits NVME command request from userspace
+ * @sdev: pointer to SCSI device
+ * @ucmd: user space command
+ * @is_admin: admin or IO command
+ */
+int mpi3_nvme_user_cmd(struct scsi_device *sdev, struct nvme_passthru_cmd __user *ucmd,
+    int is_admin)
+{
+	struct Scsi_Host *shost = sdev->host;
+	struct mpi3mr_ioc *ioc = shost_priv(shost);
+	struct mpi3mr_sdev_priv_data *sdev_priv_data = sdev->hostdata;
+	struct mpi3mr_stgt_priv_data *sas_target_priv_data = sdev_priv_data->tgt_priv_data;
+	struct mpi3mr_tgt_dev *tgt_dev;
+	struct nvme_passthru_cmd cmd;
+	struct nvme_command encap_cmd;
+	u32 effects = NVME_CMD_EFFECTS_CSUPP;
+	u64	result = 0;
+	int	ret = 0;
+
+	if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
+		return (-EFAULT);
+
+	if (cmd.flags)
+		return (-EINVAL);
+
+	/*
+	 * Metadata is not supported according to MPI 2.6 specs
+	 */
+	if (cmd.metadata_len > 0)
+		return (-EOPNOTSUPP);
+
+	tgt_dev = mpi3mr_get_tgtdev_by_handle(ioc, sas_target_priv_data->dev_handle);
+
+
+	if ((tgt_dev->dev_spec.pcie_inf.dev_info &
+	    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_MASK) !=
+	    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_NVME_DEVICE) {
+		return (-ENXIO);
+	}
+	/*
+	 * pci_access_mutex lock should already take care of
+	 * NVME_CMD_EFFECTS_CSE_MASK and other effects are related
+	 * to the namespace management, which isn't supported
+	 */
+	if (!(effects & NVME_CMD_EFFECTS_CSUPP))
+		return (-EOPNOTSUPP);
+
+	memset(&encap_cmd, 0, sizeof(encap_cmd));
+	encap_cmd.common.opcode = cmd.opcode;
+	encap_cmd.common.flags = cmd.flags;
+	encap_cmd.common.nsid = cpu_to_le32(cmd.nsid);
+	encap_cmd.common.cdw2[0] = cpu_to_le32(cmd.cdw2);
+	encap_cmd.common.cdw2[1] = cpu_to_le32(cmd.cdw3);
+	encap_cmd.common.cdw10 = cpu_to_le32(cmd.cdw10);
+	encap_cmd.common.cdw11 = cpu_to_le32(cmd.cdw11);
+	encap_cmd.common.cdw12 = cpu_to_le32(cmd.cdw12);
+	encap_cmd.common.cdw13 = cpu_to_le32(cmd.cdw13);
+	encap_cmd.common.cdw14 = cpu_to_le32(cmd.cdw14);
+	encap_cmd.common.cdw15 = cpu_to_le32(cmd.cdw15);
+	ret = mpi3_nvme_submit_command(ioc, encap_cmd, cmd.addr, NULL, cmd.data_len,
+	    &result, is_admin, tgt_dev->dev_handle);
+
+	if (ret >= 0) {
+		if (put_user(result, &ucmd->result))
+			return (-EFAULT);
+	}
+
+	return (ret);
+}
+
+
+/**
+ * mpi3_nvme_user_cmd64 - submits NVME command request from userspace
+ * @sdev: pointer to SCSI device
+ * @ucmd: user space command
+ * @is_admin: admin or IO command
+ */
+int mpi3_nvme_user_cmd64(struct scsi_device *sdev, struct nvme_passthru_cmd64 __user *ucmd,
+    int is_admin)
+{
+	struct Scsi_Host *shost = sdev->host;
+	struct mpi3mr_ioc *ioc = shost_priv(shost);
+	struct mpi3mr_sdev_priv_data *sdev_priv_data = sdev->hostdata;
+	struct mpi3mr_stgt_priv_data *sas_target_priv_data = sdev_priv_data->tgt_priv_data;
+	struct mpi3mr_tgt_dev *tgt_dev;
+	struct nvme_passthru_cmd cmd;
+	struct nvme_command encap_cmd;
+	u32 effects = NVME_CMD_EFFECTS_CSUPP;
+	u64	result = 0;
+	int	ret = 0;
+	if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
+		return (-EFAULT);
+
+	if (cmd.flags)
+		return (-EINVAL);
+
+	/*
+	 * Metadata is not supported according to MPI 2.6 specs
+	 */
+	if (cmd.metadata_len > 0)
+		return (-EOPNOTSUPP);
+
+	tgt_dev = mpi3mr_get_tgtdev_by_handle(ioc, sas_target_priv_data->dev_handle);
+
+
+	if ((tgt_dev->dev_spec.pcie_inf.dev_info &
+	    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_MASK) !=
+	    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_NVME_DEVICE) {
+		return (-ENXIO);
+	}
+
+	/*
+	 * pci_access_mutex lock should already take care of
+	 * NVME_CMD_EFFECTS_CSE_MASK and other effects are related
+	 * to the namespace management, which isn't supported
+	 */
+	if (!(effects & NVME_CMD_EFFECTS_CSUPP))
+		return (-EOPNOTSUPP);
+
+	memset(&encap_cmd, 0, sizeof(encap_cmd));
+	encap_cmd.common.opcode = cmd.opcode;
+	encap_cmd.common.flags = cmd.flags;
+	encap_cmd.common.nsid = cpu_to_le32(cmd.nsid);
+	encap_cmd.common.cdw2[0] = cpu_to_le32(cmd.cdw2);
+	encap_cmd.common.cdw2[1] = cpu_to_le32(cmd.cdw3);
+	encap_cmd.common.cdw10 = cpu_to_le32(cmd.cdw10);
+	encap_cmd.common.cdw11 = cpu_to_le32(cmd.cdw11);
+	encap_cmd.common.cdw12 = cpu_to_le32(cmd.cdw12);
+	encap_cmd.common.cdw13 = cpu_to_le32(cmd.cdw13);
+	encap_cmd.common.cdw14 = cpu_to_le32(cmd.cdw14);
+	encap_cmd.common.cdw15 = cpu_to_le32(cmd.cdw15);
+	ret = mpi3_nvme_submit_command(ioc, encap_cmd, cmd.addr, NULL, cmd.data_len,
+	    &result, is_admin, tgt_dev->dev_handle);
+
+	if (ret >= 0) {
+		if (put_user(result, &ucmd->result))
+			return (-EFAULT);
+	}
+
+	return (ret);
+}
+
+
+/**
+ * mpi3mr_scsih_ioctl() - IOCTL handler for driver
+ * @sdev: SCSI device associated with LUN.
+ * @cmd: IOCTL command.
+ * @arg: userspace ioctl data structure.
+ *
+ * This interface is used to emulate NVME functionality for the drives
+ * connected on Trimode HBA. Userspace tools can talk to NVME device
+ * through passthrough commands, e.g., nvme-cli can identify controller
+ * through `nvme id-ctrl /dev/sdX`.
+ *
+ * Return: 0 on success, -errno on failure
+ */
+int mpi3mr_scsih_ioctl(struct scsi_device *sdev, unsigned int cmd, void __user *arg)
+{
+	if (/*scsih_is_nvme(&sdev->sdev_gendev)*/1) {
+		switch (cmd) {
+		case NVME_IOCTL_ID:
+			/*
+			 * Devices are only reported for NSID 1
+			 */
+			return (1);
+		case NVME_IOCTL_ADMIN_CMD:
+			return (mpi3_nvme_user_cmd(sdev, arg, 1));
+		case NVME_IOCTL_ADMIN64_CMD:
+			return (mpi3_nvme_user_cmd64(sdev, arg, 1));
+		case NVME_IOCTL_IO_CMD:
+			return (mpi3_nvme_user_cmd(sdev, arg, 0));
+		case NVME_IOCTL_IO64_CMD:
+			return (mpi3_nvme_user_cmd64(sdev, arg, 0));
+
+		/*
+		 * NVME_IOCTL_SUBMIT_IO requires the `lba_shift` parameter
+		 * from the namespace to calculate the number of blocks.
+		 * We can obtain the namespace capabilities in the same way
+		 * we retrieve effect logs. Since it's a specific interface
+		 * for read/write operations, we may consider supporting it
+		 * in the future if it is deemed necessary.
+		 */
+		case NVME_IOCTL_SUBMIT_IO:
+		case NVME_IOCTL_IO64_CMD_VEC:
+		case NVME_IOCTL_RESCAN:
+		case NVME_IOCTL_RESET:
+		case NVME_IOCTL_SUBSYS_RESET:
+		case NVME_URING_CMD_IO:
+		case NVME_URING_CMD_IO_VEC:
+		case NVME_URING_CMD_ADMIN:
+		case NVME_URING_CMD_ADMIN_VEC:
+			return (-EOPNOTSUPP);
+		}
+	}
+	return (-EINVAL);
+}
+
 static const struct scsi_host_template mpi3mr_driver_template = {
 	.module				= THIS_MODULE,
 	.name				= "MPI3 Storage Controller",
 	.proc_name			= MPI3MR_DRIVER_NAME,
 	.queuecommand			= mpi3mr_qcmd,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl			= mpi3mr_scsih_ioctl,
+#endif
+	.ioctl				= mpi3mr_scsih_ioctl,
 	.target_alloc			= mpi3mr_target_alloc,
 	.slave_alloc			= mpi3mr_slave_alloc,
 	.slave_configure		= mpi3mr_slave_configure,

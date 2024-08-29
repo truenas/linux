@@ -636,7 +636,7 @@ static void mpi3mr_bsg_build_sgl(u8 *mpi_req, uint32_t sgl_offset,
  *
  * Return: Data format of the NVMe command (PRP/SGL etc)
  */
-static unsigned int mpi3mr_get_nvme_data_fmt(
+unsigned int mpi3mr_get_nvme_data_fmt(
 	struct mpi3_nvme_encapsulated_request *nvme_encap_request)
 {
 	u8 format = 0;
@@ -659,7 +659,7 @@ static unsigned int mpi3mr_get_nvme_data_fmt(
  *
  * Return: 0 on success, -1 on failure
  */
-static int mpi3mr_build_nvme_sgl(struct mpi3mr_ioc *mrioc,
+int mpi3mr_build_nvme_sgl(struct mpi3mr_ioc *mrioc,
 	struct mpi3_nvme_encapsulated_request *nvme_encap_request,
 	struct mpi3mr_buf_map *drv_bufs, u8 bufcnt)
 {
@@ -718,7 +718,7 @@ static int mpi3mr_build_nvme_sgl(struct mpi3mr_ioc *mrioc,
  *
  * Return: 0 on success, -1 on failure
  */
-static int mpi3mr_build_nvme_prp(struct mpi3mr_ioc *mrioc,
+int mpi3mr_build_nvme_prp(struct mpi3mr_ioc *mrioc,
 	struct mpi3_nvme_encapsulated_request *nvme_encap_request,
 	struct mpi3mr_buf_map *drv_bufs, u8 bufcnt)
 {
