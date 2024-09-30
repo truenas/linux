@@ -363,6 +363,50 @@ static int blkdev_pr_clear(struct block_device *bdev, blk_mode_t mode,
 	return ops->pr_clear(bdev, c.key);
 }
 
+static int blkdev_pr_read_keys(struct block_device *bdev, blk_mode_t mode,
+	struct pr_keys __user *argp)
+{
+	const struct pr_ops *ops = bdev->bd_disk->fops->pr_ops;
+	struct pr_keys k;
+	int err;
+
+	if (!blkdev_pr_allowed(bdev, mode))
+		return -EPERM;
+	if (!ops || !ops->pr_read_keys)
+		return -EOPNOTSUPP;
+	if (copy_from_user(&k, argp, sizeof(k)))
+		return -EFAULT;
+
+	err = ops->pr_read_keys(bdev, &k);
+	if (err == 0) {
+		if (copy_to_user(argp, &k, sizeof(k)))
+			err = -EFAULT;
+	}
+	return err;
+}
+
+static int blkdev_pr_read_reservation(struct block_device *bdev,
+	 blk_mode_t mode, struct pr_held_reservation __user *argp)
+{
+	const struct pr_ops *ops = bdev->bd_disk->fops->pr_ops;
+	struct pr_held_reservation r;
+	int err;
+
+	if (!blkdev_pr_allowed(bdev, mode))
+		return -EPERM;
+	if (!ops || !ops->pr_read_reservation)
+		return -EOPNOTSUPP;
+	if (copy_from_user(&r, argp, sizeof(r)))
+		return -EFAULT;
+
+	err = ops->pr_read_reservation(bdev, &r);
+	if (err == 0) {
+		if (copy_to_user(argp, &r, sizeof(r)))
+			err = -EFAULT;
+	}
+	return err;
+}
+
 static int blkdev_flushbuf(struct block_device *bdev, unsigned cmd,
 		unsigned long arg)
 {
@@ -571,6 +615,10 @@ static int blkdev_common_ioctl(struct block_device *bdev, blk_mode_t mode,
 		return blkdev_pr_preempt(bdev, mode, argp, true);
 	case IOC_PR_CLEAR:
 		return blkdev_pr_clear(bdev, mode, argp);
+	case IOC_PR_READ_KEYS:
+		return blkdev_pr_read_keys(bdev, mode, argp);
+	case IOC_PR_READ_RESV:
+		return blkdev_pr_read_reservation(bdev, mode, argp);
 	default:
 		return -ENOIOCTLCMD;
 	}

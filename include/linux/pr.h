@@ -4,18 +4,6 @@
 
 #include <uapi/linux/pr.h>
 
-struct pr_keys {
-	u32	generation;
-	u32	num_keys;
-	u64	keys[];
-};
-
-struct pr_held_reservation {
-	u64		key;
-	u32		generation;
-	enum pr_type	type;
-};
-
 struct pr_ops {
 	int (*pr_register)(struct block_device *bdev, u64 old_key, u64 new_key,
 			u32 flags);
