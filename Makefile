@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0
 VERSION = 6
 PATCHLEVEL = 6
-SUBLEVEL = 44
-NAME = Hurr durr I'ma ninja sloth
+SUBLEVEL = 57
+NAME = Pinguïn Aangedreven
 
 ifndef EXTRAVERSION
 EXTRAVERSION = -production
