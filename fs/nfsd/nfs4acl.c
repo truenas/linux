@@ -37,14 +37,11 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/posix_acl.h>
-#include <linux/xattr.h>
 
 #include "nfsfh.h"
 #include "nfsd.h"
 #include "acl.h"
 #include "vfs.h"
-#include "../nfs_common/nfs41acl_xdr.h"
-#include <linux/nfsacl.h>	/* For convert_nfs41xdr_to_nfs40_acl and generate_nfs41acl_buf */
 
 #define NFS4_ACL_TYPE_DEFAULT	0x01
 #define NFS4_ACL_DIR		0x02
@@ -128,8 +125,8 @@ static short ace2type(struct nfs4_ace *);
 static void _posix_to_nfsv4_one(struct posix_acl *, struct nfs4_acl *,
 				unsigned int);
 
-static int
-get_nfs4_posix_acl(struct svc_rqst *rqstp, struct dentry *dentry,
+int
+nfsd4_get_nfs4_acl(struct svc_rqst *rqstp, struct dentry *dentry,
 		struct nfs4_acl **acl)
 {
 	struct inode *inode = d_inode(dentry);
@@ -177,121 +174,6 @@ out:
 rel_pacl:
 	posix_acl_release(pacl);
 	return error;
-}
-
-static int
-get_nfs4_nfsv41xdr_acl(struct svc_rqst *rqstp, struct dentry *dentry,
-		struct nfs4_acl **pacl, enum nfs4_acl_type acl_type)
-{
-	int error = 0;
-	u32 ace_cnt, acl_flag = 0;
-	u32 *xdr_buf = NULL, *p;
-	struct nfs4_acl *acl = NULL;
-	ssize_t len;
-	size_t xdr_buf_sz = ACES_TO_XDRSIZE(NFS41ACL_MAX_ENTRIES);
-
-	xdr_buf = kzalloc(xdr_buf_sz, GFP_KERNEL);
-	if (!xdr_buf)
-		return -ENOMEM;
-
-	len = vfs_getxattr(&nop_mnt_idmap, dentry, NA41_NAME, xdr_buf, xdr_buf_sz);
-	if (len == 0) {
-		error = -EOPNOTSUPP;
-		goto out;
-	}
-
-	if (len < 0) {
-		switch (len) {
-		case -EOPNOTSUPP:
-			/* ZFS says NFSv4 ACLs not supported */
-			error = -EOPNOTSUPP;
-			goto out;
-		case -EINVAL:
-			/* ZFS unhappy with buffer size */
-			error = -EINVAL;
-			goto out;
-		case -ERANGE:
-			/* our buffer is too small. This is _very_ unexpected */
-			error = -EINVAL;
-			goto out;
-		case -EPERM:
-		case -EACCES:
-			error = -EPERM;
-			goto out;
-		default:
-			error = -ENOMEM;
-			goto out;
-		}
-	}
-
-	BUG_ON(!(XDRSIZE_IS_VALID(len)));
-
-	switch (acl_type) {
-	case NFS4ACL_ACL:
-		/*
-		 * Only NFS 4.0 (RFC 3530) ACLs are to be exported here by the NFS
-		 * server, and so the ACL-wide flags are ignored when generating the
-		 * internal NFS server ACL.
-		 */
-		p = xdr_buf + 1;
-		break;
-
-	case NFS4ACL_DACL:
-	case NFS4ACL_SACL:
-		/*
-		 * When we read the vsa_aclflags from the xattr there are some
-		 * values that are not supported by NFS (e.g. ACL_IS_DIR).Mask
-		 * them out.
-		 *
-		 * Fortunately, ACL4_AUTO_INHERIT, ACL4_PROTECTED and
-		 * ACL4_DEFAULTED have the same values as the ZFS equivalents
-		 * (ACL_AUTO_INHERIT, ACL_PROTECTED, ACL_DEFAULTED) so no
-		 * value mapping is required.
-		 */
-		p = xdr_buf;
-		acl_flag = ntohl(*(p++)) & (ACL4_AUTO_INHERIT | ACL4_PROTECTED | ACL4_DEFAULTED);
-		break;
-
-	default:
-		/* Should never happen */
-		error = -EINVAL;
-		goto out;
-	}
-
-	ace_cnt = ntohl(*(p++));
-	if (ace_cnt > NFS41ACL_MAX_ENTRIES) {
-		error = -ERANGE;
-		goto out;
-	}
-
-	acl = kzalloc(nfs4_acl_bytes(ace_cnt), GFP_KERNEL);
-	if (!acl) {
-		error = -ENOMEM;
-		goto out;
-	}
-	acl->naces = ace_cnt;
-	acl->flag = acl_flag;
-
-	error = convert_nfs41xdr_to_nfs40_acl(p++, len - (2 * sizeof(u32)), acl);
-	if (error)
-		kfree(acl);
-	else
-		*pacl = acl;
-out:
-	kfree(xdr_buf);
-	return (error);
-}
-
-int
-nfsd4_get_nfs4_acl(struct svc_rqst *rqstp, struct dentry *dentry,
-		struct nfs4_acl **acl, enum nfs4_acl_type acl_type)
-{
-	struct inode *inode = d_inode(dentry);
-
-	if (IS_NFSV4ACL(inode))
-		return get_nfs4_nfsv41xdr_acl(rqstp, dentry, acl, acl_type);
-	else
-		return get_nfs4_posix_acl(rqstp, dentry, acl);
 }
 
 struct posix_acl_summary {
@@ -893,87 +775,24 @@ out_estate:
 	return ret;
 }
 
-static __be32
-nfsd4_acl_to_attr_posix(enum nfs_ftype4 type, struct nfs4_acl *acl,
-			fsacl_t *fsaclp)
+__be32 nfsd4_acl_to_attr(enum nfs_ftype4 type, struct nfs4_acl *acl,
+			 struct nfsd_attrs *attr)
 {
 	int host_error;
 	unsigned int flags = 0;
 
 	if (!acl)
 		return nfs_ok;
+
 	if (type == NF4DIR)
 		flags = NFS4_ACL_DIR;
 
-	host_error = nfs4_acl_nfsv4_to_posix(acl, &fsaclp->posixacl.na_pacl,
-					     &fsaclp->posixacl.na_dpacl, flags);
+	host_error = nfs4_acl_nfsv4_to_posix(acl, &attr->na_pacl,
+					     &attr->na_dpacl, flags);
 	if (host_error == -EINVAL)
 		return nfserr_attrnotsupp;
 	else
 		return nfserrno(host_error);
-}
-
-static __be32
-nfsd4_acl_to_attr_zfsacl(enum nfs_ftype4 type, struct nfs4_acl *acl,
-			 fsacl_t *fsaclp)
-{
-	int error;
-	u32 *xdr_buf = NULL;
-	size_t len;
-
-	if (!acl)
-		return nfs_ok;
-
-	if (acl->naces > NFS41ACL_MAX_ENTRIES)
-		return nfserrno(-ERANGE);
-
-	else if (acl->naces == 0)
-		return nfserrno(-EINVAL);
-
-	len = ACES_TO_XDRSIZE(acl->naces);
-
-	xdr_buf = kzalloc(len, GFP_KERNEL);
-	if (!xdr_buf)
-		return nfserrno(-ENOMEM);
-
-	error = generate_nfs41acl_buf(xdr_buf, acl, type == NF4DIR);
-	if (error) {
-		kfree(xdr_buf);
-		return nfserrno(error);
-	}
-
-	fsaclp->zfsacl.aclbuf = xdr_buf;
-	fsaclp->zfsacl.sz = len;
-
-	return nfs_ok;
-}
-
-static __be32
-nfsd4_acl_to_attr_fail(enum nfs_ftype4 type, struct nfs4_acl *acl,
-		       fsacl_t *fsaclp)
-{
-	if (!acl)
-		return nfs_ok;
-
-	return nfserr_attrnotsupp;
-}
-
-int
-nfsv4_set_zfacl_from_attr(struct dentry *dentry, struct nfsd_attrs *attr)
-{
-	struct inode *delegated_inode = NULL;
-	int error;
-
-retry:
-	error = __vfs_setxattr_locked(&nop_mnt_idmap, dentry, NA41_NAME,
-				      attr->na_fsacl.zfsacl.aclbuf,
-				      attr->na_fsacl.zfsacl.sz,
-				      XATTR_REPLACE, &delegated_inode);
-
-	if (delegated_inode)
-		goto retry;
-
-	return error;
 }
 
 static short
@@ -1055,21 +874,4 @@ __be32 nfs4_acl_write_who(struct xdr_stream *xdr, int who)
 	}
 	WARN_ON_ONCE(1);
 	return nfserr_serverfault;
-}
-
-void
-nfsd4_setup_attr(struct dentry *dentry, struct nfsd_attrs *attr)
-{
-	struct inode *inode = d_inode(dentry);
-
-	if (IS_NFSV4ACL(inode)) {
-		attr->na_acltype = ACL_TYPE_ZFS;
-		attr->na_conv_fn = nfsd4_acl_to_attr_zfsacl;
-	} else if (IS_POSIXACL(inode)) {
-		attr->na_acltype = ACL_TYPE_POSIX;
-		attr->na_conv_fn = nfsd4_acl_to_attr_posix;
-	} else {
-		attr->na_acltype = ACL_TYPE_NONE;
-		attr->na_conv_fn = nfsd4_acl_to_attr_fail;
-	}
 }
