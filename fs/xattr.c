@@ -669,6 +669,13 @@ int do_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return do_set_acl(idmap, dentry, ctx->kname->name,
 				  ctx->kvalue, ctx->size);
 
+#ifdef CONFIG_TRUENAS
+	if (ctx->size &&
+	    (ctx->size > XATTR_SIZE_MAX) &&
+	    (IS_LARGE_XATTR(d->d_inode) == 0)) {
+		return -E2BIG;
+	}
+#endif
 	return vfs_setxattr(idmap, dentry, ctx->kname->name,
 			ctx->kvalue, ctx->size, ctx->flags);
 }
@@ -677,17 +684,6 @@ static int path_setxattr(const char __user *pathname,
 			 const char __user *name, const void __user *value,
 			 size_t size, int flags, unsigned int lookup_flags)
 {
-#ifdef CONFIG_TRUENAS
-	if (size) {
-		if (size > XATTR_SIZE_MAX) {
-			if ((size > XATTR_LARGE_SIZE_MAX) ||
-			    (IS_LARGE_XATTR(d->d_inode) == 0)) {
-				return -E2BIG;
-			}
-		}
-	}
-#endif
-
 	struct xattr_name kname;
 	struct xattr_ctx ctx = {
 		.cvalue   = value,
