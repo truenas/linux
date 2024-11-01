@@ -672,7 +672,7 @@ int do_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
 #ifdef CONFIG_TRUENAS
 	if (ctx->size &&
 	    (ctx->size > XATTR_SIZE_MAX) &&
-	    (IS_LARGE_XATTR(d->d_inode) == 0)) {
+	    (IS_LARGE_XATTR(dentry->d_inode) == 0)) {
 		return -E2BIG;
 	}
 #endif
