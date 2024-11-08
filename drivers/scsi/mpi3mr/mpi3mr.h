@@ -49,6 +49,8 @@
 #include "mpi/mpi30_pci.h"
 #include "mpi/mpi30_tool.h"
 #include "mpi3mr_debug.h"
+#include <linux/nvme.h>
+#include <linux/nvme_ioctl.h>
 
 /* Global list and lock for storing multiple adapters managed by the driver */
 extern spinlock_t mrioc_list_lock;
@@ -1518,6 +1520,16 @@ extern const struct attribute_group *mpi3mr_dev_groups[];
 extern struct sas_function_template mpi3mr_transport_functions;
 extern struct scsi_transport_template *mpi3mr_transport_template;
 
+int mpi3mr_build_nvme_sgl(struct mpi3mr_ioc *mrioc,
+	struct mpi3_nvme_encapsulated_request *nvme_encap_request,
+	struct mpi3mr_buf_map *drv_bufs, u8 bufcnt);
+int mpi3mr_build_nvme_prp(struct mpi3mr_ioc *mrioc,
+	struct mpi3_nvme_encapsulated_request *nvme_encap_request,
+	struct mpi3mr_buf_map *drv_bufs, u8 bufcnt);
+unsigned int mpi3mr_get_nvme_data_fmt(
+	struct mpi3_nvme_encapsulated_request *nvme_encap_request);
+int mpi3mr_map_data_buffer_dma(struct mpi3mr_ioc *mrioc,
+	struct mpi3mr_buf_map *drv_buf, u16 desc_count, void *ubuf);
 int mpi3mr_cfg_get_dev_pg0(struct mpi3mr_ioc *mrioc, u16 *ioc_status,
 	struct mpi3_device_page0 *dev_pg0, u16 pg_sz, u32 form, u32 form_spec);
 int mpi3mr_cfg_get_sas_phy_pg0(struct mpi3mr_ioc *mrioc, u16 *ioc_status,
