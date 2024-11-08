@@ -1927,7 +1927,7 @@ setup_chain:
  *
  * Return: Data format of the NVMe command (PRP/SGL etc)
  */
-static unsigned int mpi3mr_get_nvme_data_fmt(
+unsigned int mpi3mr_get_nvme_data_fmt(
 	struct mpi3_nvme_encapsulated_request *nvme_encap_request)
 {
 	u8 format = 0;
@@ -1950,7 +1950,7 @@ static unsigned int mpi3mr_get_nvme_data_fmt(
  *
  * Return: 0 on success, -1 on failure
  */
-static int mpi3mr_build_nvme_sgl(struct mpi3mr_ioc *mrioc,
+int mpi3mr_build_nvme_sgl(struct mpi3mr_ioc *mrioc,
 	struct mpi3_nvme_encapsulated_request *nvme_encap_request,
 	struct mpi3mr_buf_map *drv_bufs, u8 bufcnt)
 {
@@ -2047,7 +2047,7 @@ build_sges:
  *
  * Return: 0 on success, -1 on failure
  */
-static int mpi3mr_build_nvme_prp(struct mpi3mr_ioc *mrioc,
+int mpi3mr_build_nvme_prp(struct mpi3mr_ioc *mrioc,
 	struct mpi3_nvme_encapsulated_request *nvme_encap_request,
 	struct mpi3mr_buf_map *drv_bufs, u8 bufcnt)
 {
@@ -2321,9 +2321,9 @@ err_out:
  *
  * Return: 0 on success, -1 on failure
  */
-static int mpi3mr_map_data_buffer_dma(struct mpi3mr_ioc *mrioc,
+int mpi3mr_map_data_buffer_dma(struct mpi3mr_ioc *mrioc,
 				      struct mpi3mr_buf_map *drv_buf,
-				      u16 desc_count)
+				      u16 desc_count, void *ubuf)
 {
 	u16 i, needed_desc = drv_buf->kern_buf_len / MPI3MR_IOCTL_SGE_SIZE;
 	u32 buf_len = drv_buf->kern_buf_len, copied_len = 0;
@@ -2352,9 +2352,15 @@ static int mpi3mr_map_data_buffer_dma(struct mpi3mr_ioc *mrioc,
 		memset(drv_buf->dma_desc[i].addr, 0,
 		       mrioc->ioctl_sge[desc_count].size);
 		if (drv_buf->data_dir == DMA_TO_DEVICE) {
-			memcpy(drv_buf->dma_desc[i].addr,
-			       drv_buf->bsg_buf + copied_len,
-			       drv_buf->dma_desc[i].size);
+			if (ubuf) {
+				if (copy_from_user(drv_buf->dma_desc[i].addr,
+				    ubuf + copied_len, drv_buf->dma_desc[i].size))
+					return (-EFAULT);
+			} else {
+				memcpy(drv_buf->dma_desc[i].addr,
+				    drv_buf->bsg_buf + copied_len,
+				    drv_buf->dma_desc[i].size);
+			}
 			copied_len += drv_buf->dma_desc[i].size;
 		}
 	}
@@ -2649,7 +2655,8 @@ static long mpi3mr_bsg_process_mpt_cmds(struct bsg_job *job)
 		} else {
 			if (!drv_buf_iter->kern_buf_len)
 				continue;
-			if (mpi3mr_map_data_buffer_dma(mrioc, drv_buf_iter, desc_count)) {
+			if (mpi3mr_map_data_buffer_dma(mrioc, drv_buf_iter,
+			    desc_count, NULL)) {
 				rval = -ENOMEM;
 				mutex_unlock(&mrioc->bsg_cmds.mutex);
 				dprint_bsg_err(mrioc, "%s:%d: mapping data buffers failed\n",
