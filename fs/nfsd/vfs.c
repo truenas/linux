@@ -112,6 +112,43 @@ nfserrno (int errno)
 	return nfserr_io;
 }
 
+/*
+ * Called from nfsd_cross_mnt and is used to determine
+ * whether we need to set LOOKUP_AUTOMOUNT flag.
+ *
+ * ZFSCTL_INO_SNAPDIR is defined in sys/zfs_ctldir.h
+ * and is unlikely to change. This is a hard-coded inode
+ * number for .zfs/snapshot directory in the ZFS ctldir.
+ *
+ * If we know the parent inode number is the snapdir then
+ * we also know that the current dentry is for an auto-
+ * mounted snapshot.
+ */
+#if CONFIG_TRUENAS
+static int
+is_in_zfs_snapdir(struct dentry *dentry)
+{
+#define ZFSCTL_INO_SNAPDIR 0x0000FFFFFFFFFFFDULL
+
+	struct dentry *dp = dentry->d_parent;
+	struct inode *inode = NULL;
+
+	if (dp == NULL)
+		return 0;
+
+	inode = d_inode(dp);
+	if (inode == NULL)
+		return 0;
+
+	// Currently only ZFS has large xattr support enabled.
+	if (!IS_LARGE_XATTR(inode))
+		return 0;
+
+	// The ZFS snapdir has a hard-coded inode value
+	return (inode->i_ino == ZFSCTL_INO_SNAPDIR);
+}
+#endif /* CONFIG_TRUENAS */
+
 /* 
  * Called from nfsd_lookup and encode_dirent. Check if we have crossed 
  * a mount point.
@@ -127,10 +164,20 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 	struct path path = {.mnt = mntget(exp->ex_path.mnt),
 			    .dentry = dget(dentry)};
 	unsigned int follow_flags = 0;
+	int is_snapdir = 0;
 	int err = 0;
 
 	if (exp->ex_flags & NFSEXP_CROSSMOUNT)
 		follow_flags = LOOKUP_AUTOMOUNT;
+
+#if CONFIG_TRUENAS
+	// ZFS ctldir specific handling
+	if (exp->ex_flags & NFSEXP_SNAPDIR) {
+		is_snapdir = is_in_zfs_snapdir(dentry);
+		if (is_snapdir)
+			follow_flags = LOOKUP_AUTOMOUNT;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	err = follow_down(&path, follow_flags);
 	if (err < 0)
@@ -157,7 +204,12 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 		path_put(&path);
 		goto out;
 	}
+
+#if CONFIG_TRUENAS
+	if (nfsd_v4client(rqstp) || is_snapdir ||
+#else
 	if (nfsd_v4client(rqstp) ||
+#endif /* CONFIG_TRUENAS */
 		(exp->ex_flags & NFSEXP_CROSSMOUNT) || EX_NOHIDE(exp2)) {
 		/* successfully crossed mount point */
 		/*
