@@ -118,10 +118,10 @@ nfserrno (int errno)
  *
  * ZFSCTL_INO_SNAPDIR is defined in sys/zfs_ctldir.h
  * and is unlikely to change. This is a hard-coded inode
- * number for ./zfs/snapshot directory in the ZFS ctldir.
+ * number for .zfs/snapshot directory in the ZFS ctldir.
  *
  * If we know the parent inode number is the snapdir then
- * we also know that the curent dentry is for an auto-
+ * we also know that the current dentry is for an auto-
  * mounted snapshot.
  */
 #if CONFIG_TRUENAS
