@@ -107,6 +107,7 @@
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_driver.h>
 #include <scsi/scsi_proto.h>
+#include <linux/unaligned.h>
 
 struct drivetemp_data {
 	struct list_head list;		/* list of instantiated devices */
@@ -143,6 +144,13 @@ static LIST_HEAD(drivetemp_devlist);
 #define SCT_READ_LOG_ADDR	0xe1
 #define  SMART_READ_LOG			0xd5
 #define  SMART_WRITE_LOG		0xd6
+#define  TEMP_LOG_PAGE			0xd
+#define  TEMP_LOG_PAGE_LEN		0x10
+#define  TEMP_LOG_INVALID		0xFF
+#define  TEMP_LOG_HEADER_LEN		4
+#define  TEMP_LOG_PARAM_HEADER_LEN	4
+#define  TEMP_LOG_LEN_OFFSET		2
+#define  TEMP_LOG_PARAM_TEMP_OFFSET	5
 
 #define INVALID_TEMP		0x80
 
@@ -324,6 +332,79 @@ static bool drivetemp_sct_avoid(struct drivetemp_data *st)
 	return false;
 }
 
+static int drivetemp_retrieve_temp_log(struct drivetemp_data *st,
+    u8 *temp, u8 *reftemp)
+{
+	int err;
+	u8 scsi_cmd[MAX_COMMAND_SIZE];
+	char buf[TEMP_LOG_PAGE_LEN];
+	int i = TEMP_LOG_HEADER_LEN;
+	u16 page_len;
+
+	memset(scsi_cmd, 0, sizeof(scsi_cmd));
+	scsi_cmd[0] = LOG_SENSE;
+	scsi_cmd[2] = 0x40 | TEMP_LOG_PAGE;    /* Page control (PC)==1 */
+	put_unaligned_be16(TEMP_LOG_PAGE_LEN, &scsi_cmd[7]);
+	err = scsi_execute_cmd(st->sdev, scsi_cmd, REQ_OP_DRV_IN, buf,
+			TEMP_LOG_PAGE_LEN, 10 * HZ, 5, NULL);
+	if (err)
+		return (err);
+
+	page_len = min(get_unaligned_be16(&buf[TEMP_LOG_LEN_OFFSET]),
+		TEMP_LOG_PAGE_LEN - TEMP_LOG_HEADER_LEN) + TEMP_LOG_HEADER_LEN;
+
+	while (i + TEMP_LOG_PARAM_HEADER_LEN <= page_len) {
+		u8 param_len = (u8) buf[i + 3] + TEMP_LOG_PARAM_HEADER_LEN;
+		u16 param_code = get_unaligned_be16(&buf[i]);
+		if (i + param_len > page_len)
+			break;
+		if (param_code == 0x0)
+			*temp = (u8) buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
+		if (reftemp && param_code == 0x1)
+			*reftemp = (u8) buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
+		i += param_len;
+	}
+
+	return (0);
+}
+
+static int drivetemp_get_scsitemp(struct drivetemp_data *st, u32 attr,
+		  long *temp)
+{
+	int err;
+	u8 temp8 = TEMP_LOG_INVALID;
+
+	if ((err = drivetemp_retrieve_temp_log(st, &temp8, NULL)) == 0) {
+		if (temp8 != TEMP_LOG_INVALID)
+			*temp = (u8) temp8 * 1000;
+		else
+			err = -EIO;
+	}
+
+	return (err);
+}
+
+static int drivetemp_identify_scsi(struct drivetemp_data *st)
+{
+	int err;
+	u8 temp = TEMP_LOG_INVALID, reftemp = TEMP_LOG_INVALID;
+
+	if ((err = drivetemp_retrieve_temp_log(st, &temp,
+	    &reftemp)) == 0) {
+		if (temp != TEMP_LOG_INVALID) {
+			st->get_temp = drivetemp_get_scsitemp;
+			if (reftemp != TEMP_LOG_INVALID) {
+				st->have_temp_crit = true;
+				st->temp_crit = reftemp * 1000;
+			}
+		} else {
+			err = -EIO;
+		}
+	}
+
+	return (err);
+}
+
 static int drivetemp_identify_sata(struct drivetemp_data *st)
 {
 	struct scsi_device *sdev = st->sdev;
@@ -437,6 +518,7 @@ skip_sct:
 static int drivetemp_identify(struct drivetemp_data *st)
 {
 	struct scsi_device *sdev = st->sdev;
+	int ret;
 
 	/* Bail out immediately if there is no inquiry data */
 	if (!sdev->inquiry || sdev->inquiry_len < 16)
@@ -446,7 +528,9 @@ static int drivetemp_identify(struct drivetemp_data *st)
 	if (sdev->type != TYPE_DISK && sdev->type != TYPE_ZBC)
 		return -ENODEV;
 
-	return drivetemp_identify_sata(st);
+	if ((ret = drivetemp_identify_sata(st)))
+		ret = drivetemp_identify_scsi(st);
+	return (ret);
 }
 
 static int drivetemp_read(struct device *dev, enum hwmon_sensor_types type,
