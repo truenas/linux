@@ -282,7 +282,7 @@ EOF
 
 cp "${srctree}/scripts/package/debian/rules" debian/
 mkdir -p debian/certs
-cp scripts/package/truenas/debian-uefi-certs.pem debian/certs
+cp scripts/package/truenas/truenas-uefi-certs.pem debian/certs
 cp scripts/package/truenas/changelog debian/changelog
 cp scripts/package/truenas/copyright debian/copyright
 
