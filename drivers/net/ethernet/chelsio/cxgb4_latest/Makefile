@@ -7,6 +7,13 @@ ccflags-y += -I$(src)
 ccflags-y += -I$(src)/../include
 ccflags-y += -I$(src)/../cudbg_inc
 ccflags-y += -DPCI_ERR_HANDLERS_CONST=const
+ccflags-y += -DINET_HASHFN
+ccflags-y += -DCONFIG_CHELSIO_T4_OFFLOAD
+ccflags-y += -DCONFIG_GENERIC_ALLOCATOR
+ccflags-y += -DCONFIG_TCP_OFFLOAD
+
+# Use kernel's generic allocator (kernel 6.12 already provides backward compatibility)
+ccflags-y += -DGEN_ALLOC
 
 obj-$(CONFIG_CHELSIO_T4) += cxgb4.o
 
@@ -17,12 +24,16 @@ cxgb4-objs := cxgb4_main.o l2t.o clip_tbl.o cxgb4_ethtool.o cxgb4_cxgbtool.o \
 	      cxgb4_pci.o cxgb4_common.o
 
 # Chelsio package enhancements (always enabled by default)
-# Platform support
-cxgb4-objs += cxgb4_platform.o
+# Platform support (conditional - only when CXGB4_PLATFORM is defined)
+# AMEER: Required DCXGB4_PLATFORM and disable
+ifneq ($(filter $(ccflags-y),-DCXGB4_PLATFORM),)
+  cxgb4-objs += cxgb4_platform.o
+endif
 
-# Debug components (cudbg - enabled by default unless disable_cudbg=1)
-cxgb4-objs += cxgb4_cudbg.o fastlz_api.o fastlz.o cudbg_lib.o cudbg_wtp.o \
-	      cudbg_flash_utils.o cudbg_common.o
+# Debug components (cudbg - disabled for kernel 6.12 compatibility)
+# AMEER: Disabled cudbg completely
+# cxgb4-objs += cxgb4_cudbg.o fastlz_api.o fastlz.o cudbg_lib.o cudbg_wtp.o \
+#               cudbg_flash_utils.o cudbg_common.o
 
 # Offload components (enabled by default unless disable_offload=1)
 cxgb4-objs += ocqp.o srq.o cxgb4_uld.o cxgb4_id_table.o cxgb4_rdma_resource.o
@@ -30,8 +41,9 @@ cxgb4-objs += ocqp.o srq.o cxgb4_uld.o cxgb4_id_table.o cxgb4_rdma_resource.o
 # Multi-Adapter Failover (enabled by default unless disable_mafo=1)
 cxgb4-objs += cxgb4_ma_failover.o
 
-# Generic allocator (enabled by default unless -DGEN_ALLOC is set)
-cxgb4-objs += cxgb4_genalloc.o
+# Generic allocator (disabled - using kernel's version with compatibility macros)
+# AMEER: Using kernel's genalloc with compatibility macros for kernel 6.12 API
+# cxgb4-objs += cxgb4_genalloc.o
 
 # Thermal support (enabled by default unless -DCXGB4_THERMAL not set)
 cxgb4-objs += cxgb4_thermal.o
