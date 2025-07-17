@@ -923,8 +923,9 @@ static int set_netdevs(struct ib_device *ib_dev, struct chrd_rdev *rdev,
 
 static void chrd_init_roce_dev(struct chrd_dev *dev)
 {
-	addrconf_addr_eui48((unsigned char *)&dev->ibdev.node_guid,
-			    dev->rdev.lldi.ports[0]->dev_addr);
+// TODO-AMEER: Chelsio define this in their package, do the same
+//	addrconf_addr_eui48((unsigned char *)&dev->ibdev.node_guid,
+//			    dev->rdev.lldi.ports[0]->dev_addr);
 	dev->ibdev.node_type = RDMA_NODE_IB_CA;
 	ib_set_device_ops(&dev->ibdev, &chrd_roce_dev_ops);
 }
