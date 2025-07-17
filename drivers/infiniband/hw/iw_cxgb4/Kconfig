@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config INFINIBAND_CXGB4
+	tristate "Chelsio T4/T5/T6/T7 RDMA Driver (Enhanced Package)"
+	depends on CHELSIO_T4 && INET
+	depends on INFINIBAND_ADDR_TRANS
+	select CHELSIO_LIB
+	select GENERIC_ALLOCATOR
+	help
+	  This is an enhanced iWARP/RDMA driver for the Chelsio T4, T5, T6,
+	  and T7 series 1GbE, 10GbE, 25GbE, 40GbE, and 100GbE adapters.
+	  
+	  This enhanced version includes:
+	  - Extended T6/T7 support with additional PCI IDs
+	  - Support for T62100 cards
+	  - Enhanced performance optimizations
+	  - Extended debugging capabilities
+	  - Additional storage offload features
+	  
+	  For general information about Chelsio and our products, visit
+	  our website at <http://www.chelsio.com>.
+
+	  For customer support, please visit our customer support page at
+	  <http://www.chelsio.com/support.html>.
+
+	  Please send feedback to <linux-bugs@chelsio.com>.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called iw_cxgb4.
