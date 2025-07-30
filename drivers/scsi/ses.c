@@ -10,6 +10,8 @@
 #include <linux/kernel.h>
 #include <linux/enclosure.h>
 #include <linux/unaligned.h>
+#include <linux/pci.h>
+#include <linux/device/bus.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -22,6 +24,9 @@
 
 #include <linux/libata.h>
 #include "../ata/ahci.h"
+
+/* PCIe protocol identifier for SES Additional Element Status */
+#define SCSI_PROTOCOL_PCIE	0xb
 
 struct ses_device {
 	unsigned char *page1;
@@ -36,6 +41,7 @@ struct ses_device {
 
 struct ses_component {
 	u64 addr;
+	int protocol;
 };
 
 static bool ses_page2_supported(struct enclosure_device *edev)
@@ -482,10 +488,11 @@ static int ses_process_descriptor(struct enclosure_component *ecomp,
 
 	if (invalid) {
 		scomp->addr = 0;
+		scomp->protocol = -1;
 		return 0;
 	}
 
-	switch (proto) {
+	switch ((int)proto) {
 	case SCSI_PROTOCOL_ATA:
 		d = desc + 4;
 		if (eip) {
@@ -527,12 +534,32 @@ static int ses_process_descriptor(struct enclosure_component *ecomp,
 			(u64)d[18] << 8 |
 			(u64)d[19];
 		break;
+	case SCSI_PROTOCOL_PCIE:
+		if (!eip || max_desc_len < 76)
+			return 1;
+
+		d = desc + 4;
+		u8 num_ports = d[0];
+
+		if (num_ports == 0 || (d[1] & 0xE0) != 0x20)
+			return 1;
+
+		slot = d[3];
+		unsigned char *port_desc = d + 68;
+
+		if (port_desc[0] & 0x02) {
+			u8 bus = port_desc[4];
+			u8 devfn = port_desc[5];
+			addr = ((u16)bus << 8) | devfn;
+		}
+		break;
 	default:
 		/* FIXME: Need to add more protocols than just SAS */
 		break;
 	}
 	ecomp->slot = slot;
 	scomp->addr = addr;
+	scomp->protocol = proto;
 
 	return 0;
 }
@@ -540,6 +567,7 @@ static int ses_process_descriptor(struct enclosure_component *ecomp,
 struct efd {
 	u64 addr;
 	struct device *dev;
+	int protocol;
 };
 
 static int ses_enclosure_find_by_addr(struct enclosure_device *edev,
@@ -551,7 +579,7 @@ static int ses_enclosure_find_by_addr(struct enclosure_device *edev,
 
 	for (i = 0; i < edev->components; i++) {
 		scomp = edev->component[i].scratch;
-		if (scomp->addr != efd->addr)
+		if (scomp->protocol != efd->protocol || scomp->addr != efd->addr)
 			continue;
 
 		if (enclosure_add_device(edev, i, efd->dev) == 0)
@@ -684,6 +712,91 @@ static void ses_enclosure_data_process(struct enclosure_device *edev,
 	kfree(hdr_buf);
 }
 
+static int ses_get_enclosure_pci_domain(struct enclosure_device *edev)
+{
+	struct scsi_device *sdev = to_scsi_device(edev->edev.parent);
+	struct device *dev = scsi_get_device(sdev->host);
+
+	if (dev && dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+		return pci_domain_nr(pdev->bus);
+	}
+	return 0;
+}
+
+static int find_nvme_controller(struct device *dev, void *data)
+{
+	struct device **ctrl_dev = data;
+	if (dev->class && strcmp(dev->class->name, "nvme") == 0) {
+		*ctrl_dev = dev;
+		return 1; /* Stop iteration */
+	}
+	return 0; /* Continue iteration */
+}
+
+static struct device *get_nvme_controller_device(struct pci_dev *pdev)
+{
+	struct device *nvme_ctrl_dev = NULL;
+	device_for_each_child(&pdev->dev, &nvme_ctrl_dev, find_nvme_controller);
+	return nvme_ctrl_dev;
+}
+
+static void ses_match_nvme_to_enclosure(struct enclosure_device *edev, struct pci_dev *pdev)
+{
+	struct device *ctrl_dev;
+	struct scsi_device *edev_sdev = to_scsi_device(edev->edev.parent);
+	struct efd efd = {
+		.addr = 0,
+		.protocol = -1,
+	};
+
+	ses_enclosure_data_process(edev, edev_sdev, 0);
+	if (ses_get_enclosure_pci_domain(edev) != pci_domain_nr(pdev->bus))
+		return;
+
+	ctrl_dev = get_nvme_controller_device(pdev);
+	if (!ctrl_dev)
+		return;
+
+	efd.addr = ((u16)pdev->bus->number << 8) | pdev->devfn;
+	efd.dev = ctrl_dev;
+	efd.protocol = SCSI_PROTOCOL_PCIE;
+
+	ses_enclosure_find_by_addr(edev, &efd);
+}
+
+static void ses_match_nvme_slots_to_enclosure(struct enclosure_device *edev)
+{
+	int i;
+	int enclosure_domain = ses_get_enclosure_pci_domain(edev);
+	for (i = 0; i < edev->components; i++) {
+		struct ses_component *scomp = edev->component[i].scratch;
+		struct pci_dev *pdev;
+		struct device *ctrl_dev;
+
+		if (scomp->protocol != SCSI_PROTOCOL_PCIE)
+			continue;
+
+		int bus = (scomp->addr >> 8) & 0xFF;
+		int devfn = scomp->addr & 0xFF;
+
+		pdev = pci_get_domain_bus_and_slot(enclosure_domain, bus, devfn);
+		if (!pdev || pdev->class != PCI_CLASS_STORAGE_EXPRESS)
+			goto put_dev;
+
+		if (!pdev->dev.driver || strcmp(pdev->dev.driver->name, "nvme") != 0)
+			goto put_dev;
+
+		ctrl_dev = get_nvme_controller_device(pdev);
+		if (ctrl_dev)
+			if (enclosure_add_device(edev, i, ctrl_dev) == 0)
+				kobject_uevent(&ctrl_dev->kobj, KOBJ_CHANGE);
+
+put_dev:
+		pci_dev_put(pdev);
+	}
+}
+
 static void ses_match_to_enclosure(struct enclosure_device *edev,
 				   struct scsi_device *sdev,
 				   int refresh)
@@ -691,6 +804,7 @@ static void ses_match_to_enclosure(struct enclosure_device *edev,
 	struct scsi_device *edev_sdev = to_scsi_device(edev->edev.parent);
 	struct efd efd = {
 		.addr = 0,
+		.protocol = -1,
 	};
 
 	if (refresh)
@@ -698,8 +812,10 @@ static void ses_match_to_enclosure(struct enclosure_device *edev,
 
 	if (scsi_is_sas_rphy(sdev->sdev_target->dev.parent)) {
 		efd.addr = sas_get_address(sdev);
+		efd.protocol = SCSI_PROTOCOL_SAS;
 	} else if (scsi_is_ata(sdev)) {
 		efd.addr = sdev->host->host_no + 1;
+		efd.protocol = SCSI_PROTOCOL_ATA;
 	} else {
 		const unsigned char *d;
 		const struct scsi_vpd *vpd_pg83;
@@ -716,6 +832,7 @@ static void ses_match_to_enclosure(struct enclosure_device *edev,
 				if (piv && code_set == 1 && assoc == 1 && proto ==
 				    SCSI_PROTOCOL_SAS && type == 3 && len == 8) {
 					efd.addr = get_unaligned_be64(&d[4]);
+					efd.protocol = proto;
 					break;
 				}
 				d += len + 4;
@@ -738,11 +855,16 @@ static int poll_task_cb(void *arg)
 	struct scsi_device *tmp_sdev;
 
 	while (!kthread_should_stop()) {
+		ses_enclosure_data_process(edev, sdev, 0);
+
 		shost_for_each_device(tmp_sdev, sdev->host) {
 			if (tmp_sdev->lun != 0 || scsi_device_enclosure(tmp_sdev))
 				continue;
-			ses_match_to_enclosure(edev, tmp_sdev, 1);
+			ses_match_to_enclosure(edev, tmp_sdev, 0);
 		}
+
+		ses_match_nvme_slots_to_enclosure(edev);
+
 		if (!kthread_should_stop()) {
 			schedule_timeout_interruptible(
 				    msecs_to_jiffies(SES_POLL_PERIOD_S * 1000));
@@ -1023,6 +1145,50 @@ static struct scsi_driver ses_template = {
 	},
 };
 
+/* NVMe hotplug support */
+static int match_nvme_to_enclosure(struct enclosure_device *edev, void *data)
+{
+	struct pci_dev *pdev = (struct pci_dev *)data;
+	ses_match_nvme_to_enclosure(edev, pdev);
+	return 0; /* Continue iteration */
+}
+
+static int remove_nvme_from_enclosure(struct enclosure_device *edev, void *data)
+{
+	struct pci_dev *pdev = (struct pci_dev *)data;
+	struct device *ctrl_dev;
+
+	ctrl_dev = get_nvme_controller_device(pdev);
+	if (ctrl_dev)
+		enclosure_remove_device(edev, ctrl_dev);
+	return 0; /* Continue iteration */
+}
+
+static int nvme_ses_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct device *dev = data;
+	struct pci_dev *pdev = to_pci_dev(dev);
+
+	if (pdev->class != PCI_CLASS_STORAGE_EXPRESS)
+		return NOTIFY_DONE;
+
+	switch (action) {
+	case BUS_NOTIFY_BOUND_DRIVER:
+		if (pdev->dev.driver && strcmp(pdev->dev.driver->name, "nvme") == 0)
+			enclosure_for_each_device(match_nvme_to_enclosure, pdev);
+		break;
+	case BUS_NOTIFY_UNBIND_DRIVER:
+		if (pdev->dev.driver && strcmp(pdev->dev.driver->name, "nvme") == 0)
+			enclosure_for_each_device(remove_nvme_from_enclosure, pdev);
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block nvme_ses_notifier = {
+	.notifier_call = nvme_ses_notify,
+};
+
 static int __init ses_init(void)
 {
 	int err;
@@ -1035,8 +1201,14 @@ static int __init ses_init(void)
 	if (err)
 		goto out_unreg;
 
+	err = bus_register_notifier(&pci_bus_type, &nvme_ses_notifier);
+	if (err)
+		goto out_unreg_driver;
+
 	return 0;
 
+ out_unreg_driver:
+	scsi_unregister_driver(&ses_template.gendrv);
  out_unreg:
 	scsi_unregister_interface(&ses_interface);
 	return err;
@@ -1044,6 +1216,7 @@ static int __init ses_init(void)
 
 static void __exit ses_exit(void)
 {
+	bus_unregister_notifier(&pci_bus_type, &nvme_ses_notifier);
 	scsi_unregister_driver(&ses_template.gendrv);
 	scsi_unregister_interface(&ses_interface);
 }
