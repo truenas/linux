@@ -167,8 +167,10 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 	struct path path = {.mnt = mntget(exp->ex_path.mnt),
 			    .dentry = dget(dentry)};
 	unsigned int follow_flags = 0;
-	int is_snapdir = 0;
 	int err = 0;
+#if CONFIG_TRUENAS
+	int is_snapdir = 0;
+#endif /* CONFIG_TRUENAS */
 
 	if (exp->ex_flags & NFSEXP_CROSSMOUNT)
 		follow_flags = LOOKUP_AUTOMOUNT;
