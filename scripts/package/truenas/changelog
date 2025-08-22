@@ -1,3 +1,9 @@
+linux-6.12.43+truenas (6.12.43+truenas-1) sid; urgency=low
+
+  * Merge upstream v6.12.43 release.
+
+ -- Debian Packages List <debian.packages@ixsystems.com>  Tue, 22 Aug 2025 15:00:00 +0500
+
 linux-6.12.33+truenas (6.12.33+truenas-1) sid; urgency=low
 
   * Merge upstream v6.12.33 release.
