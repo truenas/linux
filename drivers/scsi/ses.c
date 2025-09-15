@@ -1107,6 +1107,13 @@ static void ses_intf_remove_enclosure(struct scsi_device *sdev)
 		edev->poll_task = NULL;
 	}
 
+	/* enclosure_unregister() sets ->cb to NULL callbacks, preventing any
+	 * further SES driver calls. It removes enclosure sysfs entries,
+	 * eliminating the race window. edev remains valid as we hold a ref;
+	 * it will be freed in enclosure_release() via our put_device() below.
+	 */
+	enclosure_unregister(edev);
+
 	ses_dev = edev->scratch;
 	edev->scratch = NULL;
 
@@ -1118,8 +1125,8 @@ static void ses_intf_remove_enclosure(struct scsi_device *sdev)
 	if (edev->components)
 		kfree(edev->component[0].scratch);
 
+	/* Drop last reference from enclosure_find() */
 	put_device(&edev->edev);
-	enclosure_unregister(edev);
 }
 
 static void ses_intf_remove(struct device *cdev)
