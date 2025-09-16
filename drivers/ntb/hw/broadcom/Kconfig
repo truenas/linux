@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config NTB_BROADCOM
+	tristate "Broadcom NT2.0 Non-Transparent Bridge support"
+	depends on X86_64
+	help
+	  This driver supports Broadcom NT2.0 NTB devices.
+
+	  If unsure, say N.
