@@ -5443,6 +5443,9 @@ static int mpi3mr_scsih_ioctl(struct scsi_device *sdev, unsigned int cmd, void _
 	struct mpi3mr_tgt_dev *tgt_dev = mpi3mr_get_tgtdev_by_handle(mrioc,
 					sas_target_priv_data->dev_handle);
 
+	if (!tgt_dev || tgt_dev->dev_type != MPI3_DEVICE_DEVFORM_PCIE)
+		return (-EINVAL);
+
 	if ((tgt_dev->dev_spec.pcie_inf.dev_info &
 	    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_MASK) !=
 	    MPI3_DEVICE0_PCIE_DEVICE_INFO_TYPE_NVME_DEVICE) {
