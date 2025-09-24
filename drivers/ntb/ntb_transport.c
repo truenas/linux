@@ -1435,7 +1435,7 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 
 	qp_bitmap = ntb_db_valid_mask(ndev);
 
-	qp_count = ilog2(qp_bitmap);
+	qp_count = fls64(qp_bitmap);
 	if (nt->use_msi) {
 		qp_count -= 1;
 		nt->msi_db_mask = BIT_ULL(qp_count);
