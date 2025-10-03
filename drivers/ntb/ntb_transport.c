@@ -1388,26 +1388,30 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 	spad_count = ntb_spad_count(ndev);
 
 	/* Limit the MW's based on the availability of scratchpads */
-	nt->compact = compact || (spad_count < 4 + 2 * mw_count);
+	nt->compact = compact || (spad_count < 4 + 2 * mw_count +
+	    (nt->use_msi ? 2 * mw_count : 0));
 	if (nt->compact) {
-		if (spad_count < NTBTC_MW0_SZ + 1) {
+		if (spad_count < NTBTC_MW0_SZ + 1 + (nt->use_msi ? 2 : 0)) {
 			nt->mw_count = 0;
 			rc = -EINVAL;
 			goto err;
 		}
-		max_mw_count_for_spads = spad_count - NTBTC_MW0_SZ;
+		max_mw_count_for_spads = (spad_count - NTBTC_MW0_SZ) /
+		    (nt->use_msi ? 3 : 1);
 	} else {
-		if (spad_count < MW0_SZ_HIGH + 2) {
+		if (spad_count < MW0_SZ_HIGH + 2 + (nt->use_msi ? 2 : 0)) {
 			nt->mw_count = 0;
 			rc = -EINVAL;
 			goto err;
 		}
-		max_mw_count_for_spads = (spad_count - MW0_SZ_HIGH) / 2;
+		max_mw_count_for_spads = (spad_count - MW0_SZ_HIGH) /
+		    (nt->use_msi ? 4 : 2);
 	}
 
 	nt->mw_count = min(mw_count, max_mw_count_for_spads);
 
-	nt->msi_spad_offset = nt->mw_count * 2 + MW0_SZ_HIGH;
+	nt->msi_spad_offset = nt->mw_count * 2 +
+	    (nt->compact ? NTBTC_MW0_SZ : MW0_SZ_HIGH);
 
 	nt->mw_vec = kcalloc_node(mw_count, sizeof(*nt->mw_vec),
 				  GFP_KERNEL, node);
