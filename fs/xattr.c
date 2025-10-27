@@ -113,7 +113,7 @@ static int
 xattr_permission(struct mnt_idmap *idmap, struct inode *inode,
 		 const char *name, int mask)
 {
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) {
 #else
 	if (mask & MAY_WRITE) {
@@ -138,7 +138,7 @@ xattr_permission(struct mnt_idmap *idmap, struct inode *inode,
 	 */
 	if (!strncmp(name, XATTR_TRUSTED_PREFIX, XATTR_TRUSTED_PREFIX_LEN)) {
 		if (!capable(CAP_SYS_ADMIN))
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 			return (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) ? -EPERM : -ENODATA;
 #else
 			return (mask & MAY_WRITE) ? -EPERM : -ENODATA;
@@ -153,13 +153,13 @@ xattr_permission(struct mnt_idmap *idmap, struct inode *inode,
 	 */
 	if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN)) {
 		if (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 			return (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) ? -EPERM : -ENODATA;
 #else
 			return (mask & MAY_WRITE) ? -EPERM : -ENODATA;
 #endif
 		if (S_ISDIR(inode->i_mode) && (inode->i_mode & S_ISVTX) &&
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 		    (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) &&
 #else
 		    (mask & MAY_WRITE) &&
@@ -294,7 +294,7 @@ __vfs_setxattr_locked(struct mnt_idmap *idmap, struct dentry *dentry,
 {
 	struct inode *inode = dentry->d_inode;
 	int error;
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (IS_NFSV4ACL(inode)) {
 		error = xattr_permission(idmap, inode, name, MAY_WRITE);
 		if (error) {
@@ -565,7 +565,7 @@ __vfs_removexattr_locked(struct mnt_idmap *idmap,
 {
 	struct inode *inode = dentry->d_inode;
 	int error;
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (IS_NFSV4ACL(inode)) {
 		error = xattr_permission(idmap, inode, name, MAY_WRITE);
 		if (error) {
