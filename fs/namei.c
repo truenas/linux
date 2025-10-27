@@ -543,7 +543,7 @@ static inline int do_inode_permission(struct mnt_idmap *idmap,
  */
 static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
 {
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	/*
 	 * NFSv4 ACLs have more granular write permissions. Same logic
 	 * should apply here as with generic MAY_WRITE. Specifically, protect
@@ -583,7 +583,7 @@ int inode_permission(struct mnt_idmap *idmap,
 	if (unlikely(retval))
 		return retval;
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	/*
 	 * NFSv4 ACLs have more granular write permissions. Same logic
 	 * should apply here as with generic MAY_WRITE.
@@ -3287,7 +3287,7 @@ static int may_delete(struct mnt_idmap *idmap, struct inode *dir,
 		return -EOVERFLOW;
 
 	audit_inode_child(dir, victim, AUDIT_TYPE_CHILD_DELETE);
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (IS_NFSV4ACL(inode)) {
 		/*
 		 * See RFC 5661 Section 6.2.1.3.2

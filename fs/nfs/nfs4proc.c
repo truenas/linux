@@ -71,7 +71,7 @@
 
 #include "nfs4trace.h"
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 #include "../nfs_common/nfs41acl_xdr.h"
 
 /* 0xFFFFFFFFFFFFFFFF == 18446744073709551615, len('18446744073709551615') == 20 */
@@ -8054,7 +8054,7 @@ static bool nfs4_xattr_list_nfs4_sacl(struct dentry *dentry)
 	return nfs4_server_supports_acls(NFS_SB(dentry->d_sb), NFS4ACL_SACL);
 }
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 /*
  * We will publish the DACL thru NA41_NAME ("system.nfs4_acl_xdr")
  *
@@ -11588,7 +11588,7 @@ static const struct xattr_handler nfs4_xattr_nfs4_sacl_handler = {
 	.set	= nfs4_xattr_set_nfs4_sacl,
 };
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 static const struct xattr_handler nfs4_xattr_nfs4_acl_xdr_handler = {
 	.name	= NA41_NAME,
 	.list	= nfs4_xattr_list_nfs4_acl_xdr,
@@ -11611,7 +11611,7 @@ const struct xattr_handler * const nfs4_xattr_handlers[] = {
 #if defined(CONFIG_NFS_V4_1)
 	&nfs4_xattr_nfs4_dacl_handler,
 	&nfs4_xattr_nfs4_sacl_handler,
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	&nfs4_xattr_nfs4_acl_xdr_handler,
 #endif /* CONFIG_TRUENAS */
 #endif

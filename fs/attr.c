@@ -179,7 +179,7 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
 		goto kill_priv;
 
 	/* Make sure a caller can chown. */
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	/*
 	 * Check for ACE4_WRITE_OWNER. RFC 5661 Section 6.2.1.3.1
 	 * On UNIX systems, this is the ability to execute chown() and
@@ -201,7 +201,7 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
 #endif
 
 	/* Make sure caller can chgrp. */
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if ((ia_valid & ATTR_GID) &&
 	    !chgrp_ok(idmap, inode, attr->ia_vfsgid)) {
 		if (!IS_NFSV4ACL(inode)) {
@@ -221,7 +221,7 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ia_valid & ATTR_MODE) {
 		vfsgid_t vfsgid;
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 		/*
 		 * Check for ACE4_WRITE_ACL. RFC 5661 Section 6.2.1.3.1
 		 * Permission to write the acl or mode attributes.
@@ -432,7 +432,7 @@ int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
 			return -EPERM;
 
 		if (!inode_owner_or_capable(idmap, inode)) {
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 			if (IS_NFSV4ACL(inode)) {
 				error = inode_permission(idmap, inode,
 							 MAY_WRITE);
