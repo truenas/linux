@@ -28,7 +28,7 @@
 #include <linux/nfsacl.h>
 #include <linux/nfs3.h>
 #include <linux/sort.h>
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 #include "nfs41acl_xdr.h"
 
 /* Value from zfs/include/os/linux/spl/sys/acl.h */
@@ -429,7 +429,7 @@ bool nfs_stream_decode_acl(struct xdr_stream *xdr, unsigned int *aclcnt,
 }
 EXPORT_SYMBOL_GPL(nfs_stream_decode_acl);
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 static int
 convert_to_nfs40_ace(u32 *xdrbuf, size_t *remaining, struct nfs4_ace *ace)
 {

@@ -11,7 +11,7 @@
 #include <linux/posix_acl.h>
 #include <linux/sunrpc/xdr.h>
 #include <uapi/linux/nfsacl.h>
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 #include <linux/nfs4.h>		/* For struct nfs4_acl */
 #endif /* CONFIG_TRUENAS */
 
@@ -48,7 +48,7 @@ extern bool
 nfs_stream_encode_acl(struct xdr_stream *xdr, struct inode *inode,
 		      struct posix_acl *acl, int encode_entries, int typeflag);
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 extern int
 convert_nfs41xdr_to_nfs40_acl(u32 *xdrbuf, size_t remaining, struct nfs4_acl *acl);
 extern int

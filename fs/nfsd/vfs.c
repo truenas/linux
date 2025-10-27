@@ -127,7 +127,7 @@ nfserrno (int errno)
  * we also know that the current dentry is for an auto-
  * mounted snapshot.
  */
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 static int
 is_in_zfs_snapdir(struct dentry *dentry)
 {
@@ -168,14 +168,14 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 			    .dentry = dget(dentry)};
 	unsigned int follow_flags = 0;
 	int err = 0;
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	int is_snapdir = 0;
 #endif /* CONFIG_TRUENAS */
 
 	if (exp->ex_flags & NFSEXP_CROSSMOUNT)
 		follow_flags = LOOKUP_AUTOMOUNT;
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	// ZFS ctldir specific handling
 	if (exp->ex_flags & NFSEXP_SNAPDIR) {
 		is_snapdir = is_in_zfs_snapdir(dentry);
@@ -210,7 +210,7 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 		goto out;
 	}
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (nfsd_v4client(rqstp) || is_snapdir ||
 #else
 	if (nfsd_v4client(rqstp) ||

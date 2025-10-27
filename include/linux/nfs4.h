@@ -37,7 +37,7 @@ struct nfs4_ace {
 	};
 };
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 /*
  * Move this enum here (from nfs_xdr.h)
  */
@@ -50,7 +50,7 @@ enum nfs4_acl_type {
 #endif /* CONFIG_TRUENAS */
 
 struct nfs4_acl {
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	uint32_t	flag;	/* NFSv4.1 sacl/dacl  mask: ACL4_AUTO_INHERIT, ACL4_PROTECTED, ACL4_DEFAULTED */
 #endif /* CONFIG_TRUENAS */
 	uint32_t	naces;
