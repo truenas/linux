@@ -92,7 +92,7 @@ check_attr_support(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	if ((bmval[0] & FATTR4_WORD0_ACL) && !IS_POSIXACL(d_inode(dentry)) &&
 	    !IS_NFSV4ACL(d_inode(dentry)))
 		return nfserr_attrnotsupp;
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if ((bmval[1] & FATTR4_WORD1_DACL) && !IS_NFSV4ACL(d_inode(dentry)))
 		return nfserr_attrnotsupp;
 #endif /* CONFIG_TRUENAS */
@@ -384,7 +384,7 @@ set_attr:
 
 	if (attrs.na_labelerr)
 		open->op_bmval[2] &= ~FATTR4_WORD2_SECURITY_LABEL;
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (attrs.na_aclerr) {
 		open->op_bmval[0] &= ~FATTR4_WORD0_ACL;
 		open->op_bmval[1] &= ~FATTR4_WORD1_DACL;
@@ -877,7 +877,7 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 
 	if (attrs.na_labelerr)
 		create->cr_bmval[2] &= ~FATTR4_WORD2_SECURITY_LABEL;
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (attrs.na_aclerr) {
 		create->cr_bmval[0] &= ~FATTR4_WORD0_ACL;
 		create->cr_bmval[1] &= ~FATTR4_WORD1_DACL;
@@ -3109,7 +3109,7 @@ static u32 nfsd4_getattr_rsize(const struct svc_rqst *rqstp,
 		return nfsd4_max_payload(rqstp);
 	if (bmap0 & FATTR4_WORD0_FS_LOCATIONS)
 		return nfsd4_max_payload(rqstp);
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (bmap1 & FATTR4_WORD1_DACL)
 		return nfsd4_max_payload(rqstp);
 #endif /* CONFIG_TRUENAS */

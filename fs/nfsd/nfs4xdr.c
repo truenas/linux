@@ -319,7 +319,7 @@ nfsd4_decode_nfsace4(struct nfsd4_compoundargs *argp, struct nfs4_ace *ace)
 
 /* A counted array of nfsace4's */
 static noinline __be32
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 nfsd4_decode_acl(struct nfsd4_compoundargs *argp, struct nfs4_acl **acl,
 		 enum nfs4_acl_type acl_type)
 {
@@ -365,7 +365,7 @@ nfsd4_decode_acl(struct nfsd4_compoundargs *argp, struct nfs4_acl **acl)
 	if (*acl == NULL)
 		return nfserr_jukebox;
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	(*acl)->flag = acl_flag;
 #endif /* CONFIG_TRUENAS */
 	(*acl)->naces = count;
@@ -440,7 +440,7 @@ nfsd4_decode_fattr4(struct nfsd4_compoundargs *argp, u32 *bmval, u32 bmlen,
 		iattr->ia_valid |= ATTR_SIZE;
 	}
 	if (bmval[0] & FATTR4_WORD0_ACL) {
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 		status = nfsd4_decode_acl(argp, acl, NFS4ACL_ACL);
 #else
 		status = nfsd4_decode_acl(argp, acl);
@@ -533,7 +533,7 @@ nfsd4_decode_fattr4(struct nfsd4_compoundargs *argp, u32 *bmval, u32 bmlen,
 			return nfserr_bad_xdr;
 		}
 	}
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	/*
 	 * This is based on the FATTR4_WORD0_ACL handling above.
 	 */
@@ -3015,7 +3015,7 @@ static __be32 nfsd4_encode_fattr4_supported_attrs(struct xdr_stream *xdr,
 	if (!IS_POSIXACL(d_inode(args->dentry)) &&
 		!IS_NFSV4ACL(d_inode(args->dentry)))
 		supp[0] &= ~FATTR4_WORD0_ACL;
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (!IS_NFSV4ACL(d_inode(args->dentry)))
 		supp[1] &= ~FATTR4_WORD1_DACL;
 #endif /* CONFIG_TRUENAS */
@@ -3636,7 +3636,7 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 	__be32 attrlen, status;
 	u32 attrmask[3];
 	int err;
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	/*
 	 * Even though we expect *either* ACL or DACL to be fetched,
 	 * lets be cautious and use separate variables.
@@ -3738,7 +3738,7 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 		args.fhp = fhp;
 
 	if (attrmask[0] & FATTR4_WORD0_ACL) {
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 		/*
 		 * In TrueNAS we have renamed the existing nfsd4_get_nfs4_acl
 		 * to get_nfs4_posix_acl, so that we can implement a nfsd4_get_nfs4_acl
@@ -3760,7 +3760,7 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 			goto out_nfserr;
 	}
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	if (attrmask[1] & FATTR4_WORD1_DACL) {
 		err = nfsd4_get_nfs4_acl(rqstp, dentry, &dacl, NFS4ACL_DACL);
 		if (err == -EOPNOTSUPP)
@@ -3811,7 +3811,7 @@ nfsd4_encode_fattr4(struct svc_rqst *rqstp, struct xdr_stream *xdr,
 		if (status != nfs_ok)
 			goto out;
 	}
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	/* See FATTR4_WORD0_ACL above */
 	if (attrmask[1] & FATTR4_WORD1_DACL) {
 		struct nfs4_ace *ace;
@@ -3866,7 +3866,7 @@ out:
 		security_release_secctx(&args.context);
 #endif /* CONFIG_NFSD_V4_SECURITY_LABEL */
 	kfree(args.acl);
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 	kfree(dacl);
 #endif /* CONFIG_TRUENAS */
 	if (tempfh) {

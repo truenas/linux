@@ -107,7 +107,7 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 /* called from RCU mode, don't block */
 #define MAY_NOT_BLOCK		0x00000080
 
-#if CONFIG_TRUENAS
+#ifdef CONFIG_TRUENAS
 /*
  * Extended NFSv41 write permissions. These are used selectively
  * for permissions checks where NFSv4 ACL handling is
