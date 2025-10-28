@@ -30,6 +30,24 @@ jobs:
       - name: Check out repository code
         uses: actions/checkout@v4
 
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          # Workaround to provide additional free space for kernel build
+          # https://github.com/actions/virtual-environments/issues/2840
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo apt-get clean
+          docker rmi $(docker image ls -aq) 2>/dev/null || true
+          echo "Disk space after cleanup:"
+          df -h
+
       - name: Install dependencies
         run: |
           sudo apt update
@@ -48,12 +66,6 @@ jobs:
           make syncconfig
           make archprepare
           ./scripts/package/mkdebian
-          # Workaround to provide additional free space for kernel build
-          # https://github.com/actions/virtual-environments/issues/2840
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Build Kernel
         run: |
@@ -93,6 +105,24 @@ jobs:
       - name: Check out repository code
         uses: actions/checkout@v4
 
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          # Workaround to provide additional free space for kernel build
+          # https://github.com/actions/virtual-environments/issues/2840
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo apt-get clean
+          docker rmi $(docker image ls -aq) 2>/dev/null || true
+          echo "Disk space after cleanup:"
+          df -h
+
       - name: Install dependencies
         run: |
           sudo apt update
@@ -116,12 +146,6 @@ jobs:
           make syncconfig
           make archprepare
           ./scripts/package/mkdebian
-          # Workaround to provide additional free space for kernel build
-          # https://github.com/actions/virtual-environments/issues/2840
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Build Kernel
         run: |
