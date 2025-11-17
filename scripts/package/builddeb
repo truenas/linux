@@ -79,28 +79,8 @@ install_maint_scripts () {
 	debhookdir=${KDEB_HOOKDIR:-/etc/kernel /usr/share/kernel}
 	for script in postinst postrm preinst prerm; do
 		mkdir -p "${pdir}/DEBIAN"
-		cat <<-EOF > "${pdir}/DEBIAN/${script}"
-		#!/bin/sh
-
-		set -e
-
-		# Pass maintainer script parameters to hook scripts
-		export DEB_MAINT_PARAMS="\$*"
-
-		# Tell initramfs builder whether it's wanted
-		export INITRD=$(if_enabled_echo CONFIG_BLK_DEV_INITRD Yes No)
-
-		# run-parts will error out if one of its directory arguments does not
-		# exist, so filter the list of hook directories accordingly.
-		hookdirs=
-		for dir in ${debhookdir}; do
-			test -d "\$dir/${script}.d" || continue
-			hookdirs="\$hookdirs \$dir/${script}.d"
-		done
-		hookdirs="\${hookdirs# }"
-		test -n "\$hookdirs" && run-parts --arg="${KERNELRELEASE}" --arg="/${installed_image_path}" \$hookdirs
-		exit 0
-		EOF
+		cp "scripts/package/truenas/$script" "${pdir}/DEBIAN/${script}"
+		sed -i "3i version=$KERNELRELEASE" "${pdir}/DEBIAN/${script}"
 		chmod 755 "${pdir}/DEBIAN/${script}"
 	done
 }
@@ -163,7 +143,7 @@ case "${package}" in
 	install_linux_image_dbg "${package}";;
 linux-image-*|user-mode-linux-*)
 	install_linux_image "${package}";;
-linux-libc-dev)
+linux-*-libc-dev)
 	install_libc_headers "${package}";;
 linux-headers-*)
 	install_kernel_headers "${package}";;
