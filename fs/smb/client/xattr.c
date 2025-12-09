@@ -459,7 +459,9 @@ static int cifs_xattr_get(const struct xattr_handler *handler,
 		}
 
 		pacl = pTcon->ses->server->ops->get_acl(cifs_sb,
-				inode, full_path, &acllen, 0);
+				inode, full_path, &acllen,
+				OWNER_SECINFO | GROUP_SECINFO | DACL_SECINFO);
+
 		if (IS_ERR(pacl)) {
 			rc = PTR_ERR(pacl);
 			cifs_dbg(VFS, "%s: error %zd getting sec desc\n",
