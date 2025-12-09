@@ -89,8 +89,13 @@ check_attr_support(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 
 	if (!nfsd_attrs_supported(cstate->minorversion, bmval))
 		return nfserr_attrnotsupp;
-	if ((bmval[0] & FATTR4_WORD0_ACL) && !IS_POSIXACL(d_inode(dentry)))
+	if ((bmval[0] & FATTR4_WORD0_ACL) && !IS_POSIXACL(d_inode(dentry)) &&
+	    !IS_NFSV4ACL(d_inode(dentry)))
 		return nfserr_attrnotsupp;
+#ifdef CONFIG_TRUENAS
+	if ((bmval[1] & FATTR4_WORD1_DACL) && !IS_NFSV4ACL(d_inode(dentry)))
+		return nfserr_attrnotsupp;
+#endif /* CONFIG_TRUENAS */
 	if ((bmval[2] & FATTR4_WORD2_SECURITY_LABEL) &&
 			!(exp->ex_flags & NFSEXP_SECURITY_LABEL))
 		return nfserr_attrnotsupp;
@@ -239,6 +244,7 @@ nfsd4_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	struct nfsd_attrs attrs = {
 		.na_iattr	= iap,
 		.na_seclabel	= &open->op_label,
+		.na_acltype	= ACL_TYPE_NONE
 	};
 	struct dentry *parent, *child;
 	__u32 v_mtime, v_atime;
@@ -261,8 +267,10 @@ nfsd4_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	if (host_err)
 		return nfserrno(host_err);
 
-	if (is_create_with_attrs(open))
-		nfsd4_acl_to_attr(NF4REG, open->op_acl, &attrs);
+	if (is_create_with_attrs(open)) {
+		nfsd4_setup_attr(parent, &attrs);
+		attrs.na_conv_fn(NF4REG, open->op_acl, &attrs.na_fsacl);
+	}
 
 	inode_lock_nested(inode, I_MUTEX_PARENT);
 
@@ -347,7 +355,7 @@ nfsd4_create_file(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		goto out;
 	}
 
-	if (!IS_POSIXACL(inode))
+	if (!IS_POSIXACL(inode) && !IS_NFSV4ACL(inode))
 		iap->ia_mode &= ~current_umask();
 
 	status = fh_fill_pre_attrs(fhp);
@@ -376,8 +384,15 @@ set_attr:
 
 	if (attrs.na_labelerr)
 		open->op_bmval[2] &= ~FATTR4_WORD2_SECURITY_LABEL;
+#ifdef CONFIG_TRUENAS
+	if (attrs.na_aclerr) {
+		open->op_bmval[0] &= ~FATTR4_WORD0_ACL;
+		open->op_bmval[1] &= ~FATTR4_WORD1_DACL;
+	}
+#else
 	if (attrs.na_aclerr)
 		open->op_bmval[0] &= ~FATTR4_WORD0_ACL;
+#endif /* CONFIG_TRUENAS */
 out:
 	inode_unlock(inode);
 	nfsd_attrs_free(&attrs);
@@ -784,6 +799,7 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	struct nfsd_attrs attrs = {
 		.na_iattr	= &create->cr_iattr,
 		.na_seclabel	= &create->cr_label,
+		.na_acltype	= ACL_TYPE_NONE
 	};
 	struct svc_fh resfh;
 	__be32 status;
@@ -800,7 +816,9 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	if (status)
 		return status;
 
-	status = nfsd4_acl_to_attr(create->cr_type, create->cr_acl, &attrs);
+	nfsd4_setup_attr(cstate->current_fh.fh_dentry, &attrs);
+	status = attrs.na_conv_fn(create->cr_type, create->cr_acl,
+				  &attrs.na_fsacl);
 	current->fs->umask = create->cr_umask;
 	switch (create->cr_type) {
 	case NF4LNK:
@@ -859,8 +877,15 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 
 	if (attrs.na_labelerr)
 		create->cr_bmval[2] &= ~FATTR4_WORD2_SECURITY_LABEL;
+#ifdef CONFIG_TRUENAS
+	if (attrs.na_aclerr) {
+		create->cr_bmval[0] &= ~FATTR4_WORD0_ACL;
+		create->cr_bmval[1] &= ~FATTR4_WORD1_DACL;
+	}
+#else
 	if (attrs.na_aclerr)
 		create->cr_bmval[0] &= ~FATTR4_WORD0_ACL;
+#endif /* CONFIG_TRUENAS */
 	set_change_info(&create->cr_cinfo, &cstate->current_fh);
 	fh_dup2(&cstate->current_fh, &resfh);
 out:
@@ -1171,6 +1196,7 @@ nfsd4_setattr(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	struct nfsd_attrs attrs = {
 		.na_iattr	= &setattr->sa_iattr,
 		.na_seclabel	= &setattr->sa_label,
+		.na_acltype	= ACL_TYPE_NONE
 	};
 	bool save_no_wcc, deleg_attrs;
 	struct nfs4_stid *st = NULL;
@@ -1222,8 +1248,9 @@ nfsd4_setattr(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 		goto out;
 
 	inode = cstate->current_fh.fh_dentry->d_inode;
-	status = nfsd4_acl_to_attr(S_ISDIR(inode->i_mode) ? NF4DIR : NF4REG,
-				   setattr->sa_acl, &attrs);
+	nfsd4_setup_attr(cstate->current_fh.fh_dentry, &attrs);
+	status = attrs.na_conv_fn(S_ISDIR(inode->i_mode) ? NF4DIR : NF4REG,
+				  setattr->sa_acl, &attrs.na_fsacl);
 
 	if (status)
 		goto out;
@@ -3082,6 +3109,10 @@ static u32 nfsd4_getattr_rsize(const struct svc_rqst *rqstp,
 		return nfsd4_max_payload(rqstp);
 	if (bmap0 & FATTR4_WORD0_FS_LOCATIONS)
 		return nfsd4_max_payload(rqstp);
+#ifdef CONFIG_TRUENAS
+	if (bmap1 & FATTR4_WORD1_DACL)
+		return nfsd4_max_payload(rqstp);
+#endif /* CONFIG_TRUENAS */
 
 	if (bmap1 & FATTR4_WORD1_OWNER) {
 		ret += IDMAP_NAMESZ + 4;

@@ -115,6 +115,43 @@ nfserrno (int errno)
 	return nfserr_io;
 }
 
+/*
+ * Called from nfsd_cross_mnt and is used to determine
+ * whether we need to set LOOKUP_AUTOMOUNT flag.
+ *
+ * ZFSCTL_INO_SNAPDIR is defined in sys/zfs_ctldir.h
+ * and is unlikely to change. This is a hard-coded inode
+ * number for .zfs/snapshot directory in the ZFS ctldir.
+ *
+ * If we know the parent inode number is the snapdir then
+ * we also know that the current dentry is for an auto-
+ * mounted snapshot.
+ */
+#ifdef CONFIG_TRUENAS
+static int
+is_in_zfs_snapdir(struct dentry *dentry)
+{
+#define ZFSCTL_INO_SNAPDIR 0x0000FFFFFFFFFFFDULL
+
+	struct dentry *dp = dentry->d_parent;
+	struct inode *inode = NULL;
+
+	if (dp == NULL)
+		return 0;
+
+	inode = d_inode(dp);
+	if (inode == NULL)
+		return 0;
+
+	// Currently only ZFS has large xattr support enabled.
+	if (!IS_LARGE_XATTR(inode))
+		return 0;
+
+	// The ZFS snapdir has a hard-coded inode value
+	return (inode->i_ino == ZFSCTL_INO_SNAPDIR);
+}
+#endif /* CONFIG_TRUENAS */
+
 /* 
  * Called from nfsd_lookup and encode_dirent. Check if we have crossed 
  * a mount point.
@@ -131,9 +168,21 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 			    .dentry = dget(dentry)};
 	unsigned int follow_flags = 0;
 	int err = 0;
+#ifdef CONFIG_TRUENAS
+	int is_snapdir = 0;
+#endif /* CONFIG_TRUENAS */
 
 	if (exp->ex_flags & NFSEXP_CROSSMOUNT)
 		follow_flags = LOOKUP_AUTOMOUNT;
+
+#ifdef CONFIG_TRUENAS
+	// ZFS ctldir specific handling
+	if (exp->ex_flags & NFSEXP_SNAPDIR) {
+		is_snapdir = is_in_zfs_snapdir(dentry);
+		if (is_snapdir)
+			follow_flags = LOOKUP_AUTOMOUNT;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	err = follow_down(&path, follow_flags);
 	if (err < 0)
@@ -160,7 +209,12 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 		path_put(&path);
 		goto out;
 	}
+
+#ifdef CONFIG_TRUENAS
+	if (nfsd_v4client(rqstp) || is_snapdir ||
+#else
 	if (nfsd_v4client(rqstp) ||
+#endif /* CONFIG_TRUENAS */
 		(exp->ex_flags & NFSEXP_CROSSMOUNT) || EX_NOHIDE(exp2)) {
 		/* successfully crossed mount point */
 		/*
@@ -596,15 +650,30 @@ nfsd_setattr(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	if (attr->na_seclabel && attr->na_seclabel->len)
 		attr->na_labelerr = security_inode_setsecctx(dentry,
 			attr->na_seclabel->data, attr->na_seclabel->len);
-	if (IS_ENABLED(CONFIG_FS_POSIX_ACL) && attr->na_pacl)
-		attr->na_aclerr = set_posix_acl(&nop_mnt_idmap,
-						dentry, ACL_TYPE_ACCESS,
-						attr->na_pacl);
-	if (IS_ENABLED(CONFIG_FS_POSIX_ACL) &&
-	    !attr->na_aclerr && attr->na_dpacl && S_ISDIR(inode->i_mode))
-		attr->na_aclerr = set_posix_acl(&nop_mnt_idmap,
-						dentry, ACL_TYPE_DEFAULT,
-						attr->na_dpacl);
+
+	switch(attr->na_acltype) {
+	case ACL_TYPE_POSIX:
+		if (IS_ENABLED(CONFIG_FS_POSIX_ACL) && attr->na_fsacl.posixacl.na_pacl)
+			attr->na_aclerr = set_posix_acl(&nop_mnt_idmap,
+							dentry, ACL_TYPE_ACCESS,
+							attr->na_fsacl.posixacl.na_pacl);
+		if (IS_ENABLED(CONFIG_FS_POSIX_ACL) &&
+		    !attr->na_aclerr && attr->na_fsacl.posixacl.na_dpacl &&
+			S_ISDIR(inode->i_mode))
+			attr->na_aclerr = set_posix_acl(&nop_mnt_idmap,
+							dentry, ACL_TYPE_DEFAULT,
+							attr->na_fsacl.posixacl.na_dpacl);
+		break;
+	case ACL_TYPE_ZFS:
+		if (attr->na_fsacl.zfsacl.aclbuf)
+			attr->na_aclerr = nfsv4_set_zfacl_from_attr(dentry, attr);
+		break;
+	case ACL_TYPE_NONE:
+		break;
+	default:
+		BUG();
+	};
+
 out_fill_attrs:
 	/*
 	 * RFC 1813 Section 3.3.2 does not mandate that an NFS server
@@ -1546,7 +1615,7 @@ nfsd_create_locked(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		iap->ia_mode = 0;
 	iap->ia_mode = (iap->ia_mode & S_IALLUGO) | type;
 
-	if (!IS_POSIXACL(dirp))
+	if (!IS_POSIXACL(dirp) && !IS_NFSV4ACL(dirp))
 		iap->ia_mode &= ~current_umask();
 
 	err = 0;
@@ -2670,6 +2739,20 @@ nfsd_permission(struct svc_cred *cred, struct svc_export *exp,
 	/* This assumes  NFSD_MAY_{READ,WRITE,EXEC} == MAY_{READ,WRITE,EXEC} */
 	err = inode_permission(&nop_mnt_idmap, inode,
 			       acc & (MAY_READ | MAY_WRITE | MAY_EXEC));
+
+	/*
+	 * See RFC 5661 Section 6.2.1.3.2
+	 * Allow NFSv4 ACL to override normal delete permission
+	 * In this case REMOVE is granted if DELETE is granted on file
+	 * or DELETE_CHILD is granted on parent.
+	 */
+	if ((err == -EACCES) && IS_NFSV4ACL(inode) &&
+	    (acc == NFSD_MAY_REMOVE)) {
+		err = inode_permission(&nop_mnt_idmap, inode, MAY_DELETE);
+		if (err == -EACCES)
+			err = inode_permission(&nop_mnt_idmap, d_inode(dentry->d_parent),
+			    MAY_DELETE_CHILD);
+	}
 
 	/* Allow read access to binaries even when mode 111 */
 	if (err == -EACCES && S_ISREG(inode->i_mode) &&

@@ -3147,7 +3147,20 @@ static struct nvme_subsystem *__nvme_find_get_subsystem(const char *subsysnqn)
 		return NULL;
 
 	list_for_each_entry(subsys, &nvme_subsystems, entry) {
+		bool valid_ctrl = false;
+		struct nvme_ctrl *ctrl;
+
 		if (strcmp(subsys->subnqn, subsysnqn))
+			continue;
+		if (list_empty(&subsys->ctrls))
+			continue;
+		list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry) {
+			if (!nvme_state_terminal(ctrl)) {
+				valid_ctrl = true;
+				break;
+			}
+		}
+		if (!valid_ctrl)
 			continue;
 		if (!kref_get_unless_zero(&subsys->ref))
 			continue;
@@ -3374,8 +3387,10 @@ static int nvme_init_non_mdts_limits(struct nvme_ctrl *ctrl)
 	else
 		ctrl->max_zeroes_sectors = 0;
 
+	/* NVME_ID_CNS_CS_CTRL is supported from v2.0.0 onwards. */
 	if (!nvme_is_io_ctrl(ctrl) ||
 	    !nvme_id_cns_ok(ctrl, NVME_ID_CNS_CS_CTRL) ||
+	    ctrl->vs < NVME_VS(2, 0, 0) ||
 	    test_bit(NVME_CTRL_SKIP_ID_CNS_CS, &ctrl->flags))
 		return 0;
 

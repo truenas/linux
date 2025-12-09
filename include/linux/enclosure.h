@@ -100,6 +100,8 @@ struct enclosure_device {
 	struct list_head node;
 	struct device edev;
 	struct enclosure_component_callbacks *cb;
+	struct task_struct *poll_task;
+	spinlock_t enc_lock;
 	int components;
 	struct enclosure_component component[];
 };

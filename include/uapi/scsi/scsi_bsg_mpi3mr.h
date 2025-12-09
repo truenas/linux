@@ -487,6 +487,16 @@ struct mpi3_nvme_encapsulated_error_reply {
 	__le32	nvme_completion_entry[4];
 };
 
+struct mpi3_nvme_kencap {
+	struct mpi3_nvme_encapsulated_request *nvme_encap_rqst;
+	struct mpi3_nvme_encapsulated_error_reply *nvme_encap_reply;
+	void *dbuf;
+	int dir;
+	size_t data_size;
+	size_t req_size;
+	size_t rep_size;
+};
+
 #define	MPI3MR_NVME_PRP_SIZE		8 /* PRP size */
 #define	MPI3MR_NVME_CMD_PRP1_OFFSET	24 /* PRP1 offset in NVMe cmd */
 #define	MPI3MR_NVME_CMD_PRP2_OFFSET	32 /* PRP2 offset in NVMe cmd */

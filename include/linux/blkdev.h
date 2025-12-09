@@ -398,6 +398,10 @@ struct queue_limits {
 	unsigned int		discard_alignment;
 	unsigned int		zone_write_granularity;
 
+	unsigned int		max_copy_hw_sectors;
+	unsigned int		max_copy_sectors;
+	unsigned int		max_user_copy_sectors;
+
 	/* atomic write limits */
 	unsigned int		atomic_write_hw_max;
 	unsigned int		atomic_write_max_sectors;
@@ -427,6 +431,24 @@ struct queue_limits {
 	unsigned int		dma_pad_mask;
 
 	struct blk_integrity	integrity;
+};
+
+/* Keeps track of all outstanding copy IO */
+struct blkdev_copy_io {
+	atomic_t refcount;
+	ssize_t copied;
+	int status;
+	struct task_struct *waiter;
+	void (*endio)(void *private, int status, ssize_t copied);
+	void *private;
+};
+
+/* Keeps track of single outstanding copy offload IO */
+struct blkdev_copy_offload_io {
+	struct bio *dst_bio;
+	void   *driver_private;
+	struct blkdev_copy_io *cio;
+	loff_t offset;
 };
 
 typedef int (*report_zones_cb)(struct blk_zone *zone, unsigned int idx,
@@ -1116,6 +1138,8 @@ static inline void blk_queue_disable_write_zeroes(struct request_queue *q)
 /*
  * Access functions for manipulating queue properties
  */
+extern void blk_queue_max_copy_hw_sectors(struct request_queue *q,
+					  unsigned int max_copy_sectors);
 extern void blk_set_queue_depth(struct request_queue *q, unsigned int depth);
 extern void blk_set_stacking_limits(struct queue_limits *lim);
 extern int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
@@ -1245,6 +1269,11 @@ int __blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 		sector_t nr_sects, gfp_t gfp_mask, struct bio **biop);
 int blkdev_issue_secure_erase(struct block_device *bdev, sector_t sector,
 		sector_t nr_sects, gfp_t gfp);
+ssize_t blkdev_copy_offload(struct block_device *bdev, loff_t pos_in,
+			    loff_t pos_out, size_t len,
+			    void (*endio)(void *, int, ssize_t),
+			    void *private, gfp_t gfp_mask,
+			    struct block_device *bdev_out);
 
 #define BLKDEV_ZERO_NOUNMAP	(1 << 0)  /* do not free blocks */
 #define BLKDEV_ZERO_NOFALLBACK	(1 << 1)  /* don't write explicit zeroes */
@@ -1425,6 +1454,14 @@ static inline unsigned int bdev_max_discard_sectors(struct block_device *bdev)
 static inline unsigned int bdev_discard_granularity(struct block_device *bdev)
 {
 	return bdev_limits(bdev)->discard_granularity;
+}
+
+/* Tested till 2GB with zvol testing */
+#define BLK_COPY_MAX_BYTES		(1U << 31)
+
+static inline unsigned int bdev_max_copy_sectors(struct block_device *bdev)
+{
+	return bdev_get_queue(bdev)->limits.max_copy_sectors;
 }
 
 static inline unsigned int

@@ -113,7 +113,11 @@ static int
 xattr_permission(struct mnt_idmap *idmap, struct inode *inode,
 		 const char *name, int mask)
 {
+#ifdef CONFIG_TRUENAS
+	if (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) {
+#else
 	if (mask & MAY_WRITE) {
+#endif
 		int ret;
 
 		ret = may_write_xattr(idmap, inode);
@@ -134,7 +138,11 @@ xattr_permission(struct mnt_idmap *idmap, struct inode *inode,
 	 */
 	if (!strncmp(name, XATTR_TRUSTED_PREFIX, XATTR_TRUSTED_PREFIX_LEN)) {
 		if (!capable(CAP_SYS_ADMIN))
+#ifdef CONFIG_TRUENAS
+			return (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) ? -EPERM : -ENODATA;
+#else
 			return (mask & MAY_WRITE) ? -EPERM : -ENODATA;
+#endif
 		return 0;
 	}
 
@@ -145,9 +153,17 @@ xattr_permission(struct mnt_idmap *idmap, struct inode *inode,
 	 */
 	if (!strncmp(name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN)) {
 		if (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
+#ifdef CONFIG_TRUENAS
+			return (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) ? -EPERM : -ENODATA;
+#else
 			return (mask & MAY_WRITE) ? -EPERM : -ENODATA;
+#endif
 		if (S_ISDIR(inode->i_mode) && (inode->i_mode & S_ISVTX) &&
+#ifdef CONFIG_TRUENAS
+		    (mask & (MAY_WRITE | MAY_WRITE_NAMED_ATTRS)) &&
+#else
 		    (mask & MAY_WRITE) &&
+#endif
 		    !inode_owner_or_capable(idmap, inode))
 			return -EPERM;
 	}
@@ -278,8 +294,20 @@ __vfs_setxattr_locked(struct mnt_idmap *idmap, struct dentry *dentry,
 {
 	struct inode *inode = dentry->d_inode;
 	int error;
-
+#ifdef CONFIG_TRUENAS
+	if (IS_NFSV4ACL(inode)) {
+		error = xattr_permission(idmap, inode, name, MAY_WRITE);
+		if (error) {
+			error = xattr_permission(idmap, inode, name,
+						 MAY_WRITE_NAMED_ATTRS);
+		}
+	}
+	else {
+		error = xattr_permission(idmap, inode, name, MAY_WRITE);
+	}
+#else
 	error = xattr_permission(idmap, inode, name, MAY_WRITE);
+#endif
 	if (error)
 		return error;
 
@@ -537,8 +565,20 @@ __vfs_removexattr_locked(struct mnt_idmap *idmap,
 {
 	struct inode *inode = dentry->d_inode;
 	int error;
-
+#ifdef CONFIG_TRUENAS
+	if (IS_NFSV4ACL(inode)) {
+		error = xattr_permission(idmap, inode, name, MAY_WRITE);
+		if (error) {
+			error = xattr_permission(idmap, inode, name,
+						 MAY_WRITE_NAMED_ATTRS);
+		}
+	}
+	else {
+		error = xattr_permission(idmap, inode, name, MAY_WRITE);
+	}
+#else
 	error = xattr_permission(idmap, inode, name, MAY_WRITE);
+#endif
 	if (error)
 		return error;
 
@@ -613,8 +653,13 @@ int setxattr_copy(const char __user *name, struct kernel_xattr_ctx *ctx)
 		return error;
 
 	if (ctx->size) {
+#ifdef CONFIG_TRUENAS
+		if (ctx->size > XATTR_LARGE_SIZE_MAX)
+			return -E2BIG;
+#else
 		if (ctx->size > XATTR_SIZE_MAX)
 			return -E2BIG;
+#endif
 
 		ctx->kvalue = vmemdup_user(ctx->cvalue, ctx->size);
 		if (IS_ERR(ctx->kvalue)) {
@@ -633,6 +678,12 @@ static int do_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return do_set_acl(idmap, dentry, ctx->kname->name,
 				  ctx->kvalue, ctx->size);
 
+#ifdef CONFIG_TRUENAS
+	if (ctx->size > XATTR_SIZE_MAX &&
+	    (IS_LARGE_XATTR(dentry->d_inode) == 0)) {
+		return -E2BIG;
+	}
+#endif
 	return vfs_setxattr(idmap, dentry, ctx->kname->name,
 			ctx->kvalue, ctx->size, ctx->flags);
 }
@@ -774,8 +825,19 @@ do_getxattr(struct mnt_idmap *idmap, struct dentry *d,
 	void *kvalue = NULL;
 
 	if (ctx->size) {
+#ifdef CONFIG_TRUENAS
+		if ((ctx->size > XATTR_LARGE_SIZE_MAX) &&
+		    IS_LARGE_XATTR(d->d_inode)) {
+			ctx->size = XATTR_LARGE_SIZE_MAX;
+		}
+		else if ((ctx->size > XATTR_SIZE_MAX) &&
+			 (IS_LARGE_XATTR(d->d_inode) == 0)) {
+			ctx->size = XATTR_SIZE_MAX;
+		}
+#else
 		if (ctx->size > XATTR_SIZE_MAX)
 			ctx->size = XATTR_SIZE_MAX;
+#endif
 		kvalue = kvzalloc(ctx->size, GFP_KERNEL);
 		if (!kvalue)
 			return -ENOMEM;

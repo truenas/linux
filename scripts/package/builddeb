@@ -79,28 +79,8 @@ install_maint_scripts () {
 	debhookdir=${KDEB_HOOKDIR:-/etc/kernel /usr/share/kernel}
 	for script in postinst postrm preinst prerm; do
 		mkdir -p "${pdir}/DEBIAN"
-		cat <<-EOF > "${pdir}/DEBIAN/${script}"
-		#!/bin/sh
-
-		set -e
-
-		# Pass maintainer script parameters to hook scripts
-		export DEB_MAINT_PARAMS="\$*"
-
-		# Tell initramfs builder whether it's wanted
-		export INITRD=$(if_enabled_echo CONFIG_BLK_DEV_INITRD Yes No)
-
-		# run-parts will error out if one of its directory arguments does not
-		# exist, so filter the list of hook directories accordingly.
-		hookdirs=
-		for dir in ${debhookdir}; do
-			test -d "\$dir/${script}.d" || continue
-			hookdirs="\$hookdirs \$dir/${script}.d"
-		done
-		hookdirs="\${hookdirs# }"
-		test -n "\$hookdirs" && run-parts --arg="${KERNELRELEASE}" --arg="/${installed_image_path}" \$hookdirs
-		exit 0
-		EOF
+		cp "scripts/package/truenas/$script" "${pdir}/DEBIAN/${script}"
+		sed -i "3i version=$KERNELRELEASE" "${pdir}/DEBIAN/${script}"
 		chmod 755 "${pdir}/DEBIAN/${script}"
 	done
 }
@@ -141,8 +121,8 @@ install_kernel_headers () {
 
 	CC="${DEB_HOST_GNU_TYPE}-gcc" "${srctree}/scripts/package/install-extmod-build" "${pdir}/usr/src/linux-headers-${version}"
 
-	mkdir -p $pdir/lib/modules/$version/
-	ln -s /usr/src/linux-headers-$version $pdir/lib/modules/$version/build
+	mkdir -p $pdir/lib/modules/${KERNELRELEASE}/
+	ln -s /usr/src/linux-headers-$version $pdir/lib/modules/${KERNELRELEASE}/build
 }
 
 install_libc_headers () {
@@ -156,6 +136,18 @@ install_libc_headers () {
 	mv "$pdir/usr/include/asm" "$pdir/usr/include/${DEB_HOST_MULTIARCH}"
 }
 
+install_perf () {
+	tools_dir=debian/$1
+	rm -rf $tools_dir
+	mkdir -p $tools_dir
+	tools_dest=`readlink -f $tools_dir`
+	output=$(readlink -f $objtree)
+	mkdir -p $output/tools/perf
+	output="O=$output/tools/perf"
+	$MAKE -C $srctree/tools/perf $output LDFLAGS= srctree=$(readlink -f $objtree) prefix=$tools_dest/usr NO_LIBTRACEEVENT=1 install
+	dpkg-shlibdeps $tools_dest/usr/bin/*
+}
+
 package=$1
 
 case "${package}" in
@@ -163,8 +155,12 @@ case "${package}" in
 	install_linux_image_dbg "${package}";;
 linux-image-*|user-mode-linux-*)
 	install_linux_image "${package}";;
-linux-libc-dev)
+linux-*-libc-dev)
 	install_libc_headers "${package}";;
 linux-headers-*)
 	install_kernel_headers "${package}";;
+linux-perf-truenas)
+	if is_enabled CONFIG_PERF_EVENTS && echo "${KERNELRELEASE}" | grep -q "production"; then
+		install_perf "${package}"
+	fi;;
 esac
