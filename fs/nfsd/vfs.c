@@ -2749,9 +2749,6 @@ nfsd_permission(struct svc_cred *cred, struct svc_export *exp,
 	if ((err == -EACCES) && IS_NFSV4ACL(inode) &&
 	    (acc == NFSD_MAY_REMOVE)) {
 		err = inode_permission(&nop_mnt_idmap, inode, MAY_DELETE);
-		if (err == -EACCES)
-			err = inode_permission(&nop_mnt_idmap, d_inode(dentry->d_parent),
-			    MAY_DELETE_CHILD);
 	}
 
 	/* Allow read access to binaries even when mode 111 */

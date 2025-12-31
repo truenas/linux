@@ -3293,22 +3293,12 @@ static int may_delete(struct mnt_idmap *idmap, struct inode *dir,
 		 * See RFC 5661 Section 6.2.1.3.2
 		 * for implementation details of DELETE vs DELETE_CHILD.
 		 *
-		 * Since there may be a variety of ways to implement
-		 * allow in VFS if MAY_DELETE is permitted on viction,
-		 * MAY_DELETE_CHILD is permitted on directory, or MAY_WRITE
-		 * and MAY_EXEC are permitted on directory. This allows
-		 * filesystem to enforce stricter permissions if needed.
-		 *
 		 * MAY_WRITE|MAY_EXEC is checked first to give opportunity
 		 * to perform check via generic_permission() first.
 		 */
 		error = inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
 		if (error) {
 			error = inode_permission(idmap, inode, MAY_DELETE);
-			if (error) {
-				error = inode_permission(idmap, dir,
-							 MAY_DELETE_CHILD);
-			}
 		}
 	}
 	else {
