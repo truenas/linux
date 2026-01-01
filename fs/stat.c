@@ -711,8 +711,14 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
 
 	memset(&tmp, 0, sizeof(tmp));
 
+#ifdef CONFIG_TRUENAS
+	/* Expose STX_CHANGE_COOKIE to userspace for samba */
+	tmp.stx_mask = stat->result_mask;
+	tmp.stx_change_cookie = stat->change_cookie;
+#else
 	/* STATX_CHANGE_COOKIE is kernel-only for now */
 	tmp.stx_mask = stat->result_mask & ~STATX_CHANGE_COOKIE;
+#endif
 	tmp.stx_blksize = stat->blksize;
 	/* STATX_ATTR_CHANGE_MONOTONIC is kernel-only for now */
 	tmp.stx_attributes = stat->attributes & ~STATX_ATTR_CHANGE_MONOTONIC;
@@ -760,11 +766,14 @@ int do_statx(int dfd, struct filename *filename, unsigned int flags,
 	if ((flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE)
 		return -EINVAL;
 
+
+#ifndef CONFIG_TRUENAS
 	/*
 	 * STATX_CHANGE_COOKIE is kernel-only for now. Ignore requests
 	 * from userland.
 	 */
 	mask &= ~STATX_CHANGE_COOKIE;
+#endif
 
 	error = vfs_statx(dfd, filename, flags, &stat, mask);
 	if (error)
@@ -784,11 +793,13 @@ int do_statx_fd(int fd, unsigned int flags, unsigned int mask,
 	if ((flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE)
 		return -EINVAL;
 
+#ifndef CONFIG_TRUENAS
 	/*
 	 * STATX_CHANGE_COOKIE is kernel-only for now. Ignore requests
 	 * from userland.
 	 */
 	mask &= ~STATX_CHANGE_COOKIE;
+#endif
 
 	error = vfs_statx_fd(fd, flags, &stat, mask);
 	if (error)
