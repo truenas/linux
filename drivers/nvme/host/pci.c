@@ -1205,6 +1205,11 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	ret = nvme_prep_rq(req);
 	if (unlikely(ret))
 		return ret;
+
+	/* Hang simulation: skip submission, let request timer expire */
+	if (unlikely(atomic_read(&dev->ctrl.simulate_io_hang)))
+		return BLK_STS_OK;
+
 	spin_lock(&nvmeq->sq_lock);
 	nvme_sq_copy_cmd(nvmeq, &iod->cmd);
 	nvme_write_sq_db(nvmeq, bd->last);
@@ -1238,6 +1243,10 @@ static bool nvme_prep_rq_batch(struct nvme_queue *nvmeq, struct request *req)
 	if (unlikely(!test_bit(NVMEQ_ENABLED, &nvmeq->flags)))
 		return false;
 	if (unlikely(!nvme_check_ready(&nvmeq->dev->ctrl, req, true)))
+		return false;
+
+	/* Hang simulation: block batch submission path */
+	if (unlikely(atomic_read(&nvmeq->dev->ctrl.simulate_io_hang)))
 		return false;
 
 	return nvme_prep_rq(req) == BLK_STS_OK;

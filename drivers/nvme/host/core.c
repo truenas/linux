@@ -62,6 +62,10 @@ static unsigned char shutdown_timeout = 5;
 module_param(shutdown_timeout, byte, 0644);
 MODULE_PARM_DESC(shutdown_timeout, "timeout in seconds for controller shutdown");
 
+static bool simulate_hang_forever;
+module_param(simulate_hang_forever, bool, 0644);
+MODULE_PARM_DESC(simulate_hang_forever, "when set with simulate_io_hang, skip timeout in nvme_wait_ready (debug)");
+
 static u8 nvme_max_retries = 5;
 module_param_named(max_retries, nvme_max_retries, byte, 0644);
 MODULE_PARM_DESC(max_retries, "max number of retries a command may have");
@@ -630,6 +634,9 @@ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
 
 	if (changed) {
 		WRITE_ONCE(ctrl->state, new_state);
+		/* Auto-clear hang simulation on DEAD state */
+		if (new_state == NVME_CTRL_DEAD)
+			atomic_set(&ctrl->simulate_io_hang, 0);
 		wake_up_all(&ctrl->state_wq);
 	}
 
@@ -2624,22 +2631,29 @@ static int nvme_wait_ready(struct nvme_ctrl *ctrl, u32 mask, u32 val,
 		u32 timeout, const char *op)
 {
 	unsigned long timeout_jiffies = jiffies + timeout * HZ;
+	unsigned long start_jiffies = jiffies;
 	u32 csts;
 	int ret;
 
 	while ((ret = ctrl->ops->reg_read32(ctrl, NVME_REG_CSTS, &csts)) == 0) {
 		if (csts == ~0)
 			return -ENODEV;
-		if ((csts & mask) == val)
+		/* Hang simulation: skip ready check to force timeout path */
+		if (atomic_read(&ctrl->simulate_io_hang))
+			;
+		else if ((csts & mask) == val)
 			break;
 
 		usleep_range(1000, 2000);
 		if (fatal_signal_pending(current))
 			return -EINTR;
-		if (time_after(jiffies, timeout_jiffies)) {
+		/* Hang forever if both simulate_io_hang and simulate_hang_forever set */
+		if (time_after(jiffies, timeout_jiffies) &&
+		    !(atomic_read(&ctrl->simulate_io_hang) && simulate_hang_forever)) {
 			dev_err(ctrl->device,
-				"Device not ready; aborting %s, CSTS=0x%x\n",
-				op, csts);
+				"Device not ready; aborting %s, CSTS=0x%x (waited %ums)\n",
+				op, csts,
+				jiffies_to_msecs(jiffies - start_jiffies));
 			return -ENODEV;
 		}
 	}
@@ -5123,6 +5137,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
 	INIT_DELAYED_WORK(&ctrl->ka_work, nvme_keep_alive_work);
 	INIT_DELAYED_WORK(&ctrl->failfast_work, nvme_failfast_work);
 	memset(&ctrl->ka_cmd, 0, sizeof(ctrl->ka_cmd));
+	atomic_set(&ctrl->simulate_io_hang, 0);
 	ctrl->ka_cmd.common.opcode = nvme_admin_keep_alive;
 	ctrl->ka_last_check_time = jiffies;
 

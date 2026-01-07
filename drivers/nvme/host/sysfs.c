@@ -719,6 +719,72 @@ static DEVICE_ATTR(dhchap_ctrl_secret, S_IRUGO | S_IWUSR,
 	nvme_ctrl_dhchap_ctrl_secret_show, nvme_ctrl_dhchap_ctrl_secret_store);
 #endif
 
+/*
+ * simulate_io_hang - Emulate permanently hung controller (debug/testing).
+ * Triggers timeout → abort → reset → DEAD sequence. Auto-clears on DEAD.
+ * Use recover_controller to restore from DEAD state.
+ */
+static ssize_t simulate_io_hang_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", atomic_read(&ctrl->simulate_io_hang));
+}
+
+static ssize_t simulate_io_hang_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
+	int val, err;
+
+	err = kstrtoint(buf, 10, &val);
+	if (err)
+		return err;
+
+	atomic_set(&ctrl->simulate_io_hang, !!val);
+	return count;
+}
+static DEVICE_ATTR_RW(simulate_io_hang);
+
+/*
+ * recover_controller - Force recovery from DEAD state (debug/testing).
+ * Removes dead namespaces, forces RESETTING state, queues reset work.
+ * Only works when hardware is still accessible (CSTS readable).
+ */
+static ssize_t recover_controller_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 csts;
+	int ret;
+
+	if (nvme_ctrl_state(ctrl) != NVME_CTRL_DEAD)
+		return -EINVAL;
+
+	if (!ctrl->ops->reg_read32)
+		return -EOPNOTSUPP;
+
+	ret = ctrl->ops->reg_read32(ctrl, NVME_REG_CSTS, &csts);
+	if (ret || csts == ~0U)
+		return ret ? -EIO : -ENODEV;
+
+	dev_info(ctrl->device, "recovering from DEAD state\n");
+
+	nvme_remove_namespaces(ctrl);
+
+	spin_lock_irqsave(&ctrl->lock, flags);
+	WRITE_ONCE(ctrl->state, NVME_CTRL_RESETTING);
+	spin_unlock_irqrestore(&ctrl->lock, flags);
+
+	queue_work(nvme_reset_wq, &ctrl->reset_work);
+	return count;
+}
+static DEVICE_ATTR_WO(recover_controller);
+
 static struct attribute *nvme_dev_attrs[] = {
 	&dev_attr_reset_controller.attr,
 	&dev_attr_rescan_controller.attr,
@@ -747,6 +813,8 @@ static struct attribute *nvme_dev_attrs[] = {
 	&dev_attr_dhchap_ctrl_secret.attr,
 #endif
 	&dev_attr_adm_passthru_err_log_enabled.attr,
+	&dev_attr_simulate_io_hang.attr,
+	&dev_attr_recover_controller.attr,
 	NULL
 };
 
