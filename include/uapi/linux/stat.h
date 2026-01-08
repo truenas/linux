@@ -186,8 +186,11 @@ struct statx {
 	__u32	stx_atomic_write_unit_max_opt;
 	__u32	__spare2[1];
 
+	/* Expose change cookie for durable / persistent handles in samba */
+	__u64	stx_change_cookie;
+
 	/* 0xc0 */
-	__u64	__spare3[8];	/* Spare space for future expansion */
+	__u64	__spare3[7];	/* Spare space for future expansion */
 
 	/* 0x100 */
 };
@@ -219,6 +222,8 @@ struct statx {
 #define STATX_SUBVOL		0x00008000U	/* Want/got stx_subvol */
 #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
 #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
+
+#define STATX_CHANGE_COOKIE	0x40000000U	/* Want/got stx_change_attr */
 
 #define STATX__RESERVED		0x80000000U	/* Reserved for future struct statx expansion */
 
