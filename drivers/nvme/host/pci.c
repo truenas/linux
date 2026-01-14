@@ -171,6 +171,7 @@ struct nvme_dev {
 	struct nvme_ctrl ctrl;
 	u32 last_ps;
 	bool hmb;
+	bool hung_device;
 	struct sg_table *hmb_sgt;
 	mempool_t *dmavec_mempool;
 
@@ -1742,6 +1743,15 @@ disable:
 	}
 
 	nvme_dev_disable(dev, false);
+
+	/*
+	 * Detect hung device. If device does not respond after
+	 * io + abort + CAP.TO timeout, no point of trying again
+	 * in reset work which would cause another CAP.TO wait.
+	 */
+	if (readl(dev->bar + NVME_REG_CSTS) & NVME_CSTS_RDY)
+		dev->hung_device = true;
+
 	if (nvme_try_sched_reset(&dev->ctrl))
 		nvme_unquiesce_io_queues(&dev->ctrl);
 	return BLK_EH_DONE;
@@ -3026,7 +3036,14 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 	nvme_quiesce_io_queues(&dev->ctrl);
 
 	if (!dead && dev->ctrl.queue_count > 0) {
-		nvme_delete_io_queues(dev);
+		/*
+		 * Skip queue deletion during reset - controller disable
+		 * deletes all queues per spec. Only do explicit deletion
+		 * during clean shutdown. This also avoids admin_timeout
+		 * wait if delete commands hang on an unresponsive device.
+		 */
+		if (shutdown)
+			nvme_delete_io_queues(dev);
 		nvme_disable_ctrl(&dev->ctrl, shutdown);
 		nvme_poll_irqdisable(&dev->queues[0]);
 	}
@@ -3097,11 +3114,23 @@ static void nvme_reset_work(struct work_struct *work)
 	struct nvme_dev *dev =
 		container_of(work, struct nvme_dev, ctrl.reset_work);
 	bool was_suspend = !!(dev->ctrl.ctrl_config & NVME_CC_SHN_NORMAL);
+	bool was_hung = dev->hung_device;
 	int result;
+
+	dev->hung_device = false;
 
 	if (nvme_ctrl_state(&dev->ctrl) != NVME_CTRL_RESETTING) {
 		dev_warn(dev->ctrl.device, "ctrl state %d is not RESETTING\n",
 			 dev->ctrl.state);
+		result = -ENODEV;
+		goto out;
+	}
+
+	/*
+	 * If device was hung (didn't respond after io + abort + CAP.TO),
+	 * skip re-enable to avoid another CAP.TO wait.
+	 */
+	if (was_hung) {
 		result = -ENODEV;
 		goto out;
 	}
@@ -3202,6 +3231,10 @@ static void nvme_reset_work(struct work_struct *work)
 	nvme_mark_namespaces_dead(&dev->ctrl);
 	nvme_unquiesce_io_queues(&dev->ctrl);
 	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DEAD);
+
+	/* Remove namespaces for hung devices after DEAD state */
+	if (was_hung)
+		nvme_remove_namespaces(&dev->ctrl);
 }
 
 static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
