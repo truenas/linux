@@ -138,6 +138,7 @@ struct nvme_queue;
 static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown);
 static void nvme_delete_io_queues(struct nvme_dev *dev);
 static void nvme_update_attrs(struct nvme_dev *dev);
+static bool nvme_pci_ctrl_is_dead(struct nvme_dev *dev);
 
 struct nvme_descriptor_pools {
 	struct dma_pool *large;
@@ -171,6 +172,13 @@ struct nvme_dev {
 	struct nvme_ctrl ctrl;
 	u32 last_ps;
 	bool hmb;
+#ifdef CONFIG_TRUENAS
+	bool hung_device;
+
+	/* NSSR tracking */
+	bool nssr_pending;
+	struct completion nssr_done;
+#endif
 	struct sg_table *hmb_sgt;
 	mempool_t *dmavec_mempool;
 
@@ -1617,6 +1625,9 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req)
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
 	u32 csts = readl(dev->bar + NVME_REG_CSTS);
 	u8 opcode;
+#ifdef CONFIG_TRUENAS
+	bool try_nssr = false;
+#endif
 
 	/*
 	 * Shutdown the device immediately if we see it is disconnected. This
@@ -1690,6 +1701,16 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req)
 	 * returned to the driver, or if this is the admin queue.
 	 */
 	opcode = nvme_req(req)->cmd->common.opcode;
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Skip abort and go directly to controller reset, following FreeBSD.
+	 * I/O timeout often indicates controller-level issues where aborts
+	 * may not work. Reduces recovery time from 60s to 30s for hung devices.
+	 */
+	nvme_req(req)->flags |= NVME_REQ_CANCELLED;
+	try_nssr = true;
+	goto disable;
+#endif
 	if (!nvmeq->qid || (iod->flags & IOD_ABORTED)) {
 		dev_warn(dev->ctrl.device,
 			 "I/O tag %d (%04x) opcode %#x (%s) QID %d timeout, reset controller\n",
@@ -1741,7 +1762,56 @@ disable:
 		return BLK_EH_DONE;
 	}
 
+#ifdef CONFIG_TRUENAS
+	if (try_nssr && dev->subsystem && pdev->bus->self &&
+	    pdev->bus->self->is_hotplug_bridge) {
+		bool nssr_ok = false;
+
+		init_completion(&dev->nssr_done);
+
+		mutex_lock(&dev->shutdown_lock);
+		if (dev->bar_mapped_size) {
+			dev->nssr_pending = true;
+			writel(NVME_SUBSYS_RESET, dev->bar + NVME_REG_NSSR);
+			readl(dev->bar + NVME_REG_CSTS);
+			nssr_ok = true;
+		}
+		mutex_unlock(&dev->shutdown_lock);
+
+		if (nssr_ok &&
+		    wait_for_completion_timeout(&dev->nssr_done, 5 * HZ)) {
+			dev_warn(dev->ctrl.device,
+				 "I/O tag %d (%04x) opcode %#x (%s) QID %d timeout, NSSR\n",
+				 req->tag, nvme_cid(req), opcode,
+				 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid);
+			return BLK_EH_DONE;
+		}
+
+		if (nssr_ok)
+			dev->nssr_pending = false;
+	}
+
+	if (try_nssr)
+		dev_warn(dev->ctrl.device,
+			 "I/O tag %d (%04x) opcode %#x (%s) QID %d timeout, reset controller\n",
+			 req->tag, nvme_cid(req), opcode,
+			 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid);
+#endif
+
 	nvme_dev_disable(dev, false);
+
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Detect hung device. If device does not respond after
+	 * io + abort + CAP.TO timeout, no point of trying again
+	 * in reset work which would cause another CAP.TO wait.
+	 */
+	mutex_lock(&dev->shutdown_lock);
+	if (!nvme_pci_ctrl_is_dead(dev))
+		dev->hung_device = true;
+	mutex_unlock(&dev->shutdown_lock);
+#endif
+
 	if (nvme_try_sched_reset(&dev->ctrl))
 		nvme_unquiesce_io_queues(&dev->ctrl);
 	return BLK_EH_DONE;
@@ -3026,7 +3096,18 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 	nvme_quiesce_io_queues(&dev->ctrl);
 
 	if (!dead && dev->ctrl.queue_count > 0) {
+#ifdef CONFIG_TRUENAS
+		/*
+		 * Skip queue deletion during reset - controller disable
+		 * deletes all queues per spec. Only do explicit deletion
+		 * during clean shutdown. This also avoids admin_timeout
+		 * wait if delete commands hang on an unresponsive device.
+		 */
+		if (shutdown)
+			nvme_delete_io_queues(dev);
+#else
 		nvme_delete_io_queues(dev);
+#endif
 		nvme_disable_ctrl(&dev->ctrl, shutdown);
 		nvme_poll_irqdisable(&dev->queues[0]);
 	}
@@ -3099,12 +3180,28 @@ static void nvme_reset_work(struct work_struct *work)
 	bool was_suspend = !!(dev->ctrl.ctrl_config & NVME_CC_SHN_NORMAL);
 	int result;
 
+#ifdef CONFIG_TRUENAS
+	bool was_hung = dev->hung_device;
+	dev->hung_device = false;
+#endif
+
 	if (nvme_ctrl_state(&dev->ctrl) != NVME_CTRL_RESETTING) {
 		dev_warn(dev->ctrl.device, "ctrl state %d is not RESETTING\n",
 			 dev->ctrl.state);
 		result = -ENODEV;
 		goto out;
 	}
+
+#ifdef CONFIG_TRUENAS
+	/*
+	 * If device was hung (didn't respond after io + abort + CAP.TO),
+	 * skip re-enable to avoid another CAP.TO wait.
+	 */
+	if (was_hung) {
+		result = -ENODEV;
+		goto out;
+	}
+#endif
 
 	/*
 	 * If we're called to reset a live controller first shut it down before
@@ -3202,6 +3299,12 @@ static void nvme_reset_work(struct work_struct *work)
 	nvme_mark_namespaces_dead(&dev->ctrl);
 	nvme_unquiesce_io_queues(&dev->ctrl);
 	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DEAD);
+
+#ifdef CONFIG_TRUENAS
+	/* Remove namespaces for hung devices after DEAD state */
+	if (was_hung)
+		nvme_remove_namespaces(&dev->ctrl);
+#endif
 }
 
 static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
@@ -3568,11 +3671,21 @@ static void nvme_shutdown(struct pci_dev *pdev)
 static void nvme_remove(struct pci_dev *pdev)
 {
 	struct nvme_dev *dev = pci_get_drvdata(pdev);
+	bool dead = false;
+
+#ifdef CONFIG_TRUENAS
+	dead = dev->nssr_pending;
+	if (dead) {
+		dev->nssr_pending = false;
+		complete(&dev->nssr_done);
+	}
+#endif
 
 	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
 	pci_set_drvdata(pdev, NULL);
 
-	if (!pci_device_is_present(pdev)) {
+	dead |= !pci_device_is_present(pdev);
+	if (dead) {
 		nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DEAD);
 		nvme_dev_disable(dev, true);
 	}
@@ -3580,7 +3693,12 @@ static void nvme_remove(struct pci_dev *pdev)
 	flush_work(&dev->ctrl.reset_work);
 	nvme_stop_ctrl(&dev->ctrl);
 	nvme_remove_namespaces(&dev->ctrl);
+#if defined(CONFIG_TRUENAS)
+	if (!dead)
+		nvme_dev_disable(dev, true);
+#else
 	nvme_dev_disable(dev, true);
+#endif
 	nvme_free_host_mem(dev);
 	nvme_dev_remove_admin(dev);
 	nvme_dbbuf_dma_free(dev);
