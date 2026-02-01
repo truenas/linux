@@ -143,6 +143,12 @@ static bool nssr_debug = true;
 module_param(nssr_debug, bool, 0644);
 MODULE_PARM_DESC(nssr_debug,
 	"Enable verbose NSSR and hung device detection logging for debugging.");
+
+static bool nssr_mask_aer = true;
+module_param(nssr_mask_aer, bool, 0644);
+MODULE_PARM_DESC(nssr_mask_aer,
+	"Mask Completion Timeout AER errors on upstream port during NSSR to "
+	"prevent false error recovery on other devices in the PCIe hierarchy.");
 #endif
 
 struct nvme_dev;
@@ -1788,6 +1794,9 @@ disable:
 	if (try_nssr && enable_nssr && dev->subsystem) {
 		bool nssr_ok = false;
 		unsigned long start = jiffies;
+		struct pci_dev *bridge = pdev->bus->self;
+		int aer_cap = 0;
+		u32 aer_mask_orig = 0;
 
 		if (nssr_debug)
 			dev_warn(dev->ctrl.device,
@@ -1796,6 +1805,20 @@ disable:
 				 pdev->bus->self ? pdev->bus->self->is_hotplug_bridge : 0);
 
 		init_completion(&dev->nssr_done);
+
+		/* Mask Completion Timeout on upstream port to prevent AER cascade */
+		if (nssr_mask_aer && bridge) {
+			aer_cap = pci_find_ext_capability(bridge, PCI_EXT_CAP_ID_ERR);
+			if (aer_cap) {
+				pci_read_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+						      &aer_mask_orig);
+				pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+						       aer_mask_orig | PCI_ERR_UNC_COMP_TIME);
+				if (nssr_debug)
+					dev_info(&pdev->dev, "NSSR: masked CmpltTO on %s\n",
+						 pci_name(bridge));
+			}
+		}
 
 		mutex_lock(&dev->shutdown_lock);
 		if (dev->bar_mapped_size) {
@@ -1819,7 +1842,29 @@ disable:
 				 req->tag, nvme_cid(req), opcode,
 				 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid,
 				 jiffies_to_msecs(jiffies - start));
+			/* Restore AER mask if we masked it */
+			if (aer_cap) {
+				pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_STATUS,
+						       PCI_ERR_UNC_COMP_TIME);
+				pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+						       aer_mask_orig);
+				if (nssr_debug)
+					dev_info(&pdev->dev, "NSSR: restored AER on %s (success)\n",
+						 pci_name(bridge));
+			}
 			return BLK_EH_DONE;
+		}
+
+
+		/* Restore AER mask if we masked it */
+		if (aer_cap) {
+			pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_STATUS,
+					       PCI_ERR_UNC_COMP_TIME);
+			pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+					       aer_mask_orig);
+			if (nssr_debug)
+				dev_info(&pdev->dev, "NSSR: restored AER on %s (fallback)\n",
+					 pci_name(bridge));
 		}
 
 		if (nssr_ok) {
