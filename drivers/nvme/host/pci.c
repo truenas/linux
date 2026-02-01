@@ -132,6 +132,19 @@ static bool noacpi;
 module_param(noacpi, bool, 0444);
 MODULE_PARM_DESC(noacpi, "disable acpi bios quirks");
 
+#ifdef CONFIG_TRUENAS
+static bool enable_nssr = true;
+module_param(enable_nssr, bool, 0644);
+MODULE_PARM_DESC(enable_nssr,
+	"Enable NSSR (NVM Subsystem Reset) for fast hung device removal on "
+	"hotplug-capable slots. If disabled, use standard controller reset.");
+
+static bool nssr_debug = true;
+module_param(nssr_debug, bool, 0644);
+MODULE_PARM_DESC(nssr_debug,
+	"Enable verbose NSSR and hung device detection logging for debugging.");
+#endif
+
 struct nvme_dev;
 struct nvme_queue;
 
@@ -1772,9 +1785,15 @@ disable:
 	}
 
 #ifdef CONFIG_TRUENAS
-	if (try_nssr && dev->subsystem && pdev->bus->self &&
-	    pdev->bus->self->is_hotplug_bridge) {
+	if (try_nssr && enable_nssr && dev->subsystem) {
 		bool nssr_ok = false;
+		unsigned long start = jiffies;
+
+		if (nssr_debug)
+			dev_warn(dev->ctrl.device,
+				 "I/O timeout, attempting NSSR (subsystem=%d, hotplug=%d)\n",
+				 dev->subsystem,
+				 pdev->bus->self ? pdev->bus->self->is_hotplug_bridge : 0);
 
 		init_completion(&dev->nssr_done);
 
@@ -1784,27 +1803,45 @@ disable:
 			writel(NVME_SUBSYS_RESET, dev->bar + NVME_REG_NSSR);
 			readl(dev->bar + NVME_REG_CSTS);
 			nssr_ok = true;
+			if (nssr_debug)
+				dev_warn(dev->ctrl.device,
+					 "NSSR write completed, waiting for removal (timeout=5s)\n");
+		} else {
+			if (nssr_debug)
+				dev_warn(dev->ctrl.device, "NSSR skipped: BAR not mapped\n");
 		}
 		mutex_unlock(&dev->shutdown_lock);
 
 		if (nssr_ok &&
 		    wait_for_completion_timeout(&dev->nssr_done, 5 * HZ)) {
 			dev_warn(dev->ctrl.device,
-				 "I/O tag %d (%04x) opcode %#x (%s) QID %d timeout, NSSR\n",
+				 "I/O tag %d (%04x) opcode %#x (%s) QID %d timeout, NSSR removal after %ums\n",
 				 req->tag, nvme_cid(req), opcode,
-				 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid);
+				 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid,
+				 jiffies_to_msecs(jiffies - start));
 			return BLK_EH_DONE;
 		}
 
-		if (nssr_ok)
+		if (nssr_ok) {
+			dev_warn(dev->ctrl.device,
+				 "NSSR timeout after %ums, falling back to reset\n",
+				 jiffies_to_msecs(jiffies - start));
 			dev->nssr_pending = false;
+		}
 	}
 
-	if (try_nssr)
-		dev_warn(dev->ctrl.device,
-			 "I/O tag %d (%04x) opcode %#x (%s) QID %d timeout, reset controller\n",
-			 req->tag, nvme_cid(req), opcode,
-			 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid);
+	if (try_nssr) {
+		if (!enable_nssr)
+			dev_warn(dev->ctrl.device,
+				 "I/O tag %d (%04x) opcode %#x (%s) QID %d timeout, NSSR disabled via module param, using reset\n",
+				 req->tag, nvme_cid(req), opcode,
+				 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid);
+		else
+			dev_warn(dev->ctrl.device,
+				 "I/O tag %d (%04x) opcode %#x (%s) QID %d timeout, reset controller\n",
+				 req->tag, nvme_cid(req), opcode,
+				 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid);
+	}
 #endif
 
 	nvme_dev_disable(dev, false);
@@ -1816,8 +1853,14 @@ disable:
 	 * in reset work which would cause another CAP.TO wait.
 	 */
 	mutex_lock(&dev->shutdown_lock);
-	if (!nvme_pci_ctrl_is_dead(dev))
+	if (atomic_read(&dev->ctrl.simulate_io_hang) || !nvme_pci_ctrl_is_dead(dev)) {
 		dev->hung_device = true;
+		if (nssr_debug)
+			dev_warn(dev->ctrl.device, "Hung device detected, will skip re-enable\n");
+	} else {
+		if (nssr_debug)
+			dev_warn(dev->ctrl.device, "Device is dead after disable, not marking as hung\n");
+	}
 	mutex_unlock(&dev->shutdown_lock);
 #endif
 
@@ -3112,8 +3155,13 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 		 * during clean shutdown. This also avoids admin_timeout
 		 * wait if delete commands hang on an unresponsive device.
 		 */
-		if (shutdown)
+		if (shutdown) {
 			nvme_delete_io_queues(dev);
+		} else {
+			if (nssr_debug)
+				dev_warn(dev->ctrl.device,
+					 "Skipping queue deletion during reset (shutdown=false)\n");
+		}
 #else
 		nvme_delete_io_queues(dev);
 #endif
@@ -3192,6 +3240,8 @@ static void nvme_reset_work(struct work_struct *work)
 #ifdef CONFIG_TRUENAS
 	bool was_hung = dev->hung_device;
 	dev->hung_device = false;
+	if (nssr_debug && was_hung)
+		dev_warn(dev->ctrl.device, "reset_work: device was marked as hung\n");
 #endif
 
 	if (nvme_ctrl_state(&dev->ctrl) != NVME_CTRL_RESETTING) {
@@ -3207,6 +3257,8 @@ static void nvme_reset_work(struct work_struct *work)
 	 * skip re-enable to avoid another CAP.TO wait.
 	 */
 	if (was_hung) {
+		dev_warn(dev->ctrl.device,
+			 "Skipping re-enable for hung device, avoiding second CAP.TO wait\n");
 		result = -ENODEV;
 		goto out;
 	}
@@ -3291,6 +3343,10 @@ static void nvme_reset_work(struct work_struct *work)
 	}
 
 	nvme_start_ctrl(&dev->ctrl);
+#ifdef CONFIG_TRUENAS
+	if (nssr_debug)
+		dev_warn(dev->ctrl.device, "reset_work: completed successfully, controller LIVE\n");
+#endif
 	return;
 
  out_unlock:
@@ -3311,8 +3367,16 @@ static void nvme_reset_work(struct work_struct *work)
 
 #ifdef CONFIG_TRUENAS
 	/* Remove namespaces for hung devices after DEAD state */
-	if (was_hung)
+	if (was_hung) {
 		nvme_remove_namespaces(&dev->ctrl);
+		if (nssr_debug)
+			dev_warn(dev->ctrl.device,
+				 "reset_work: completed, controller DEAD, namespaces removed (was_hung=1)\n");
+	} else {
+		if (nssr_debug)
+			dev_warn(dev->ctrl.device,
+				 "reset_work: completed, controller DEAD (was_hung=0)\n");
+	}
 #endif
 }
 
@@ -3685,8 +3749,13 @@ static void nvme_remove(struct pci_dev *pdev)
 #ifdef CONFIG_TRUENAS
 	dead = dev->nssr_pending;
 	if (dead) {
+		if (nssr_debug)
+			dev_warn(dev->ctrl.device, "nvme_remove: NSSR removal path, signaling completion\n");
 		dev->nssr_pending = false;
 		complete(&dev->nssr_done);
+	} else {
+		if (nssr_debug)
+			dev_warn(dev->ctrl.device, "nvme_remove: normal removal path\n");
 	}
 #endif
 
@@ -3714,6 +3783,10 @@ static void nvme_remove(struct pci_dev *pdev)
 	nvme_free_queues(dev, 0);
 	mempool_destroy(dev->dmavec_mempool);
 	nvme_release_descriptor_pools(dev);
+#if defined(CONFIG_TRUENAS)
+	if (nssr_debug)
+		dev_warn(dev->ctrl.device, "nvme_remove: completed (dead=%d)\n", dead);
+#endif
 	nvme_dev_unmap(dev);
 	nvme_uninit_ctrl(&dev->ctrl);
 }
