@@ -1795,6 +1795,7 @@ disable:
 		bool nssr_ok = false;
 		unsigned long start = jiffies;
 		struct pci_dev *bridge = pdev->bus->self;
+		struct pci_dev *aer_port = NULL;
 		int aer_cap = 0;
 		u32 aer_mask_orig = 0;
 
@@ -1806,17 +1807,99 @@ disable:
 
 		init_completion(&dev->nssr_done);
 
-		/* Mask Completion Timeout on upstream port to prevent AER cascade */
+		/*
+		 * Mask Completion Timeout on the ROOT PORT.
+		 * CmpltTO is detected by the requester of the transaction. For NSSR,
+		 * the CPU initiates the write which goes through the root port.
+		 * The root port is the requester and detects the timeout when the
+		 * NVMe device drops the link without sending a completion.
+		 *
+		 * We must mask at the root port, not intermediate switch ports,
+		 * because the root port is where the error is actually detected.
+		 */
 		if (nssr_mask_aer && bridge) {
-			aer_cap = pci_find_ext_capability(bridge, PCI_EXT_CAP_ID_ERR);
+			struct pci_dev *port = bridge;
+
+			if (nssr_debug)
+				dev_info(&pdev->dev, "NSSR: walking PCIe hierarchy from %s to root port\n",
+					 pci_name(port));
+
+			/*
+			 * Walk up the hierarchy all the way to the root port.
+			 * Topology: Device -> Downstream Port -> Switch -> Upstream Port -> Root Port
+			 */
+			while (port) {
+				int pcie_type = pci_pcie_type(port);
+				const char *type_str = "Unknown";
+
+				switch (pcie_type) {
+				case PCI_EXP_TYPE_ENDPOINT:
+					type_str = "Endpoint";
+					break;
+				case PCI_EXP_TYPE_LEG_END:
+					type_str = "Legacy Endpoint";
+					break;
+				case PCI_EXP_TYPE_ROOT_PORT:
+					type_str = "Root Port";
+					break;
+				case PCI_EXP_TYPE_UPSTREAM:
+					type_str = "Upstream Port";
+					break;
+				case PCI_EXP_TYPE_DOWNSTREAM:
+					type_str = "Downstream Port";
+					break;
+				case PCI_EXP_TYPE_PCI_BRIDGE:
+					type_str = "PCIe-to-PCI Bridge";
+					break;
+				case PCI_EXP_TYPE_PCIE_BRIDGE:
+					type_str = "PCI-to-PCIe Bridge";
+					break;
+				case PCI_EXP_TYPE_RC_END:
+					type_str = "Root Complex Endpoint";
+					break;
+				case PCI_EXP_TYPE_RC_EC:
+					type_str = "Root Complex Event Collector";
+					break;
+				}
+
+				if (nssr_debug)
+					dev_info(&pdev->dev, "NSSR:   %s (%s)\n",
+						 pci_name(port), type_str);
+
+				if (pcie_type == PCI_EXP_TYPE_ROOT_PORT) {
+					aer_port = port;
+					if (nssr_debug)
+						dev_info(&pdev->dev, "NSSR:   -> selected (root port)\n");
+					break;
+				}
+
+				/* Move up to parent */
+				if (port->bus && port->bus->self)
+					port = port->bus->self;
+				else
+					break;
+			}
+
+			/*
+			 * Fallback: if we didn't find upstream/root port (shouldn't happen
+			 * in normal topologies), use immediate parent as last resort.
+			 */
+			if (!aer_port) {
+				aer_port = bridge;
+				if (nssr_debug)
+					dev_info(&pdev->dev, "NSSR: no upstream/root found, using fallback %s\n",
+						 pci_name(aer_port));
+			}
+
+			aer_cap = pci_find_ext_capability(aer_port, PCI_EXT_CAP_ID_ERR);
 			if (aer_cap) {
-				pci_read_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+				pci_read_config_dword(aer_port, aer_cap + PCI_ERR_UNCOR_MASK,
 						      &aer_mask_orig);
-				pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+				pci_write_config_dword(aer_port, aer_cap + PCI_ERR_UNCOR_MASK,
 						       aer_mask_orig | PCI_ERR_UNC_COMP_TIME);
 				if (nssr_debug)
 					dev_info(&pdev->dev, "NSSR: masked CmpltTO on %s\n",
-						 pci_name(bridge));
+						 pci_name(aer_port));
 			}
 		}
 
@@ -1843,28 +1926,28 @@ disable:
 				 nvme_opcode_str(nvmeq->qid, opcode), nvmeq->qid,
 				 jiffies_to_msecs(jiffies - start));
 			/* Restore AER mask if we masked it */
-			if (aer_cap) {
-				pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_STATUS,
+			if (aer_cap && aer_port) {
+				pci_write_config_dword(aer_port, aer_cap + PCI_ERR_UNCOR_STATUS,
 						       PCI_ERR_UNC_COMP_TIME);
-				pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+				pci_write_config_dword(aer_port, aer_cap + PCI_ERR_UNCOR_MASK,
 						       aer_mask_orig);
 				if (nssr_debug)
 					dev_info(&pdev->dev, "NSSR: restored AER on %s (success)\n",
-						 pci_name(bridge));
+						 pci_name(aer_port));
 			}
 			return BLK_EH_DONE;
 		}
 
 
 		/* Restore AER mask if we masked it */
-		if (aer_cap) {
-			pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_STATUS,
+		if (aer_cap && aer_port) {
+			pci_write_config_dword(aer_port, aer_cap + PCI_ERR_UNCOR_STATUS,
 					       PCI_ERR_UNC_COMP_TIME);
-			pci_write_config_dword(bridge, aer_cap + PCI_ERR_UNCOR_MASK,
+			pci_write_config_dword(aer_port, aer_cap + PCI_ERR_UNCOR_MASK,
 					       aer_mask_orig);
 			if (nssr_debug)
 				dev_info(&pdev->dev, "NSSR: restored AER on %s (fallback)\n",
-					 pci_name(bridge));
+					 pci_name(aer_port));
 		}
 
 		if (nssr_ok) {
