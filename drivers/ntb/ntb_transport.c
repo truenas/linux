@@ -73,7 +73,7 @@ MODULE_VERSION(NTB_TRANSPORT_VER);
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Intel Corporation");
 
-static unsigned long max_mw_size;
+static unsigned long max_mw_size = 256 * 1024 * 1024;
 module_param(max_mw_size, ulong, 0644);
 MODULE_PARM_DESC(max_mw_size, "Limit size of large memory windows");
 
@@ -927,8 +927,8 @@ static int ntb_set_mw(struct ntb_transport_ctx *nt, int num_mw,
 	xlat_size = round_up(size, xlat_align_size);
 	buff_size = round_up(size, xlat_align);
 
-	/* No need to re-setup */
-	if (mw->xlat_size == xlat_size)
+	/* No need to re-setup if size already matches */
+	if (mw->xlat_size == xlat_size && mw->buff_size == buff_size)
 		return 0;
 
 	if (mw->buff_size)
@@ -1048,8 +1048,11 @@ static void ntb_transport_link_cleanup(struct ntb_transport_ctx *nt)
 	if (!nt->link_is_up)
 		cancel_delayed_work_sync(&nt->link_work);
 
-	for (i = 0; i < nt->mw_count; i++)
-		ntb_free_mw(nt, i);
+	/*
+	 * Do NOT free MW memory on link down. Memory is retained across
+	 * link cycles to avoid fragmentation from repeated allocation.
+	 * Memory is only freed on device removal in ntb_transport_free().
+	 */
 
 	/* The scratchpad registers keep the values if the remote side
 	 * goes down, blast them now to give them a sane value the next
@@ -1332,6 +1335,34 @@ static int ntb_transport_init_queue(struct ntb_transport_ctx *nt,
 	return 0;
 }
 
+/*
+ * Speculatively pre-allocate memory assuming symmetric config.
+ * This grabs contiguous memory early before fragmentation.
+ * If peer has different size, we'll reallocate on link-up.
+ */
+static void ntb_preallocate_mws(struct ntb_transport_ctx *nt)
+{
+	struct ntb_transport_mw *mw;
+	resource_size_t size;
+	int i, rc;
+
+	for (i = 0; i < nt->mw_count; i++) {
+		mw = &nt->mw_vec[i];
+		size = mw->phys_size;
+
+		if (max_mw_size && size > max_mw_size)
+			size = max_mw_size;
+
+		rc = ntb_set_mw(nt, i, size);
+		if (rc) {
+			dev_info(&nt->ndev->pdev->dev,
+				 "Failed to preallocate MW%d (size %llx): %d\n",
+				 i, (unsigned long long)size, rc);
+			/* Continue - link-up will retry */
+		}
+	}
+}
+
 static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 {
 	struct ntb_transport_ctx *nt;
@@ -1476,6 +1507,9 @@ static int ntb_transport_probe(struct ntb_client *self, struct ntb_dev *ndev)
 	INIT_WORK(&nt->link_cleanup, ntb_transport_link_cleanup_work);
 	nt->link_is_up = false;
 
+	/* Speculatively pre-allocate MW buffers to avoid fragmentation */
+	ntb_preallocate_mws(nt);
+
 	rc = ntb_set_ctx(ndev, nt, &ntb_transport_ops);
 	if (rc)
 		goto err2;
@@ -1495,9 +1529,11 @@ err3:
 err2:
 	kfree(nt->qp_vec);
 err1:
-	while (i--) {
+	for (i = 0; i < mw_count; i++) {
 		mw = &nt->mw_vec[i];
-		iounmap(mw->vbase);
+		ntb_free_mw(nt, i);
+		if (mw->vbase)
+			iounmap(mw->vbase);
 	}
 	kfree(nt->mw_vec);
 err:
