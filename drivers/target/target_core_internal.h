@@ -173,4 +173,8 @@ extern struct se_portal_group xcopy_pt_tpg;
 
 extern char db_root[];
 
+#ifdef CONFIG_TRUENAS
+u32	target_max_data_sg_nents(struct se_cmd *cmd);
+#endif
+
 #endif /* TARGET_CORE_INTERNAL_H */
