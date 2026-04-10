@@ -30,6 +30,9 @@
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
 #include <target/target_core_fabric.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include "target_core_internal.h"
 #include "target_core_alua.h"
@@ -938,6 +941,62 @@ int target_for_each_device(int (*fn)(struct se_device *dev, void *data),
 	return ret;
 }
 
+#ifdef CONFIG_TRUENAS
+EXPORT_SYMBOL(target_for_each_device);
+
+/*
+ * target_ha_reopen_backend - reopen a deferred-open backend at HA failover
+ *
+ * At STANDBY startup with lio_ha_forward_active=1, iblock/fileio backends
+ * return 0 from configure_device() without actually opening the backing store.
+ * DF_CONFIGURED is still set (by target_configure_device()), but hw_block_size
+ * etc. are all zero because the backend never ran its full setup path.
+ *
+ * After failover (lio_ha_forward_active cleared), lio_ha.ko calls this function
+ * for each device to:
+ *   1. Retry dev->transport->configure_device() -- the guard inside iblock/fileio
+ *      checks for lio_ha_forward_active==0 and ibd_bdev_file==NULL, so it runs
+ *      the full open path this time.
+ *   2. Refresh the block_size / queue_depth / hw_max_sectors attributes from the
+ *      now-populated hw_ values.
+ *
+ * Returns 0 on success.  On error the device stays NOT READY (ibd_bd == NULL).
+ */
+int target_ha_reopen_backend(struct se_device *dev)
+{
+	int ret;
+
+	if (!target_dev_configured(dev))
+		return -ENODEV;
+
+	ret = dev->transport->configure_device(dev);
+	if (ret)
+		return ret;
+
+	if (dev->transport->configure_unmap &&
+	    dev->transport->configure_unmap(dev)) {
+		pr_debug("%s: discard support available\n", __func__);
+		/* emulate_tpu was skipped at STANDBY startup (backend was not open);
+		 * restore it now that the backend is open after failover.
+		 */
+		dev->dev_attrib.emulate_tpu = 1;
+	}
+
+	dev->dev_attrib.block_size  = dev->dev_attrib.hw_block_size;
+	dev->dev_attrib.queue_depth = dev->dev_attrib.hw_queue_depth;
+
+	if (dev->dev_attrib.hw_block_size) {
+		dev->dev_attrib.hw_max_sectors =
+			se_dev_align_max_sectors(dev->dev_attrib.hw_max_sectors,
+						 dev->dev_attrib.hw_block_size);
+		dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(target_ha_reopen_backend);
+#endif /* CONFIG_TRUENAS */
+
 int target_configure_device(struct se_device *dev)
 {
 	struct se_hba *hba = dev->se_hba;
@@ -984,10 +1043,16 @@ int target_configure_device(struct se_device *dev)
 	/*
 	 * Align max_hw_sectors down to PAGE_SIZE I/O transfers
 	 */
-	dev->dev_attrib.hw_max_sectors =
-		se_dev_align_max_sectors(dev->dev_attrib.hw_max_sectors,
-					 dev->dev_attrib.hw_block_size);
-	dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
+#ifdef CONFIG_TRUENAS
+	/* hw_block_size is 0 when lio_ha defers the backend open on STANDBY. */
+	if (dev->dev_attrib.hw_block_size)
+#endif
+	{
+		dev->dev_attrib.hw_max_sectors =
+			se_dev_align_max_sectors(dev->dev_attrib.hw_max_sectors,
+						 dev->dev_attrib.hw_block_size);
+		dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
+	}
 
 	dev->creation_time = get_jiffies_64();
 

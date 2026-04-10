@@ -19,6 +19,9 @@
 #include <scsi/iscsi_proto.h>
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include <target/iscsi/iscsi_target_core.h>
 #include <target/iscsi/iscsi_target_stat.h>
@@ -753,6 +756,18 @@ void iscsi_post_login_handler(
 	pr_debug("Incremented number of active iSCSI sessions to %u on"
 		" iSCSI Target Portal Group: %hu\n", tpg->nsessions, tpg->tpgt);
 	spin_unlock_bh(&se_tpg->session_lock);
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Notify lio_ha.ko that a new iSCSI initiator session is registered.
+	 * iSCSI bypasses target_setup_session() (which normally fires this
+	 * hook) and calls __transport_register_session() directly under the
+	 * session spinlock.  The hook requires process context (it may call
+	 * lio_ha_tcp_send), so it is called here after the lock is released.
+	 * The hook is a no-op when lio_ha_forward_active == 0 or when called
+	 * for internal TPGs (se_tpg_wwn == NULL, e.g. discovery sessions).
+	 */
+	target_ha_session_create(se_sess);
+#endif /* CONFIG_TRUENAS */
 
 	iscsi_post_login_start_timers(conn);
 	/*
