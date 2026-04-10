@@ -375,6 +375,14 @@ struct t10_pr_registration {
 	u64 pr_res_mapped_lun;
 	u64 pr_aptpl_target_lun;
 	u16 tg_pt_sep_rtpi;
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Global tag of the physical target port the registration was made
+	 * through: part of the I_T nexus identity beside pr_reg_nacl and the
+	 * ISID.
+	 */
+	u16 pr_reg_port_tag;
+#endif
 	u32 pr_res_generation;
 	u64 pr_reg_bin_isid;
 	u64 pr_res_key;
@@ -661,6 +669,17 @@ struct se_session {
 	spinlock_t		deve_list_lock;	/* protects deve_list */
 	/* Position in se_node_acl->ua_sess_list, under nacl->lun_entry_mutex */
 	struct list_head	ua_sess_link;
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Physical target port of a session that lio_ha creates for an
+	 * initiator logged in through the peer node's port: its global TPG tag
+	 * and relative target port identifier.  Valid when sess_port_set; any
+	 * other session is on the port of its node ACL's TPG.
+	 */
+	u16			sess_port_tag;
+	u16			sess_port_rtpi;
+	bool			sess_port_set;
+#endif
 };
 
 struct se_device;
