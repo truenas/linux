@@ -76,5 +76,8 @@ extern unsigned char *core_scsi3_pr_dump_type(int);
 extern sense_reason_t target_scsi3_emulate_pr_in(struct se_cmd *);
 extern sense_reason_t target_scsi3_emulate_pr_out(struct se_cmd *);
 extern sense_reason_t target_check_reservation(struct se_cmd *);
+#ifdef CONFIG_TRUENAS
+void target_ha_pr_changed(struct se_device *dev);
+#endif
 
 #endif /* TARGET_CORE_PR_H */

@@ -30,6 +30,9 @@
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
 #include <target/target_core_fabric.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include "target_core_internal.h"
 #include "target_core_alua.h"
@@ -952,6 +955,102 @@ int target_for_each_device(int (*fn)(struct se_device *dev, void *data),
 	return ret;
 }
 
+#ifdef CONFIG_TRUENAS
+EXPORT_SYMBOL(target_for_each_device);
+
+/*
+ * target_ha_reopen_backend - reopen a deferred-open backend at HA failover
+ *
+ * At STANDBY startup with lio_ha_forward_active=1, iblock/fileio backends
+ * return 0 from configure_device() without actually opening the backing store.
+ * DF_CONFIGURED is still set (by target_configure_device()), but hw_block_size
+ * etc. are all zero because the backend never ran its full setup path.
+ *
+ * After failover (lio_ha_forward_active cleared), lio_ha.ko calls this function
+ * for each device to:
+ *   1. Retry dev->transport->configure_device() -- the guard inside iblock/fileio
+ *      checks for lio_ha_forward_active==0 and ibd_bdev_file==NULL, so it runs
+ *      the full open path this time.
+ *   2. Refresh the block_size / queue_depth / hw_max_sectors attributes from the
+ *      now-populated hw_ values.
+ *
+ * Serialised by target_ha_reopen_mutex: the failover store and a write of
+ * 1 to a device's "opened" attribute may run at once, and two opens would
+ * leak a reference on the backing store.
+ *
+ * Returns 0 on success, -EPERM while forwarding is active (the backend would
+ * not be opened).  On error the device stays NOT READY (ibd_bd == NULL).
+ */
+static DEFINE_MUTEX(target_ha_reopen_mutex);
+
+int target_ha_reopen_backend(struct se_device *dev)
+{
+	int ret = 0;
+
+	if (!target_dev_configured(dev))
+		return -ENODEV;
+
+	mutex_lock(&target_ha_reopen_mutex);
+
+	/*
+	 * On STANDBY configure_device() returns 0 without opening anything;
+	 * only the failover store, after clearing the flag, opens backends.
+	 */
+	if (atomic_read(&lio_ha_forward_active)) {
+		ret = -EPERM;
+		goto out;
+	}
+
+	/*
+	 * Already open: a retried failover, or opened=1 written again.
+	 * Opening again would take a second reference on the backing store.
+	 */
+	if (dev->transport->backend_is_ready &&
+	    dev->transport->backend_is_ready(dev) &&
+	    dev->dev_attrib.block_size)
+		goto out;
+
+	ret = dev->transport->configure_device(dev);
+	if (ret)
+		goto out;
+
+	if (dev->transport->configure_unmap &&
+	    dev->transport->configure_unmap(dev)) {
+		pr_debug("%s: discard support available\n", __func__);
+		/* emulate_tpu was skipped at STANDBY startup (backend was not open);
+		 * restore it now that the backend is open after failover.
+		 */
+		dev->dev_attrib.emulate_tpu = 1;
+	}
+
+	/*
+	 * target_configure_device() left these 0, the backend being closed
+	 * then.  Fill them from the backend, keeping any value set since.
+	 * block_size goes last: target_cmd_parse_cdb() treats the device as
+	 * open only once it is set.
+	 */
+	if (!dev->dev_attrib.queue_depth)
+		dev->dev_attrib.queue_depth = dev->dev_attrib.hw_queue_depth;
+	if (dev->dev_attrib.hw_block_size) {
+		dev->dev_attrib.hw_max_sectors =
+			se_dev_align_max_sectors(dev->dev_attrib.hw_max_sectors,
+						 dev->dev_attrib.hw_block_size);
+		if (!dev->dev_attrib.optimal_sectors)
+			dev->dev_attrib.optimal_sectors =
+				dev->dev_attrib.hw_max_sectors;
+	}
+	if (!dev->dev_attrib.block_size) {
+		/* Pairs with smp_load_acquire() in target_cmd_parse_cdb(). */
+		smp_store_release(&dev->dev_attrib.block_size,
+				  dev->dev_attrib.hw_block_size);
+	}
+out:
+	mutex_unlock(&target_ha_reopen_mutex);
+	return ret;
+}
+EXPORT_SYMBOL(target_ha_reopen_backend);
+#endif /* CONFIG_TRUENAS */
+
 int target_configure_device(struct se_device *dev)
 {
 	struct se_hba *hba = dev->se_hba;
@@ -998,10 +1097,16 @@ int target_configure_device(struct se_device *dev)
 	/*
 	 * Align max_hw_sectors down to PAGE_SIZE I/O transfers
 	 */
-	dev->dev_attrib.hw_max_sectors =
-		se_dev_align_max_sectors(dev->dev_attrib.hw_max_sectors,
-					 dev->dev_attrib.hw_block_size);
-	dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
+#ifdef CONFIG_TRUENAS
+	/* hw_block_size is 0 when lio_ha defers the backend open on STANDBY. */
+	if (dev->dev_attrib.hw_block_size)
+#endif
+	{
+		dev->dev_attrib.hw_max_sectors =
+			se_dev_align_max_sectors(dev->dev_attrib.hw_max_sectors,
+						 dev->dev_attrib.hw_block_size);
+		dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
+	}
 
 	dev->creation_time = get_jiffies_64();
 
@@ -1021,6 +1126,15 @@ int target_configure_device(struct se_device *dev)
 	spin_unlock(&hba->device_lock);
 
 	dev->dev_flags |= DF_CONFIGURED;
+
+#ifdef CONFIG_TRUENAS
+	/*
+	 * A new device has no PR state.  Have it sent, so that STANDBY drops
+	 * whatever it still holds under this name from a device deleted and
+	 * created again; nothing else would replace that before a PR OUT.
+	 */
+	target_ha_pr_changed(dev);
+#endif
 
 	return 0;
 
