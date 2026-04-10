@@ -24,6 +24,9 @@
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
 #include <target/target_core_fabric.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include "target_core_internal.h"
 #include "target_core_alua.h"
@@ -32,6 +35,122 @@
 
 extern struct se_device *g_lun0_dev;
 static DEFINE_XARRAY_ALLOC(tpg_xa);
+
+#ifdef CONFIG_TRUENAS
+/*
+ * Global registry of all non-internal TPGs (those registered with a non-NULL
+ * se_wwn).  Allows lio_ha.ko to look up a target TPG by fabric_name +
+ * target_name + tpg_tag so that ACTIVE can create synthetic se_sessions with
+ * the correct node_acl and LUN mappings.
+ *
+ * Entries are added in core_tpg_register() when se_wwn != NULL, and removed
+ * in core_tpg_deregister().  Protected by a spinlock; read from TCP RX
+ * context without sleeping.
+ */
+struct ha_tpg_reg_entry {
+	struct se_portal_group	*tpg;
+	struct list_head	 node;
+};
+
+static LIST_HEAD(ha_tpg_reg_list);
+static DEFINE_SPINLOCK(ha_tpg_reg_lock);
+
+/**
+ * target_ha_lookup_tpg - find a real fabric TPG by identity
+ * @fabric_name: target_core_fabric_ops.fabric_name (e.g. "iscsi", "qla2xxx")
+ * @target_name: IQN or WWPN string from tpg_get_wwn()
+ * @tpg_tag:     portal group tag from tpg_get_tag()
+ *
+ * Returns the matching se_portal_group pointer, or NULL if not found.
+ * The caller must not sleep; called from TCP RX context on ACTIVE.
+ */
+struct se_portal_group *target_ha_lookup_tpg(const char *fabric_name,
+					     const char *target_name,
+					     u16 tpg_tag)
+{
+	struct ha_tpg_reg_entry *re;
+	struct se_portal_group *found = NULL;
+
+	spin_lock(&ha_tpg_reg_lock);
+	list_for_each_entry(re, &ha_tpg_reg_list, node) {
+		struct se_portal_group *tpg = re->tpg;
+		const struct target_core_fabric_ops *tfo = tpg->se_tpg_tfo;
+		const char *wwn;
+
+		if (strcmp(tfo->fabric_name, fabric_name) != 0)
+			continue;
+		if (tfo->tpg_get_tag(tpg) != tpg_tag)
+			continue;
+		wwn = tfo->tpg_get_wwn(tpg);
+		if (!wwn || strcmp(wwn, target_name) != 0)
+			continue;
+		found = tpg;
+		break;
+	}
+	spin_unlock(&ha_tpg_reg_lock);
+	return found;
+}
+EXPORT_SYMBOL(target_ha_lookup_tpg);
+
+/*
+ * target_ha_foreach_nacl_dev - find all nacl+lun mappings for an initiator/device
+ *
+ * Iterates all registered TPGs for @fabric_name, finds the nacl for
+ * @initiator_name in each, and walks the nacl's lun_entry_hlist to locate
+ * entries whose se_lun is mapped to @dev.  Calls @fn for each match.
+ *
+ * Used by lio_ha.ko at failover to resolve the nacl+lun context needed by
+ * target_ha_pr_add_reg() when restoring replicated PR state.
+ *
+ * TPG lifetime: at failover time the LIO config is fully up and no TPG
+ * teardown is occurring, so we snapshot the TPG list under ha_tpg_reg_lock
+ * and then work through the snapshot without the lock.
+ */
+void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_name,
+				struct se_device *dev, target_ha_nacl_fn_t fn, void *data)
+{
+#define HA_NACL_MAX_TPGS  32
+	struct se_portal_group *tpg_arr[HA_NACL_MAX_TPGS];
+	struct ha_tpg_reg_entry *re;
+	int ntpg = 0, i;
+
+	/* Snapshot matching TPG pointers under the spinlock. */
+	spin_lock(&ha_tpg_reg_lock);
+	list_for_each_entry(re, &ha_tpg_reg_list, node) {
+		if (strcmp(re->tpg->se_tpg_tfo->fabric_name, fabric_name) != 0)
+			continue;
+		if (ntpg < HA_NACL_MAX_TPGS)
+			tpg_arr[ntpg++] = re->tpg;
+	}
+	spin_unlock(&ha_tpg_reg_lock);
+
+	for (i = 0; i < ntpg; i++) {
+		struct se_portal_group *tpg = tpg_arr[i];
+		struct se_node_acl *nacl;
+		struct se_dev_entry *deve;
+
+		nacl = core_tpg_get_initiator_node_acl(tpg, (unsigned char *)initiator_name);
+		if (!nacl)
+			continue;
+
+		rcu_read_lock();
+		hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
+			struct se_device *mapped_dev;
+
+			if (!deve->se_lun)
+				continue;
+			mapped_dev = rcu_dereference(deve->se_lun->lun_se_dev);
+			if (mapped_dev != dev)
+				continue;
+			fn(nacl, deve->se_lun, deve->mapped_lun, data);
+		}
+		rcu_read_unlock();
+
+		target_put_nacl(nacl);
+	}
+}
+EXPORT_SYMBOL(target_ha_foreach_nacl_dev);
+#endif /* CONFIG_TRUENAS */
 
 /*	__core_tpg_get_initiator_node_acl():
  *
@@ -539,6 +658,24 @@ int core_tpg_register(
 	spin_lock_init(&se_tpg->session_lock);
 	mutex_init(&se_tpg->tpg_lun_mutex);
 	mutex_init(&se_tpg->acl_node_mutex);
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Add to the global TPG registry so lio_ha.ko can look up this
+	 * TPG by fabric_name + target_name + tpg_tag.  Internal TPGs
+	 * (se_wwn=NULL, e.g. iSCSI discovery, ha_recv) are excluded.
+	 */
+	if (se_wwn) {
+		struct ha_tpg_reg_entry *re;
+
+		re = kzalloc(sizeof(*re), GFP_KERNEL);
+		if (re) {
+			re->tpg = se_tpg;
+			spin_lock(&ha_tpg_reg_lock);
+			list_add_tail(&re->node, &ha_tpg_reg_list);
+			spin_unlock(&ha_tpg_reg_lock);
+		}
+	}
+#endif /* CONFIG_TRUENAS */
 
 	if (se_tpg->proto_id >= 0) {
 		se_tpg->tpg_virt_lun0 = core_tpg_alloc_lun(se_tpg, 0);
@@ -597,6 +734,24 @@ int core_tpg_deregister(struct se_portal_group *se_tpg)
 		core_tpg_remove_lun(se_tpg, se_tpg->tpg_virt_lun0);
 		kfree_rcu(se_tpg->tpg_virt_lun0, rcu_head);
 	}
+
+#ifdef CONFIG_TRUENAS
+	{
+		struct ha_tpg_reg_entry *re, *tmp;
+
+		spin_lock(&ha_tpg_reg_lock);
+		list_for_each_entry_safe(re, tmp, &ha_tpg_reg_list, node) {
+			if (re->tpg == se_tpg) {
+				list_del(&re->node);
+				spin_unlock(&ha_tpg_reg_lock);
+				kfree(re);
+				goto ha_tpg_removed;
+			}
+		}
+		spin_unlock(&ha_tpg_reg_lock);
+ha_tpg_removed:;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	target_tpg_deregister_rtpi(se_tpg);
 

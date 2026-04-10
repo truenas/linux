@@ -31,6 +31,9 @@
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
 #include <target/target_core_fabric.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include "target_core_internal.h"
 #include "target_core_alua.h"
@@ -50,6 +53,57 @@ struct kmem_cache *t10_alua_lu_gp_mem_cache;
 struct kmem_cache *t10_alua_tg_pt_gp_cache;
 struct kmem_cache *t10_alua_lba_map_cache;
 struct kmem_cache *t10_alua_lba_map_mem_cache;
+
+#ifdef CONFIG_TRUENAS
+atomic_t lio_ha_forward_active = ATOMIC_INIT(0);
+EXPORT_SYMBOL(lio_ha_forward_active);
+
+static const struct lio_ha_ops *ha_ops;
+
+void lio_ha_register_ops(const struct lio_ha_ops *ops)
+{
+	WRITE_ONCE(ha_ops, ops);
+}
+EXPORT_SYMBOL(lio_ha_register_ops);
+
+void lio_ha_unregister_ops(void)
+{
+	/* forward_active must be 0 before ops are unregistered; the module
+	 * self-reference taken in forward_active_store(1) enforces this for
+	 * the normal rmmod path.
+	 */
+	WARN_ON(atomic_read(&lio_ha_forward_active));
+	WRITE_ONCE(ha_ops, NULL);
+}
+EXPORT_SYMBOL(lio_ha_unregister_ops);
+
+/*
+ * target_ha_session_create / target_ha_session_destroy
+ *
+ * Wrappers around the ha_ops session hooks for fabrics that do not use
+ * target_setup_session() / target_remove_session() (iSCSI calls
+ * __transport_register_session and transport_deregister_session directly).
+ * Exported so that iscsi_target_mod can call them without needing access
+ * to the static ha_ops pointer.
+ */
+void target_ha_session_create(struct se_session *sess)
+{
+	const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
+
+	if (ops && ops->session_create)
+		ops->session_create(sess);
+}
+EXPORT_SYMBOL(target_ha_session_create);
+
+void target_ha_session_destroy(struct se_session *sess)
+{
+	const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
+
+	if (ops && ops->session_destroy)
+		ops->session_destroy(sess);
+}
+EXPORT_SYMBOL(target_ha_session_destroy);
+#endif /* CONFIG_TRUENAS */
 
 static void transport_complete_task_attr(struct se_cmd *cmd);
 static void translate_sense_reason(struct se_cmd *cmd, sense_reason_t reason);
@@ -422,6 +476,18 @@ void __transport_register_session(
 			se_sess->sess_bin_isid = get_unaligned_be64(&buf[0]);
 		}
 
+#ifdef CONFIG_TRUENAS
+		/*
+		 * ha_recv synthetic sessions use real_nacl for LUN lookup but are
+		 * registered on ha_recv_tpg (different from real_nacl->se_tpg).
+		 * Skip nacl_sess/acl_sess_list update: lio_target_nacl_info_show would
+		 * cast ha_recv_sess_entry* as iscsit_session* -> page fault.
+		 * transport_deregister_session_configfs checks !list_empty before
+		 * list_del_init, so not adding to the list is safe on deregister.
+		 */
+		if (se_tpg != se_nacl->se_tpg)
+			goto skip_nacl_sess_update;
+#endif /* CONFIG_TRUENAS */
 		spin_lock_irqsave(&se_nacl->nacl_sess_lock, flags);
 		/*
 		 * The se_nacl->nacl_sess pointer will be set to the
@@ -432,6 +498,9 @@ void __transport_register_session(
 		list_add_tail(&se_sess->sess_acl_list,
 			      &se_nacl->acl_sess_list);
 		spin_unlock_irqrestore(&se_nacl->nacl_sess_lock, flags);
+#ifdef CONFIG_TRUENAS
+skip_nacl_sess_update:;
+#endif /* CONFIG_TRUENAS */
 	}
 	list_add_tail(&se_sess->sess_list, &se_tpg->tpg_sess_list);
 
@@ -501,6 +570,22 @@ target_setup_session(struct se_portal_group *tpg,
 	}
 
 	transport_register_session(tpg, sess->se_node_acl, sess, private);
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Notify lio_ha.ko that a new initiator session has been registered.
+	 * On STANDBY (lio_ha_forward_active=1), lio_ha.ko sends a
+	 * SESSION_CONNECT message to ACTIVE so ACTIVE can create a matching
+	 * synthetic se_session with the correct LUN mappings.  The hook is a
+	 * no-op when forward_active=0 or when called for internal TPGs (e.g.
+	 * ha_recv itself, which has se_tpg_wwn=NULL).
+	 */
+	{
+		const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
+
+		if (ops && ops->session_create)
+			ops->session_create(sess);
+	}
+#endif /* CONFIG_TRUENAS */
 	return sess;
 
 free_sess:
@@ -688,6 +773,21 @@ EXPORT_SYMBOL(transport_deregister_session);
 
 void target_remove_session(struct se_session *se_sess)
 {
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Notify lio_ha.ko that an initiator session is being torn down.
+	 * On STANDBY, lio_ha.ko sends SESSION_DISCONNECT to ACTIVE so
+	 * ACTIVE removes the corresponding synthetic se_session.  Must fire
+	 * before transport_deregister_session_configfs() while se_node_acl
+	 * is still valid and se_tpg is still set.
+	 */
+	{
+		const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
+
+		if (ops && ops->session_destroy)
+			ops->session_destroy(se_sess);
+	}
+#endif /* CONFIG_TRUENAS */
 	transport_deregister_session_configfs(se_sess);
 	transport_deregister_session(se_sess);
 }
@@ -978,6 +1078,24 @@ void target_complete_cmd_with_length(struct se_cmd *cmd, u8 scsi_status, int len
 	target_complete_cmd(cmd, scsi_status);
 }
 EXPORT_SYMBOL(target_complete_cmd_with_length);
+
+#ifdef CONFIG_TRUENAS
+/**
+ * target_complete_tmr - send TMR response and release the command
+ * @cmd: command whose se_tmr_req->response has been set by caller
+ *
+ * Equivalent to the non-aborted tail of target_tmr_work().  Called by
+ * lio_ha.ko after processing (or rejecting) a forwarded Task Management
+ * Request.
+ */
+void target_complete_tmr(struct se_cmd *cmd)
+{
+	cmd->se_tfo->queue_tm_rsp(cmd);
+	transport_lun_remove_cmd(cmd);
+	transport_cmd_check_stop_to_fabric(cmd);
+}
+EXPORT_SYMBOL(target_complete_tmr);
+#endif /* CONFIG_TRUENAS */
 
 static void target_add_to_state_list(struct se_cmd *cmd)
 {
@@ -1557,6 +1675,25 @@ target_cmd_parse_cdb(struct se_cmd *cmd)
 {
 	struct se_device *dev = cmd->se_dev;
 	sense_reason_t ret;
+
+#ifdef CONFIG_TRUENAS
+	/*
+	 * On STANDBY (forward_active=1) skip the backend's parse_cdb entirely.
+	 * parse_cdb calls get_blocks() for an LBA range check; with ibd_bd=NULL
+	 * (backend not yet open) get_blocks() returns 0 and every multi-sector
+	 * command is failed before reaching __target_execute_cmd.  ACTIVE is
+	 * authoritative for opcode validation; STANDBY just needs to forward.
+	 *
+	 * SCF_SUPPORTED_SAM_OPCODE must still be set: __transport_wait_for_tasks
+	 * returns false without it, abandoning in-flight forwarded commands
+	 * during session teardown (potential UAF).
+	 */
+	if (atomic_read(&lio_ha_forward_active)) {
+		cmd->se_cmd_flags |= SCF_SUPPORTED_SAM_OPCODE;
+		atomic_long_inc(&cmd->se_lun->lun_stats.cmd_pdus);
+		return 0;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	ret = dev->transport->parse_cdb(cmd);
 	if (ret == TCM_UNSUPPORTED_SCSI_OPCODE)
@@ -2138,6 +2275,32 @@ EXPORT_SYMBOL(transport_generic_request_failure);
 void __target_execute_cmd(struct se_cmd *cmd, bool do_checks)
 {
 	sense_reason_t ret;
+
+#ifdef CONFIG_TRUENAS
+	/*
+	 * On STANDBY, forward every command to ACTIVE before any local
+	 * pre-execution checks (UA, ALUA state, reservations).  ACTIVE holds
+	 * the authoritative SCSI state; STANDBY's local UA queue and ALUA
+	 * state are not meaningful while forwarding is active.  Must be first
+	 * so that sense generation for a failed check never reaches
+	 * iblock_get_blocks() with a NULL ibd_bd (backend not yet open).
+	 */
+	if (atomic_read(&lio_ha_forward_active)) {
+		ha_ops->forward_cmd(cmd);
+		return;
+	}
+	/*
+	 * Backend not yet open: configure_device was deferred at STANDBY
+	 * startup, and target_ha_reopen_backend() has not succeeded yet.
+	 * Fail the command cleanly rather than crashing in iblock_get_blocks
+	 * or iblock_execute_rw with a NULL ibd_bd.
+	 */
+	if (cmd->se_dev->transport->backend_is_ready &&
+	    !cmd->se_dev->transport->backend_is_ready(cmd->se_dev)) {
+		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+		goto err;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	if (!cmd->execute_cmd) {
 		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
@@ -3582,6 +3745,13 @@ static void target_tmr_work(struct work_struct *work)
 
 	if (cmd->transport_state & CMD_T_ABORTED)
 		goto aborted;
+
+#ifdef CONFIG_TRUENAS
+	if (atomic_read(&lio_ha_forward_active)) {
+		ha_ops->forward_tmr(cmd);
+		return;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	switch (tmr->function) {
 	case TMR_ABORT_TASK:

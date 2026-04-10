@@ -60,6 +60,10 @@ struct target_backend_ops {
 
 	struct configfs_attribute **tb_dev_attrib_attrs;
 	struct configfs_attribute **tb_dev_action_attrs;
+#ifdef CONFIG_TRUENAS
+	/* Returns true if the backend is open and ready for local execution. */
+	bool (*backend_is_ready)(struct se_device *);
+#endif
 };
 
 struct exec_cmd_ops {
