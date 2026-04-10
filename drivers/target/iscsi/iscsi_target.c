@@ -25,6 +25,9 @@
 #include <scsi/scsi_tcq.h>
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include <target/target_core_backend.h>
 #include <target/iscsi/iscsi_target_core.h>
@@ -4503,6 +4506,17 @@ int iscsit_close_session(struct iscsit_session *sess)
 	 */
 	iscsit_wait_for_session_usage(sess);
 
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Notify lio_ha.ko that this iSCSI initiator session is being torn
+	 * down.  iSCSI bypasses target_remove_session() (which normally fires
+	 * this hook) and calls transport_deregister_session() directly.
+	 * Must fire before transport_deregister_session() while se_tpg and
+	 * se_node_acl are still valid, and after the wait above, once no one
+	 * else is using the session.
+	 */
+	target_ha_session_destroy(sess->se_sess);
+#endif /* CONFIG_TRUENAS */
 	transport_deregister_session(sess->se_sess);
 
 	iscsit_free_all_ooo_cmdsns(sess);

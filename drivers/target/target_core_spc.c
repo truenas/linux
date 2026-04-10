@@ -509,6 +509,7 @@ spc_emulate_evpd_b0(struct se_cmd *cmd, unsigned char *buf)
 {
 	struct se_device *dev = cmd->se_dev;
 	u32 mtl = 0;
+	u32 max_data_sg_nents;
 	int have_tp = 0, opt, min;
 	u32 io_max_blocks;
 
@@ -545,8 +546,14 @@ spc_emulate_evpd_b0(struct se_cmd *cmd, unsigned char *buf)
 	 * XXX: Currently assumes single PAGE_SIZE per scatterlist for fabrics
 	 * enforcing maximum HW scatter-gather-list entry limit
 	 */
-	if (cmd->se_tfo->max_data_sg_nents) {
-		mtl = (cmd->se_tfo->max_data_sg_nents * PAGE_SIZE) /
+#ifdef CONFIG_TRUENAS
+	/* For a session forwarded by lio_ha, the peer port's fabric's limit. */
+	max_data_sg_nents = target_max_data_sg_nents(cmd);
+#else
+	max_data_sg_nents = cmd->se_tfo->max_data_sg_nents;
+#endif
+	if (max_data_sg_nents) {
+		mtl = (max_data_sg_nents * PAGE_SIZE) /
 		       dev->dev_attrib.block_size;
 	}
 	io_max_blocks = mult_frac(dev->dev_attrib.hw_max_sectors,
