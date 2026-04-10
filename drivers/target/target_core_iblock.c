@@ -30,6 +30,9 @@
 
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include "target_core_iblock.h"
 #include "target_core_pr.h"
@@ -104,6 +107,16 @@ static int iblock_configure_device(struct se_device *dev)
 		pr_err("Missing udev_path= parameters for IBLOCK\n");
 		return -EINVAL;
 	}
+
+#ifdef CONFIG_TRUENAS
+	/* Defer open until HA forwarding is disabled (pool not yet imported) */
+	if (atomic_read(&lio_ha_forward_active))
+		return 0;
+
+	/* Idempotent: skip if already open (e.g. opened=1 written twice) */
+	if (ib_dev->ibd_bdev_file)
+		return 0;
+#endif /* CONFIG_TRUENAS */
 
 	ret = bioset_init(&ib_dev->ibd_bio_set, IBLOCK_BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
 	if (ret) {
@@ -1167,6 +1180,48 @@ static bool iblock_get_write_cache(struct se_device *dev)
 	return bdev_write_cache(IBLOCK_DEV(dev)->ibd_bd);
 }
 
+#ifdef CONFIG_TRUENAS
+static struct se_device *iblock_action_to_dev(struct config_item *item)
+{
+	return container_of(to_config_group(item), struct se_device,
+			    dev_action_group);
+}
+
+static ssize_t iblock_opened_show(struct config_item *item, char *page)
+{
+	struct iblock_dev *ib_dev = IBLOCK_DEV(iblock_action_to_dev(item));
+
+	return sysfs_emit(page, "%d\n", ib_dev->ibd_bdev_file ? 1 : 0);
+}
+
+static ssize_t iblock_opened_store(struct config_item *item,
+				   const char *page, size_t count)
+{
+	struct se_device *dev = iblock_action_to_dev(item);
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(page, 0, &val);
+	if (ret)
+		return ret;
+	if (val != 1)
+		return -EINVAL;
+
+	ret = iblock_configure_device(dev);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+CONFIGFS_ATTR(iblock_, opened);
+
+static struct configfs_attribute *iblock_action_attrs[] = {
+	&iblock_attr_opened,
+	NULL,
+};
+#endif /* CONFIG_TRUENAS */
+
 static const struct target_backend_ops iblock_ops = {
 	.name			= "iblock",
 	.inquiry_prod		= "IBLOCK",
@@ -1193,6 +1248,9 @@ static const struct target_backend_ops iblock_ops = {
 	.get_io_opt		= iblock_get_io_opt,
 	.get_write_cache	= iblock_get_write_cache,
 	.tb_dev_attrib_attrs	= sbc_attrib_attrs,
+#ifdef CONFIG_TRUENAS
+	.tb_dev_action_attrs	= iblock_action_attrs,
+#endif
 };
 
 static int __init iblock_module_init(void)

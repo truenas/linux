@@ -26,6 +26,9 @@
 
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include "target_core_file.h"
 
@@ -116,6 +119,16 @@ static int fd_configure_device(struct se_device *dev)
 		pr_err("Missing fd_dev_name=\n");
 		return -EINVAL;
 	}
+
+#ifdef CONFIG_TRUENAS
+	/* Defer open until HA forwarding is disabled (pool not yet imported) */
+	if (atomic_read(&lio_ha_forward_active))
+		return 0;
+
+	/* Idempotent: skip if already open (e.g. opened=1 written twice) */
+	if (fd_dev->fd_file)
+		return 0;
+#endif /* CONFIG_TRUENAS */
 
 	/*
 	 * Use O_DSYNC by default instead of O_SYNC to forgo syncing
@@ -909,6 +922,48 @@ fd_parse_cdb(struct se_cmd *cmd)
 	return sbc_parse_cdb(cmd, &fd_exec_cmd_ops);
 }
 
+#ifdef CONFIG_TRUENAS
+static struct se_device *fd_action_to_dev(struct config_item *item)
+{
+	return container_of(to_config_group(item), struct se_device,
+			    dev_action_group);
+}
+
+static ssize_t fd_opened_show(struct config_item *item, char *page)
+{
+	struct fd_dev *fd_dev = FD_DEV(fd_action_to_dev(item));
+
+	return sysfs_emit(page, "%d\n", fd_dev->fd_file ? 1 : 0);
+}
+
+static ssize_t fd_opened_store(struct config_item *item,
+			       const char *page, size_t count)
+{
+	struct se_device *dev = fd_action_to_dev(item);
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(page, 0, &val);
+	if (ret)
+		return ret;
+	if (val != 1)
+		return -EINVAL;
+
+	ret = fd_configure_device(dev);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+CONFIGFS_ATTR(fd_, opened);
+
+static struct configfs_attribute *fd_action_attrs[] = {
+	&fd_attr_opened,
+	NULL,
+};
+#endif /* CONFIG_TRUENAS */
+
 static const struct target_backend_ops fileio_ops = {
 	.name			= "fileio",
 	.inquiry_prod		= "FILEIO",
@@ -930,6 +985,9 @@ static const struct target_backend_ops fileio_ops = {
 	.format_prot		= fd_format_prot,
 	.free_prot		= fd_free_prot,
 	.tb_dev_attrib_attrs	= sbc_attrib_attrs,
+#ifdef CONFIG_TRUENAS
+	.tb_dev_action_attrs	= fd_action_attrs,
+#endif
 };
 
 static int __init fileio_module_init(void)

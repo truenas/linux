@@ -31,6 +31,9 @@
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
 #include <target/target_core_fabric.h>
+#ifdef CONFIG_TRUENAS
+#include <target/target_core_ha.h>
+#endif
 
 #include "target_core_internal.h"
 #include "target_core_alua.h"
@@ -50,6 +53,30 @@ struct kmem_cache *t10_alua_lu_gp_mem_cache;
 struct kmem_cache *t10_alua_tg_pt_gp_cache;
 struct kmem_cache *t10_alua_lba_map_cache;
 struct kmem_cache *t10_alua_lba_map_mem_cache;
+
+#ifdef CONFIG_TRUENAS
+atomic_t lio_ha_forward_active = ATOMIC_INIT(0);
+EXPORT_SYMBOL(lio_ha_forward_active);
+
+static const struct lio_ha_ops *ha_ops;
+
+void lio_ha_register_ops(const struct lio_ha_ops *ops)
+{
+	WRITE_ONCE(ha_ops, ops);
+}
+EXPORT_SYMBOL(lio_ha_register_ops);
+
+void lio_ha_unregister_ops(void)
+{
+	/* forward_active must be 0 before ops are unregistered; the module
+	 * self-reference taken in forward_active_store(1) enforces this for
+	 * the normal rmmod path.
+	 */
+	WARN_ON(atomic_read(&lio_ha_forward_active));
+	WRITE_ONCE(ha_ops, NULL);
+}
+EXPORT_SYMBOL(lio_ha_unregister_ops);
+#endif /* CONFIG_TRUENAS */
 
 static void transport_complete_task_attr(struct se_cmd *cmd);
 static void translate_sense_reason(struct se_cmd *cmd, sense_reason_t reason);
@@ -501,6 +528,22 @@ target_setup_session(struct se_portal_group *tpg,
 	}
 
 	transport_register_session(tpg, sess->se_node_acl, sess, private);
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Notify lio_ha.ko that a new initiator session has been registered.
+	 * On STANDBY (lio_ha_forward_active=1), lio_ha.ko sends a
+	 * SESSION_CONNECT message to ACTIVE so ACTIVE can create a matching
+	 * synthetic se_session with the correct LUN mappings.  The hook is a
+	 * no-op when forward_active=0 or when called for internal TPGs (e.g.
+	 * ha_recv itself, which has se_tpg_wwn=NULL).
+	 */
+	{
+		const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
+
+		if (ops && ops->session_create)
+			ops->session_create(sess);
+	}
+#endif /* CONFIG_TRUENAS */
 	return sess;
 
 free_sess:
@@ -688,6 +731,21 @@ EXPORT_SYMBOL(transport_deregister_session);
 
 void target_remove_session(struct se_session *se_sess)
 {
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Notify lio_ha.ko that an initiator session is being torn down.
+	 * On STANDBY, lio_ha.ko sends SESSION_DISCONNECT to ACTIVE so
+	 * ACTIVE removes the corresponding synthetic se_session.  Must fire
+	 * before transport_deregister_session_configfs() while se_node_acl
+	 * is still valid and se_tpg is still set.
+	 */
+	{
+		const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
+
+		if (ops && ops->session_destroy)
+			ops->session_destroy(se_sess);
+	}
+#endif /* CONFIG_TRUENAS */
 	transport_deregister_session_configfs(se_sess);
 	transport_deregister_session(se_sess);
 }
@@ -978,6 +1036,24 @@ void target_complete_cmd_with_length(struct se_cmd *cmd, u8 scsi_status, int len
 	target_complete_cmd(cmd, scsi_status);
 }
 EXPORT_SYMBOL(target_complete_cmd_with_length);
+
+#ifdef CONFIG_TRUENAS
+/**
+ * target_complete_tmr - send TMR response and release the command
+ * @cmd: command whose se_tmr_req->response has been set by caller
+ *
+ * Equivalent to the non-aborted tail of target_tmr_work().  Called by
+ * lio_ha.ko after processing (or rejecting) a forwarded Task Management
+ * Request.
+ */
+void target_complete_tmr(struct se_cmd *cmd)
+{
+	cmd->se_tfo->queue_tm_rsp(cmd);
+	transport_lun_remove_cmd(cmd);
+	transport_cmd_check_stop_to_fabric(cmd);
+}
+EXPORT_SYMBOL(target_complete_tmr);
+#endif /* CONFIG_TRUENAS */
 
 static void target_add_to_state_list(struct se_cmd *cmd)
 {
@@ -2164,6 +2240,13 @@ void __target_execute_cmd(struct se_cmd *cmd, bool do_checks)
 			goto err;
 		}
 	}
+
+#ifdef CONFIG_TRUENAS
+	if (atomic_read(&lio_ha_forward_active)) {
+		ha_ops->forward_cmd(cmd);
+		return;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	ret = cmd->execute_cmd(cmd);
 	if (!ret)
@@ -3582,6 +3665,13 @@ static void target_tmr_work(struct work_struct *work)
 
 	if (cmd->transport_state & CMD_T_ABORTED)
 		goto aborted;
+
+#ifdef CONFIG_TRUENAS
+	if (atomic_read(&lio_ha_forward_active)) {
+		ha_ops->forward_tmr(cmd);
+		return;
+	}
+#endif /* CONFIG_TRUENAS */
 
 	switch (tmr->function) {
 	case TMR_ABORT_TASK:
