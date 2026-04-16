@@ -591,6 +591,27 @@ static int ses_enclosure_find_by_addr(struct enclosure_device *edev,
 
 #define INIT_ALLOC_SIZE 32
 
+/*
+ * After a fresh SES read updates every component's scomp->addr, any slot
+ * whose address went back to zero is now empty. Drop the stale binding so
+ * sysfs (/sys/class/enclosure/.../<slot>/device/...) reflects reality. The
+ * add path in ses_enclosure_find_by_addr is the only place bindings are
+ * created during polling; without this symmetric teardown a hot relocation
+ * leaves the source slot permanently pointing at the moved disk.
+ */
+static void ses_remove_stale_components(struct enclosure_device *edev)
+{
+	int i;
+
+	for (i = 0; i < edev->components; i++) {
+		struct enclosure_component *ecomp = &edev->component[i];
+		struct ses_component *scomp = ecomp->scratch;
+
+		if (ecomp->dev && scomp->addr == 0)
+			enclosure_remove_device(edev, ecomp->dev);
+	}
+}
+
 static void ses_enclosure_data_process(struct enclosure_device *edev,
 				       struct scsi_device *sdev,
 				       int create)
@@ -601,13 +622,15 @@ static void ses_enclosure_data_process(struct enclosure_device *edev,
 	struct ses_device *ses_dev = edev->scratch;
 	int types = ses_dev->page1_num_types;
 	unsigned char *hdr_buf = kzalloc(INIT_ALLOC_SIZE, GFP_KERNEL);
+	bool addr_refreshed = false;
 
 	if (!hdr_buf)
 		goto simple_populate;
 
 	/* re-read page 10 */
-	if (ses_dev->page10)
-		ses_recv_diag(sdev, 10, ses_dev->page10, ses_dev->page10_len);
+	if (ses_dev->page10 &&
+	    !ses_recv_diag(sdev, 10, ses_dev->page10, ses_dev->page10_len))
+		addr_refreshed = true;
 	/* Page 7 for the descriptors is optional */
 	result = ses_recv_diag(sdev, 7, hdr_buf, INIT_ALLOC_SIZE);
 	if (result)
@@ -710,6 +733,15 @@ static void ses_enclosure_data_process(struct enclosure_device *edev,
 		spin_unlock(&edev->enc_lock);
 	kfree(buf);
 	kfree(hdr_buf);
+
+	/*
+	 * Only prune bindings when we actually got a fresh page 10 read on
+	 * a refresh call. Skip it on create (no bindings exist yet) and when
+	 * SES was unreachable (scomp->addr values would be stale and could
+	 * cause us to unbind a slot that is still occupied).
+	 */
+	if (!create && addr_refreshed)
+		ses_remove_stale_components(edev);
 }
 
 static int ses_get_enclosure_pci_domain(struct enclosure_device *edev)
