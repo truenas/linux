@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config LIO_HA
+	tristate "TrueNAS LIO HA forwarding module"
+	depends on TARGET_CORE && TRUENAS
+	help
+	  Enables the lio_ha.ko kernel module for TrueNAS High Availability
+	  with the Linux LIO iSCSI/FC target stack.
+
+	  On a STANDBY node, lio_ha intercepts all I/O and Task Management
+	  Requests before they reach the local backend and forwards them to
+	  the ACTIVE node over a private TCP channel.  On failover, a single
+	  write clears the forwarding flag; lio_ha restores replicated
+	  Persistent Reservation state, opens the local iblock/fileio backends,
+	  and stops forwarding -- without any LUN removal or reinsertion.
+
+	  The module is loaded on both ACTIVE and STANDBY nodes.  On ACTIVE
+	  it registers the ha_recv fabric driver that accepts forwarded commands
+	  and submits them to the local LIO stack on behalf of STANDBY's
+	  initiators, preserving correct per-I_T nexus PR checking.
+
+	  If unsure, say N.
