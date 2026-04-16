@@ -48,5 +48,6 @@ source "drivers/target/tcm_fc/Kconfig"
 source "drivers/target/iscsi/Kconfig"
 source "drivers/target/sbp/Kconfig"
 source "drivers/target/tcm_remote/Kconfig"
+source "drivers/target/lio_ha/Kconfig"
 
 endif
