@@ -1,0 +1,431 @@
+lio_ha -- TrueNAS LIO high-availability forwarding module
+==========================================================
+
+This module implements active/standby HA for the LIO SCSI target
+subsystem on TrueNAS.  It is loaded on both the ACTIVE node (which
+owns the storage pool) and the STANDBY node (which re-exports the
+same LUNs to initiators over iSCSI and FC).
+
+The module has two main components:
+
+  ha_fwd (lio_ha_fwd.c)
+    STANDBY side.  Implements the lio_ha_ops callbacks that LIO
+    core calls when lio_ha_forward_active == 1.  Serialises se_cmd
+    objects to the wire format, sends them to ACTIVE, receives
+    responses, and completes the original se_cmd.
+
+  ha_recv (lio_ha_recv.c)
+    ACTIVE side.  A private LIO fabric driver with no configfs
+    presence.  Accepts SESSION_CONNECT messages and creates synthetic
+    se_sessions; dispatches forwarded commands to LIO core for local
+    execution; returns results to STANDBY.
+
+Module state is held in the global struct lio_ha_cfg (lio_ha.h) and
+exposed through configfs attributes at /sys/kernel/config/lio_ha/.
+
+The LIO core is modified in target_core_transport.c, target_core_pr.c,
+target_core_tpg.c, and target_core_device.c under #ifdef CONFIG_TRUENAS.
+The core-side architecture overview is in target_core_ha.h.
+
+
+ROLES
+=====
+
+ACTIVE
+  Owns the storage pool; runs full LIO iblock/fileio backends.
+  The ha_recv fabric driver accepts the TCP connection from STANDBY
+  and creates a synthetic se_session for each initiator session
+  that STANDBY reports via SESSION_CONNECT.  Forwarded commands
+  execute against the real backends under the correct I_T nexus
+  and PR context, and results are returned to STANDBY.
+
+STANDBY
+  Re-exports the same LUNs.  iblock/fileio backends are configured
+  but not opened until failover (lio_ha_forward_active blocks local
+  execution).  Every incoming SCSI command, TMR, and PR OUT is
+  serialised to the wire and sent to ACTIVE for execution.  LUN
+  mappings, CHAP credentials, and initiator ACLs are configured
+  identically on both nodes.
+
+
+TCP CONNECTION
+==============
+
+Both nodes run a listen socket and a connect loop simultaneously,
+each bound to local_addr:port and connecting to peer_addr:port.
+The first TCP connection established -- whether inbound or outbound
+-- becomes the active link.  This symmetric model avoids any need
+to designate one node as "server" and handles simultaneous restarts
+gracefully: whichever node's TCP SYN succeeds first wins.
+
+On link loss, both sides start reconnecting immediately.  The
+connect side uses exponential backoff (1 s to 30 s between tries).
+
+Default port: 999.
+
+Threads:
+
+  ha_listen_task   binds, listens, loops on kernel_accept.  On
+                   accept calls lio_ha_on_connected().
+
+  ha_connect_task  loops: if disconnected, tries kernel_connect with
+                   a 5 s timeout; exponential backoff on failure.
+                   On success calls lio_ha_on_connected().
+
+  ha_rx_task       started per-connection inside lio_ha_on_connected().
+                   Reads wire header + payload in a loop, dispatches
+                   by channel and message type.  On socket error
+                   calls lio_ha_on_disconnected() and exits.
+
+Locking:
+
+  ha_tcp_lock (mutex)   protects the active socket pointer, ha_rx_task
+                        reference, and ha_state in lio_ha_cfg.
+
+  ha_send_lock (mutex)  serialises callers of lio_ha_tcp_send() so
+                        that header and payload are written atomically.
+                        lio_ha_on_disconnected() acquires this lock
+                        before sock_release() to prevent freeing the
+                        socket while a send is in progress.
+
+
+WIRE PROTOCOL
+=============
+
+All integer fields are big-endian (__be*).  Full struct definitions
+are in lio_ha_wire.h, which has no kernel dependencies and can be
+read in isolation.
+
+Every message is framed as:
+
+  lio_ha_wire_hdr (8 bytes)
+    __be32 channel   0 = CTL, 1 = DATA
+    __be32 length    payload bytes, NOT including this header
+
+  [lio_ha_data_hdr (8 bytes) -- DATA channel only, immediately after
+   the wire header]
+    __be64 cmd_cookie   ties this DATA message to a CMD_FORWARD or
+                        CMD_RESPONSE
+
+  payload
+
+CTL-channel payloads begin with lio_ha_msg_hdr (8 bytes):
+
+    __be32 type      enum lio_ha_msg_type
+    __be32 reserved  must be zero
+
+
+CHANNELS
+========
+
+Channel 0 (CTL)
+  Carries all control messages: session lifecycle, I/O forwarding,
+  TMR forwarding, PR replication, and LUN sync.  Each payload starts
+  with lio_ha_msg_hdr so the receiver dispatches by type.
+
+Channel 1 (DATA)
+  Carries raw SCSI data for forwarded commands.  Each DATA payload
+  is preceded by an 8-byte lio_ha_data_hdr containing a cmd_cookie
+  that ties the data to its CMD_FORWARD (WRITE, S->A) or CMD_RESPONSE
+  (READ, A->S).  No lio_ha_msg_hdr on this channel.
+
+
+MESSAGE TYPES
+=============
+
+SESSION_CONNECT (S->A)
+  Sent when an initiator connects to a STANDBY target.  Carries
+  the initiator IQN/WWPN, target IQN/WWPN, fabric name, and TPG tag.
+  ACTIVE calls target_ha_lookup_tpg() to find the matching TPG,
+  looks up the node_acl for initiator_name, and creates a synthetic
+  se_session keyed by STANDBY's se_session pointer (session_id).
+  The synthetic session points to the real node_acl so that LUN
+  mappings and PR per-I_T nexus tracking are correct.
+
+SESSION_DISCONNECT (S->A)
+  Sent when the initiator session tears down on STANDBY.  ACTIVE
+  removes the synthetic se_session identified by session_id.
+
+CMD_FORWARD (S->A)
+  One per SCSI command.  Carries session_id, cmd_cookie (STANDBY's
+  se_cmd pointer, echoed back in CMD_RESPONSE), LUN, data direction,
+  expected transfer length, and the full CDB (up to 32 bytes).
+
+  For WRITE commands: write data is sent on the DATA channel BEFORE
+  CMD_FORWARD.  ACTIVE buffers the data keyed by cmd_cookie; it is
+  ready when CMD_FORWARD arrives and triggers backend submission.
+
+  For READ and NONE: no DATA message precedes CMD_FORWARD.
+
+CMD_RESPONSE (A->S)
+  Returns SCSI status (one byte) and optional sense data.  For READ
+  commands: read data is sent on the DATA channel BEFORE CMD_RESPONSE.
+  STANDBY's rx loop buffers the DATA payload and the CMD_RESPONSE
+  handler pairs them by cmd_cookie before completing the se_cmd.
+
+TMR_FORWARD (S->A)
+  One per Task Management Request.  Carries session_id, cmd_cookie
+  for the TMR se_cmd, ref_cookie (the command to abort for ABORT TASK),
+  the TMR function code, and LUN.
+
+TMR_RESPONSE (A->S)
+  Returns the TMR response code: TMR_FUNCTION_COMPLETE or
+  TMR_FUNCTION_REJECTED.
+
+PERS_ACTION (A->S)
+  Sent after each successful PR OUT executed on ACTIVE.
+  Fire-and-forget -- no ACK.  Carries the PR action code, RESERVATION
+  KEY, SERVICE ACTION RESERVATION KEY, reservation type, initiator
+  name, device name, and fabric name.  STANDBY calls
+  lio_ha_pr_apply() to update its replicated in-memory PR table.
+
+LUN_SYNC (A->S)
+  Sent by ACTIVE when the TCP link comes up, once per storage object.
+  Payload: a fixed header (dev_name + aptpl_buf_len) followed by
+  aptpl_buf_len bytes of APTPL-format text describing the full PR
+  state for that device.  STANDBY calls lio_ha_pr_apply() for each
+  registration in the text to initialise its in-memory PR table.
+
+LUN_SYNC_DONE (A->S)
+  Sent after all LUN_SYNC messages for the current sync cycle.  On
+  receipt STANDBY advances ha_state from CONNECTED to SYNCED.
+
+
+COMMAND FORWARDING FLOW
+=======================
+
+WRITE command:
+
+  STANDBY                          ACTIVE
+  ---------                          -------
+  DATA (write data, DATA chan) -->
+  CMD_FORWARD (CTL chan)        -->
+                                     buffer DATA by cmd_cookie
+                                     submit to backend (write_pending)
+                                     backend completes
+                                <--  CMD_RESPONSE (CTL chan)
+  complete se_cmd with SCSI status
+
+READ command:
+
+  STANDBY                          ACTIVE
+  ---------                          -------
+  CMD_FORWARD (CTL chan)        -->
+                                     submit to backend
+                                     backend returns read data
+                                <--  DATA (read data, DATA chan)
+                                <--  CMD_RESPONSE (CTL chan)
+  copy DATA to se_cmd scatter list
+  complete se_cmd with SCSI status
+
+No-data command (DMA_NONE):
+
+  STANDBY                          ACTIVE
+  ---------                          -------
+  CMD_FORWARD (CTL chan)        -->
+                                     submit to backend
+                                     backend completes
+                                <--  CMD_RESPONSE (CTL chan)
+  complete se_cmd with SCSI status
+
+PR commands (PR IN, PR OUT) go through target_execute_cmd() on
+STANDBY and are forwarded using the same CMD_FORWARD/CMD_RESPONSE
+path as data I/O.  A successful PR OUT on ACTIVE additionally fires
+a PERS_ACTION to STANDBY so the replicated PR table stays current.
+
+
+IN-FLIGHT COMMAND TRACKING
+===========================
+
+Each forwarded command is tracked on STANDBY by an ha_fwd_entry
+with kref-based reference counting (initial kref = 2):
+
+  ref 1 ("hash ref")    held while the entry is in ha_fwd_ht.
+                        Dropped by the CMD_RESPONSE handler, the
+                        disconnect handler, or the send-failure path.
+
+  ref 2 ("caller ref")  held by forward_cmd() until all sends
+                        complete (success or failure).  Ensures the
+                        entry is not freed while forward_cmd still
+                        holds a pointer to it.
+
+target_complete_cmd() is called exactly once per entry: either by
+the CMD_RESPONSE handler (success) or by the disconnect/failure
+paths, which complete the se_cmd with SAM_STAT_BUSY.
+
+
+HA STATE MACHINE (STANDBY)
+=============================
+
+ha_state is stored in lio_ha_cfg and readable via configfs:
+
+  DISCONNECTED (0)
+    TCP link is down.  All forwarded commands complete immediately
+    with SAM_STAT_BUSY.
+
+  CONNECTED (1)
+    TCP link is up.  ACTIVE is sending LUN_SYNC messages.
+    STANDBY stores the incoming PR state but does not yet forward
+    initiator commands.
+
+  SYNCED (2)
+    LUN_SYNC_DONE received.  STANDBY forwards initiator commands
+    normally.  Middleware writes ALUA NONOPTIMIZED after reaching
+    this state.
+
+Transitions:
+
+  DISCONNECTED -> CONNECTED       TCP connection established
+  CONNECTED -> SYNCED             LUN_SYNC_DONE received from ACTIVE
+  CONNECTED/SYNCED -> DISCONNECTED  TCP link lost or closed
+
+
+FAILOVER SEQUENCE
+=================
+
+Failover on TrueNAS is always ungraceful: the pool imports on
+STANDBY while ACTIVE is unreachable.  The middleware-driven
+sequence is:
+
+  1. Middleware sets all ALUA target port groups to TRANSITIONING so
+     that initiators receive the correct UA and pause I/O during the
+     failover window.
+
+  2. Middleware writes "0" to /sys/kernel/config/lio_ha/forward_active.
+     lio_ha.ko processes the write as follows:
+
+     a. lio_ha_forward_active is set to 0 immediately.  iblock and
+        fileio check this flag inside configure_device(); it must be
+        clear before any backend is opened.
+
+     b. target_for_each_device() calls lio_ha_failover_device() for
+        every configured se_device.  Per device:
+
+        i.  lio_ha_pr_table is scanned for entries matching this
+            device and copied into a local snapshot (to avoid
+            holding lio_ha_pr_lock across LIO core calls).
+
+        ii. For each registrant, target_ha_foreach_nacl_dev() finds
+            the (nacl, lun, mapped_lun) tuple in the LIO TPG
+            configuration, and target_ha_pr_add_reg() installs the
+            PR registration directly into LIO core.  Non-holders
+            are restored first; the holder last so the reservation
+            is set after all registrants exist.
+
+        iii.target_ha_reopen_backend() calls configure_device() on
+            the iblock or fileio backend to open the block device
+            or file against the now-available pool.
+
+  3. Middleware sets all ALUA target port groups to ACTIVE-OPTIMIZED.
+     Initiators resume I/O against the new ACTIVE.
+
+Writing "0" to forward_active is idempotent.  Any device whose
+backend fails to open returns NOT READY; retrying the write re-runs
+failover for all devices and skips those already open.
+
+
+CONFIGFS ATTRIBUTES
+===================
+
+Path: /sys/kernel/config/lio_ha/
+
+  local_addr   (rw)  IP address this node listens on for incoming HA
+                     TCP connections.  Written by middleware at startup.
+
+  peer_addr    (rw)  IP address of the peer node's HA interface.
+                     ha_connect_task continuously attempts to connect
+                     here.  Written by middleware at startup.
+
+  port         (rw)  TCP port for both listen and connect.
+                     Default: 999.
+
+  ha_state     (ro)  Current state string: "disconnected", "connected",
+                     or "synced".  Middleware on STANDBY polls until
+                     "synced" before writing ALUA NONOPTIMIZED.
+                     "disconnected" on ACTIVE triggers an alert.
+
+  forward_active (rw)
+                     0 or 1.
+                     Write "1" at STANDBY startup: sets
+                     lio_ha_forward_active so backends defer open()
+                     and all commands are forwarded to ACTIVE.
+                     Write "0" at failover: restores replicated PR
+                     state, opens all backends, clears forwarding.
+                     Both writes are idempotent.
+
+
+FILE MAP
+========
+
+  lio_ha_wire.h    On-wire types: lio_ha_wire_hdr, lio_ha_data_hdr,
+                   lio_ha_msg_hdr, all message structs and enums, and
+                   field-size constants.  No kernel dependencies;
+                   safe to read in isolation.
+
+  lio_ha.h         Internal module types: struct lio_ha_cfg, struct
+                   lio_ha_pr_entry, enum lio_ha_state, and function
+                   declarations shared across compilation units.
+
+  lio_ha_main.c    Module init/exit.  Configfs subsystem registration
+                   and all five attributes.  Replicated PR table
+                   (lio_ha_pr_table, protected by lio_ha_pr_lock) and
+                   lio_ha_pr_apply() which handles both PERS_ACTION
+                   (incremental) and LUN_SYNC (bulk) updates.
+                   lio_ha_failover_device() and the forward_active
+                   write handler that drives the failover sequence.
+
+  lio_ha_fwd.c     STANDBY-side forwarding.  Implements the four
+                   lio_ha_ops callbacks (forward_cmd, forward_tmr,
+                   session_create, session_destroy).  In-flight
+                   command tracking with ha_fwd_entry / kref.
+                   Read-data buffering (ha_fwd_data_ht, keyed by
+                   cmd_cookie) for READ responses from ACTIVE.
+
+  lio_ha_recv.c    ACTIVE-side ha_recv fabric driver.  Single
+                   system-wide TPG registered programmatically with
+                   no configfs entry.  Synthetic se_session hash table
+                   keyed by session_id.  CMD_FORWARD submission to LIO
+                   core, WRITE-data buffering (ha_recv_data_ht), and
+                   CMD_RESPONSE / DATA sending.
+
+  lio_ha_tcp.c     TCP connection management.  Listen and connect
+                   threads (both active simultaneously on each node).
+                   Wire framing: lio_ha_tcp_send(), receive loop
+                   (ha_rx_task) dispatching by channel and type.
+                   Reconnect with exponential backoff.
+
+
+LIO CORE CHANGES (CONFIG_TRUENAS)
+==================================
+
+All additions in the core files are gated on #ifdef CONFIG_TRUENAS.
+
+  include/target/target_core_ha.h
+    Declares the three hooks, the target_ha_nacl_fn_t typedef, and
+    all additional exports below.  Contains the core-side architecture
+    overview comment.
+
+  drivers/target/target_core_transport.c
+    - lio_ha_forward_active: atomic_t checked in target_execute_cmd()
+      and core_tmr_call_handler().
+    - lio_ha_register_ops() / lio_ha_unregister_ops().
+    - EXPORT_SYMBOL(target_complete_tmr).
+
+  drivers/target/target_core_pr.c
+    - lio_ha_register_pr_notifier() / lio_ha_unregister_pr_notifier().
+    - pr_change() call site after each successful PR OUT.
+    - target_ha_pr_export(): serialise device PR state as APTPL text.
+    - target_ha_pr_add_reg(): install one PR registration at failover.
+
+  drivers/target/target_core_tpg.c
+    - target_ha_lookup_tpg(): find a TPG by fabric name, target name,
+      and TPG tag.
+    - target_ha_foreach_nacl_dev(): iterate nacl+lun mappings for an
+      initiator/device pair across all registered TPGs.
+    - ha_tpg_reg_list: list of TPGs maintained by
+      target_ha_register_tpg() / target_ha_unregister_tpg(), hooked
+      into core_tpg_register() / core_tpg_deregister().
+
+  drivers/target/target_core_device.c
+    - target_for_each_device(): iterate all configured se_devices.
+    - target_ha_reopen_backend(): open a deferred backend at failover.
