@@ -173,14 +173,14 @@ else
 fi
 sourcename=${KDEB_SOURCENAME:-linux-$KERNELRELEASE}
 
+debarch=
+set_debarch
+
 if [ "$ARCH" = "um" ] ; then
 	packagename=user-mode-linux
 else
-	packagename=linux-image-truenas-$exversion-amd64
+	packagename=linux-image-truenas-$exversion-$debarch
 fi
-
-debarch=
-set_debarch
 
 # Try to determine distribution
 if [ "${KDEB_CHANGELOG_DIST:+set}" ]; then

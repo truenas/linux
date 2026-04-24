@@ -3,4 +3,4 @@
 syscall_abis_32 +=
 syscall_abis_64 += renameat rlimit memfd_secret
 
-syscalltbl = arch/arm64/tools/syscall_%.tbl
+syscalltbl = $(srctree)/arch/arm64/tools/syscall_%.tbl
