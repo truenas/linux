@@ -425,9 +425,9 @@ static void lio_ha_replace_port_info(struct se_cmd *cmd, u8 *buf, size_t len)
 				put_unaligned_be16(tg_pt_gp_id, p + 6);
 				break;
 			}
-		} else if (code_set == 4 && designator_type == 3) {
+		} else if (code_set == 3 && designator_type == 8) {
 			/*
-			 * SCSI name string (UTF-8, iSCSI): contains
+			 * SCSI name string (code_set=3 UTF-8, type=8, iSCSI):
 			 * "iqn...,t,0x<tag>" where <tag> is %04x.
 			 * Patch the 4-hex-digit tag to match our tpg_rtpi.
 			 */
