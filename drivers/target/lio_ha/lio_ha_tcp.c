@@ -266,8 +266,32 @@ static void ha_tcp_on_connected(struct socket *sock)
 		return;
 	}
 
-	/* Enable TCP keepalives. */
+	/*
+	 * Aggressive TCP keepalive + TCP_NODELAY on the HA wire.
+	 *
+	 * The HA backplane is a dedicated low-latency link; we want a
+	 * crashed/unreachable peer detected within seconds, not the Linux
+	 * default (~2 hours of idle before the first keepalive probe).
+	 *
+	 * Values mirror FreeBSD CTL HA (cam/ctl/ctl_ha.c) which has shipped
+	 * with idle=1s, intvl=1s, cnt=5 for years on the same kind of HA
+	 * interconnect.  Detection time is roughly idle + cnt*intvl ~= 6s.
+	 *
+	 * NODELAY: control messages (CMD_FORWARD, CMD_RESPONSE, PERS_ACTION,
+	 * etc.) are tiny -- Nagle would coalesce them and add latency for
+	 * no throughput benefit.
+	 *
+	 * Errors are logged but non-fatal: the connection still works at
+	 * default TCP timing, just without fast dead-peer detection.
+	 */
 	sock_set_keepalive(sock->sk);
+	if (tcp_sock_set_keepidle(sock->sk, 1))
+		pr_warn("ha_tcp: failed to set TCP_KEEPIDLE\n");
+	if (tcp_sock_set_keepintvl(sock->sk, 1))
+		pr_warn("ha_tcp: failed to set TCP_KEEPINTVL\n");
+	if (tcp_sock_set_keepcnt(sock->sk, 5))
+		pr_warn("ha_tcp: failed to set TCP_KEEPCNT\n");
+	tcp_sock_set_nodelay(sock->sk);
 
 	ha_conn_sock = sock;
 
