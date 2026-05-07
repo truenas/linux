@@ -579,6 +579,47 @@ static int ha_main_send_lun_sync_for_device(struct se_device *dev, void *data)
 }
 
 /*
+ * ACTIVE-side bulk LUN_SYNC: send LUN_SYNC for every device, then a
+ * LUN_SYNC_DONE; on successful send, advance our own ha_state to SYNCED.
+ *
+ * Two callers fire this:
+ *   1. ha_main_on_connect() -- wire just came up while we are PRIMARY.
+ *   2. lio_ha_forward_active_store(0) -- we just became PRIMARY while
+ *      the wire was already up (delayed failover).
+ *
+ * Self-gated on ha_state so both callers can invoke unconditionally:
+ *   DISCONNECTED -> no-op (the connect handler will fire when wire returns).
+ *   CONNECTED    -> send LUN_SYNC + LUN_SYNC_DONE; flip to SYNCED on success.
+ *   SYNCED       -> no-op (already done; idempotent).
+ */
+static void ha_main_send_lun_sync_all(void)
+{
+	struct lio_ha_msg_lun_sync_done done = {};
+	enum lio_ha_state state;
+
+	spin_lock(&lio_ha_cfg.lock);
+	state = lio_ha_cfg.ha_state;
+	spin_unlock(&lio_ha_cfg.lock);
+
+	if (state != LIO_HA_CONNECTED)
+		return;
+
+	lio_ha_dbg(1, "ACTIVE: sending LUN_SYNC for all devices\n");
+	target_for_each_device(ha_main_send_lun_sync_for_device, NULL);
+
+	done.hdr.type     = cpu_to_be32(LIO_HA_MSG_LUN_SYNC_DONE);
+	done.hdr.reserved = 0;
+	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &done, sizeof(done))) {
+		pr_debug("lio_ha: LUN_SYNC_DONE send failed\n");
+		return;
+	}
+	spin_lock(&lio_ha_cfg.lock);
+	lio_ha_cfg.ha_state = LIO_HA_SYNCED;
+	spin_unlock(&lio_ha_cfg.lock);
+	pr_info("lio_ha: LUN_SYNC complete -- ha_state = synced\n");
+}
+
+/*
  * TCP connect handler -- registered with lio_ha_tcp_register_connect_handler().
  * Called on both ACTIVE and STANDBY whenever the HA TCP link comes up.
  *
@@ -595,8 +636,6 @@ static int ha_main_send_lun_sync_for_device(struct se_device *dev, void *data)
  */
 static void ha_main_on_connect(void)
 {
-	struct lio_ha_msg_lun_sync_done done = {};
-
 	if (atomic_read(&lio_ha_forward_active)) {
 		struct ha_main_sess_entry *se;
 		struct lio_ha_msg_session_connect *snap;
@@ -650,19 +689,7 @@ static void ha_main_on_connect(void)
 	}
 
 	/* ACTIVE: send bulk PR state. */
-	lio_ha_dbg(1, "TCP connected (ACTIVE): beginning LUN_SYNC\n");
-	target_for_each_device(ha_main_send_lun_sync_for_device, NULL);
-
-	done.hdr.type     = cpu_to_be32(LIO_HA_MSG_LUN_SYNC_DONE);
-	done.hdr.reserved = 0;
-	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &done, sizeof(done))) {
-		pr_debug("lio_ha: LUN_SYNC_DONE send failed\n");
-	} else {
-		spin_lock(&lio_ha_cfg.lock);
-		lio_ha_cfg.ha_state = LIO_HA_SYNCED;
-		spin_unlock(&lio_ha_cfg.lock);
-		pr_info("lio_ha: LUN_SYNC complete -- ha_state = synced\n");
-	}
+	ha_main_send_lun_sync_all();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1002,6 +1029,18 @@ static ssize_t lio_ha_forward_active_store(struct config_item *item,
 		ha_main_sess_list_flush();
 		target_for_each_device(ha_main_failover_device, NULL);
 		lio_ha_dbg(1, "forward_active cleared: failover complete\n");
+
+		/*
+		 * If the wire reconnected before this 1->0 transition (e.g.
+		 * delayed failover -- the new SECONDARY came back online
+		 * before middleware wrote forward_active=0 here), the
+		 * connect-handler trigger already fired with us still in
+		 * STANDBY mode and did NOT send LUN_SYNC.  Fire it now.
+		 * Idempotent with the connect-handler path: the helper
+		 * self-gates on ha_state and only sends when CONNECTED.
+		 */
+		ha_main_send_lun_sync_all();
+
 		module_put(THIS_MODULE);
 	}
 	return count;
