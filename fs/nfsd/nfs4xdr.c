@@ -3659,6 +3659,11 @@ static const nfsd4_enc_attr nfsd4_enc_fattr4_encode_ops[] = {
 };
 
 /*
+ * TrueNAS Note: any future FATTR4_* encoding should go through the dispatch
+ * table for RFC consistency. See NAS-140938 for bug details.
+ */
+
+/*
  * Note: @fhp can be NULL; in this case, we might have to compose the filehandle
  * ourselves.
  */
