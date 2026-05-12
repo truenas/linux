@@ -2682,8 +2682,24 @@ scsih_sdev_configure(struct scsi_device *sdev, struct queue_limits *lim)
 				pcie_device->enclosure_level,
 				pcie_device->connector_name);
 
-		if (pcie_device->nvme_mdts)
-			lim->max_hw_sectors = pcie_device->nvme_mdts / 512;
+		/*
+		 * The driver allocates a single 4 KiB page for the NVMe PRP
+		 * list, accommodating at most 512 entries. This limits the
+		 * maximum supported NVMe I/O transfer to 2 MiB. Cap
+		 * max_hw_sectors to the smaller of the drive's reported MDTS
+		 * or the 2 MiB driver limit to prevent buffer overflow.
+		 *
+		 * The PRP buffer is allocated once at driver init before
+		 * devices are enumerated, so it cannot be sized per-device.
+		 */
+		{
+			u32 nvme_max_sectors = SZ_2M >> SECTOR_SHIFT;
+
+			if (pcie_device->nvme_mdts)
+				nvme_max_sectors = min(nvme_max_sectors,
+					pcie_device->nvme_mdts >> SECTOR_SHIFT);
+			lim->max_hw_sectors = nvme_max_sectors;
+		}
 
 		pcie_device_put(pcie_device);
 		spin_unlock_irqrestore(&ioc->pcie_device_lock, flags);
