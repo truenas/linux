@@ -78,6 +78,9 @@ bool mesh_matches_local(struct ieee80211_sub_if_data *sdata,
 	 *   - MDA enabled
 	 * - Power management control on fc
 	 */
+	if (!ie->mesh_config)
+		return false;
+
 	if (!(ifmsh->mesh_id_len == ie->mesh_id_len &&
 	     memcmp(ifmsh->mesh_id, ie->mesh_id, ie->mesh_id_len) == 0 &&
 	     (ifmsh->mesh_pp_id == ie->mesh_config->meshconf_psel) &&
@@ -622,6 +625,9 @@ int mesh_add_he_6ghz_cap_ie(struct ieee80211_sub_if_data *sdata,
 	sband = ieee80211_get_sband(sdata);
 	if (!sband)
 		return -EINVAL;
+
+	if (sband->band != NL80211_BAND_6GHZ)
+		return 0;
 
 	iftd = ieee80211_get_sband_iftype_data(sband,
 					       NL80211_IFTYPE_MESH_POINT);
@@ -1626,6 +1632,9 @@ static void mesh_rx_csa_frame(struct ieee80211_sub_if_data *sdata,
 		return;
 
 	if (!mesh_matches_local(sdata, elems))
+		goto free;
+
+	if (!elems->mesh_chansw_params_ie)
 		goto free;
 
 	ifmsh->chsw_ttl = elems->mesh_chansw_params_ie->mesh_ttl;

@@ -39,7 +39,6 @@ int mt7925_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 	} else if (cmd == MCU_UNI_CMD(DEV_INFO_UPDATE) ||
 		   cmd == MCU_UNI_CMD(BSS_INFO_UPDATE) ||
 		   cmd == MCU_UNI_CMD(STA_REC_UPDATE) ||
-		   cmd == MCU_UNI_CMD(HIF_CTRL) ||
 		   cmd == MCU_UNI_CMD(OFFLOAD) ||
 		   cmd == MCU_UNI_CMD(SUSPEND)) {
 		struct mt7925_mcu_uni_event *event;
@@ -342,6 +341,51 @@ static void mt7925_mcu_roc_handle_grant(struct mt792x_dev *dev,
 }
 
 static void
+mt7925_mcu_handle_hif_ctrl_basic(struct mt792x_dev *dev, struct tlv *tlv)
+{
+	struct mt7925_mcu_hif_ctrl_basic_tlv *basic;
+
+	basic = (struct mt7925_mcu_hif_ctrl_basic_tlv *)tlv;
+
+	if (basic->hifsuspend) {
+		if (basic->hif_tx_traffic_status == HIF_TRAFFIC_IDLE &&
+		    basic->hif_rx_traffic_status == HIF_TRAFFIC_IDLE)
+			/* success */
+			dev->hif_idle = true;
+		else
+			/* busy */
+			/* invalid */
+			dev->hif_idle = false;
+	} else {
+		dev->hif_resumed = true;
+	}
+	wake_up(&dev->wait);
+}
+
+static void
+mt7925_mcu_uni_hif_ctrl_event(struct mt792x_dev *dev, struct sk_buff *skb)
+{
+	struct tlv *tlv;
+	u32 tlv_len;
+
+	skb_pull(skb, sizeof(struct mt7925_mcu_rxd) + 4);
+	tlv = (struct tlv *)skb->data;
+	tlv_len = skb->len;
+
+	while (tlv_len > 0 && le16_to_cpu(tlv->len) <= tlv_len) {
+		switch (le16_to_cpu(tlv->tag)) {
+		case UNI_EVENT_HIF_CTRL_BASIC:
+			mt7925_mcu_handle_hif_ctrl_basic(dev, tlv);
+			break;
+		default:
+			break;
+		}
+		tlv_len -= le16_to_cpu(tlv->len);
+		tlv = (struct tlv *)((char *)(tlv) + le16_to_cpu(tlv->len));
+	}
+}
+
+static void
 mt7925_mcu_uni_roc_event(struct mt792x_dev *dev, struct sk_buff *skb)
 {
 	struct tlv *tlv;
@@ -487,6 +531,9 @@ mt7925_mcu_uni_rx_unsolicited_event(struct mt792x_dev *dev,
 	rxd = (struct mt7925_mcu_rxd *)skb->data;
 
 	switch (rxd->eid) {
+	case MCU_UNI_EVENT_HIF_CTRL:
+		mt7925_mcu_uni_hif_ctrl_event(dev, skb);
+		break;
 	case MCU_UNI_EVENT_FW_LOG_2_HOST:
 		mt7925_mcu_uni_debug_msg_event(dev, skb);
 		break;
@@ -958,10 +1005,10 @@ int mt7925_run_firmware(struct mt792x_dev *dev)
 	if (err)
 		return err;
 
-	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
 	err = mt7925_load_clc(dev, mt792x_ram_name(dev));
 	if (err)
 		return err;
+	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
 
 	return mt7925_mcu_fw_log_2_host(dev, 1);
 }
@@ -3214,7 +3261,6 @@ __mt7925_mcu_set_clc(struct mt792x_dev *dev, u8 *alpha2,
 		u8 rsvd[64];
 	} __packed req = {
 		.tag = cpu_to_le16(0x3),
-		.len = cpu_to_le16(sizeof(req) - 4),
 
 		.idx = idx,
 		.env = env_cap,
@@ -3242,6 +3288,7 @@ __mt7925_mcu_set_clc(struct mt792x_dev *dev, u8 *alpha2,
 		memcpy(req.type, rule->type, 2);
 
 		req.size = cpu_to_le16(seg->len);
+		req.len = cpu_to_le16(sizeof(req) + seg->len - 4);
 		skb = __mt76_mcu_msg_alloc(&dev->mt76, &req,
 					   le16_to_cpu(req.size) + sizeof(req),
 					   sizeof(req), GFP_KERNEL);
@@ -3548,7 +3595,7 @@ mt7925_mcu_rate_txpower_band(struct mt76_phy *phy,
 		memcpy(tx_power_tlv->alpha2, dev->alpha2, sizeof(dev->alpha2));
 		tx_power_tlv->n_chan = num_ch;
 		tx_power_tlv->tag = cpu_to_le16(0x1);
-		tx_power_tlv->len = cpu_to_le16(sizeof(*tx_power_tlv));
+		tx_power_tlv->len = cpu_to_le16(msg_len);
 
 		switch (band) {
 		case NL80211_BAND_2GHZ:
