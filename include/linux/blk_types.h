@@ -349,8 +349,8 @@ enum req_op {
 	REQ_OP_ZONE_RESET_ALL	= (__force blk_opf_t)19,
 
 	/* copy offload src and dst operation */
-	REQ_OP_COPY_SRC		= (__force blk_opf_t)18,
-	REQ_OP_COPY_DST		= (__force blk_opf_t)19,
+	REQ_OP_COPY_SRC		= (__force blk_opf_t)22,
+	REQ_OP_COPY_DST		= (__force blk_opf_t)23,
 
 	/* Driver private requests */
 	REQ_OP_DRV_IN		= (__force blk_opf_t)34,
