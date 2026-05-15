@@ -1218,6 +1218,7 @@ struct intel_crtc_state {
 	bool wm_level_disabled;
 	u32 dc3co_exitline;
 	u16 su_y_granularity;
+	u8 entry_setup_frames;
 
 	/*
 	 * Frequence the dpll for the port should run at. Differs from the
@@ -2070,6 +2071,19 @@ static inline bool intel_encoder_is_dp(struct intel_encoder *encoder)
 	case INTEL_OUTPUT_DDI:
 		/* Skip pure HDMI/DVI DDI encoders */
 		return i915_mmio_reg_valid(enc_to_intel_dp(encoder)->output_reg);
+	default:
+		return false;
+	}
+}
+
+static inline bool intel_encoder_is_hdmi(struct intel_encoder *encoder)
+{
+	switch (encoder->type) {
+	case INTEL_OUTPUT_HDMI:
+		return true;
+	case INTEL_OUTPUT_DDI:
+		/* See if the HDMI encoder is valid. */
+		return i915_mmio_reg_valid(enc_to_intel_hdmi(encoder)->hdmi_reg);
 	default:
 		return false;
 	}

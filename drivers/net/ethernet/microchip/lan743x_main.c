@@ -1330,7 +1330,7 @@ static int lan743x_mac_set_mtu(struct lan743x_adapter *adapter, int new_mtu)
 }
 
 /* PHY */
-static int lan743x_phy_reset(struct lan743x_adapter *adapter)
+static int lan743x_hw_reset_phy(struct lan743x_adapter *adapter)
 {
 	u32 data;
 
@@ -1344,11 +1344,6 @@ static int lan743x_phy_reset(struct lan743x_adapter *adapter)
 				  (!(data & PMT_CTL_ETH_PHY_RST_) &&
 				  (data & PMT_CTL_READY_)),
 				  50000, 1000000);
-}
-
-static int lan743x_phy_init(struct lan743x_adapter *adapter)
-{
-	return lan743x_phy_reset(adapter);
 }
 
 static void lan743x_phy_interface_select(struct lan743x_adapter *adapter)
@@ -2499,8 +2494,7 @@ static int lan743x_rx_process_buffer(struct lan743x_rx *rx)
 
 	/* save existing skb, allocate new skb and map to dma */
 	skb = buffer_info->skb;
-	if (lan743x_rx_init_ring_element(rx, rx->last_head,
-					 GFP_ATOMIC | GFP_DMA)) {
+	if (lan743x_rx_init_ring_element(rx, rx->last_head, GFP_ATOMIC)) {
 		/* failed to allocate next skb.
 		 * Memory is very low.
 		 * Drop this packet and reuse buffer.
@@ -3061,6 +3055,11 @@ static void lan743x_phylink_mac_link_up(struct phylink_config *config,
 	else if (speed == SPEED_100)
 		mac_cr |= MAC_CR_CFG_L_;
 
+	if (duplex == DUPLEX_FULL)
+		mac_cr |= MAC_CR_DPX_;
+	else
+		mac_cr &= ~MAC_CR_DPX_;
+
 	lan743x_csr_write(adapter, MAC_CR, mac_cr);
 
 	lan743x_ptp_update_latency(adapter, speed);
@@ -3505,10 +3504,6 @@ static int lan743x_hardware_init(struct lan743x_adapter *adapter,
 	if (ret)
 		return ret;
 
-	ret = lan743x_phy_init(adapter);
-	if (ret)
-		return ret;
-
 	ret = lan743x_ptp_init(adapter);
 	if (ret)
 		return ret;
@@ -3639,6 +3634,10 @@ static int lan743x_pcidev_probe(struct pci_dev *pdev,
 		goto return_error;
 
 	ret = lan743x_csr_init(adapter);
+	if (ret)
+		goto cleanup_pci;
+
+	ret = lan743x_hw_reset_phy(adapter);
 	if (ret)
 		goto cleanup_pci;
 

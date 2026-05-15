@@ -10,6 +10,7 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
+#include <linux/rbtree.h>
 
 #include <drm/drm_print.h>
 
@@ -53,7 +54,11 @@ struct drm_buddy_block {
 	 * a list, if so desired. As soon as the block is freed with
 	 * drm_buddy_free* ownership is given back to the mm.
 	 */
-	struct list_head link;
+	union {
+		struct rb_node rb;
+		struct list_head link;
+	};
+
 	struct list_head tmp_link;
 };
 
@@ -68,7 +73,7 @@ struct drm_buddy_block {
  */
 struct drm_buddy {
 	/* Maintain a free list for each order. */
-	struct list_head *free_list;
+	struct rb_root **free_trees;
 
 	/*
 	 * Maintain explicit binary tree(s) to track the allocation of the
@@ -94,7 +99,7 @@ struct drm_buddy {
 };
 
 static inline u64
-drm_buddy_block_offset(struct drm_buddy_block *block)
+drm_buddy_block_offset(const struct drm_buddy_block *block)
 {
 	return block->header & DRM_BUDDY_HEADER_OFFSET;
 }
@@ -159,6 +164,8 @@ int drm_buddy_block_trim(struct drm_buddy *mm,
 			 u64 *start,
 			 u64 new_size,
 			 struct list_head *blocks);
+
+void drm_buddy_reset_clear(struct drm_buddy *mm, bool is_clear);
 
 void drm_buddy_free_block(struct drm_buddy *mm, struct drm_buddy_block *block);
 
