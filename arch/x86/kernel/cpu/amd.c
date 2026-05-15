@@ -935,6 +935,9 @@ static void init_amd_zen1(struct cpuinfo_x86 *c)
 		msr_clear_bit(MSR_K7_HWCR, MSR_K7_HWCR_IRPERF_EN_BIT);
 		clear_cpu_cap(c, X86_FEATURE_IRPERF);
 	}
+
+	pr_notice_once("AMD Zen1 FPDSS bug detected, enabling mitigation.\n");
+	msr_set_bit(MSR_AMD64_FP_CFG, MSR_AMD64_FP_CFG_ZEN1_DENORM_FIX_BIT);
 }
 
 static bool cpu_has_zenbleed_microcode(void)
@@ -986,6 +989,9 @@ static void init_amd_zen2(struct cpuinfo_x86 *c)
 		msr_clear_bit(MSR_AMD64_CPUID_FN_7, 18);
 		pr_emerg("RDSEED is not reliable on this platform; disabling.\n");
 	}
+
+	if (!cpu_has(c, X86_FEATURE_HYPERVISOR))
+		msr_set_bit(MSR_ZEN4_BP_CFG, MSR_ZEN2_BP_CFG_BUG_FIX_BIT);
 }
 
 static void init_amd_zen3(struct cpuinfo_x86 *c)
@@ -1018,8 +1024,50 @@ static void init_amd_zen4(struct cpuinfo_x86 *c)
 	}
 }
 
+static bool check_rdseed_microcode(void)
+{
+	struct cpuinfo_x86 *c = &boot_cpu_data;
+	union zen_patch_rev p;
+	u32 min_rev = 0;
+
+	p.ext_fam	= c->x86 - 0xf;
+	p.model		= c->x86_model;
+	p.ext_model	= c->x86_model >> 4;
+	p.stepping	= c->x86_stepping;
+	/* reserved bits are expected to be 0 in test below */
+	p.__reserved	= 0;
+
+	if (cpu_has(c, X86_FEATURE_ZEN5)) {
+		switch (p.ucode_rev >> 8) {
+		case 0xb0021:	min_rev = 0xb00215a; break;
+		case 0xb0081:	min_rev = 0xb008121; break;
+		case 0xb1010:	min_rev = 0xb101054; break;
+		case 0xb2040:	min_rev = 0xb204037; break;
+		case 0xb4040:	min_rev = 0xb404035; break;
+		case 0xb4041:	min_rev = 0xb404108; break;
+		case 0xb6000:	min_rev = 0xb600037; break;
+		case 0xb6080:	min_rev = 0xb608038; break;
+		case 0xb7000:	min_rev = 0xb700037; break;
+		default:
+			pr_debug("%s: ucode_rev: 0x%x, current revision: 0x%x\n",
+				 __func__, p.ucode_rev, c->microcode);
+			return false;
+		}
+	}
+
+	if (!min_rev)
+		return false;
+
+	return c->microcode >= min_rev;
+}
+
 static void init_amd_zen5(struct cpuinfo_x86 *c)
 {
+	if (!check_rdseed_microcode()) {
+		clear_cpu_cap(c, X86_FEATURE_RDSEED);
+		msr_clear_bit(MSR_AMD64_CPUID_FN_7, 18);
+		pr_emerg_once("RDSEED32 is broken. Disabling the corresponding CPUID bit.\n");
+	}
 }
 
 static void init_amd(struct cpuinfo_x86 *c)
