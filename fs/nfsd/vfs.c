@@ -188,6 +188,20 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 	    nfsd_mountpoint(dentry, exp) == 2) {
 		/* This is only a mountpoint in some other namespace */
 		path_put(&path);
+#ifdef CONFIG_TRUENAS
+		/*
+		 * For snapdir entries we set LOOKUP_AUTOMOUNT above, so
+		 * if the path is unchanged the automount was attempted
+		 * and failed (EISDIR from zfsctl_snapshot_mount).  This
+		 * can happen transiently when zfs_suspend_fs races with
+		 * the mount helper after the z_teardown_lock deadlock
+		 * fix (see https://github.com/openzfs/zfs/pull/18415).
+		 * Return ESTALE so the client retries via LOOKUP rather
+		 * than caching the ctldir stub as an empty directory.
+		 */
+		if (is_snapdir)
+			err = -ESTALE;
+#endif /* CONFIG_TRUENAS */
 		goto out;
 	}
 
@@ -201,8 +215,23 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 		 * allowed without an explicit export of the new
 		 * directory.
 		 */
-		if (err == -ENOENT && !(exp->ex_flags & NFSEXP_V4ROOT))
-			err = 0;
+		if (err == -ENOENT && !(exp->ex_flags & NFSEXP_V4ROOT)) {
+#ifdef CONFIG_TRUENAS
+			/*
+			 * For ZFS snapshot entries under a zfs_snapdir
+			 * export, the fallback dentry is an automount
+			 * stub with simple_dir_operations that returns
+			 * empty READDIR (NFS4_OK, zero entries). The
+			 * client caches this silently with no error
+			 * signal to trigger re-resolution. Return ESTALE
+			 * so the client retries via LOOKUP.
+			 */
+			if (is_snapdir)
+				err = -ESTALE;
+			else
+#endif /* CONFIG_TRUENAS */
+				err = 0;
+		}
 		path_put(&path);
 		goto out;
 	}
