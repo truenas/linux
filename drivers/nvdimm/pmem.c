@@ -341,6 +341,8 @@ static bool pmem_dma_submit_bio(struct pmem_device *pmem, struct bio *bio,
 		}
 		last_cookie1 = cookie;
 		i += dmas;
+		if (cb)
+			break;
 	}
 	dma_async_issue_pending(dma_chan1);
 
@@ -372,6 +374,8 @@ static bool pmem_dma_submit_bio(struct pmem_device *pmem, struct bio *bio,
 		}
 		last_cookie2 = cookie;
 		i += 2;
+		if (cb)
+			break;
 	}
 	dma_async_issue_pending(dma_chan2);
 	return true;
