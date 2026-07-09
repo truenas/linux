@@ -230,9 +230,12 @@ static netdev_tx_t ntb_netdev_start_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 
 err:
+	if (rc == -EBUSY)
+		return NETDEV_TX_BUSY;
 	ndev->stats.tx_dropped++;
 	ndev->stats.tx_errors++;
-	return NETDEV_TX_BUSY;
+	dev_kfree_skb_any(skb);
+	return NETDEV_TX_OK;
 }
 
 static enum hrtimer_restart ntb_netdev_tx_timer(struct hrtimer *hrtimer)
