@@ -124,7 +124,7 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
 
 	netdev_dbg(ndev, "%s: %d byte payload received\n", __func__, len);
 
-	if (len < 0) {
+	if (len < ETH_HLEN) {
 		ndev->stats.rx_errors++;
 		ndev->stats.rx_length_errors++;
 		nskb = skb;
