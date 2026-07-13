@@ -1806,7 +1806,18 @@ static int ntb_process_rxc(struct ntb_transport_qp *qp)
 	entry->rx_hdr = hdr;
 	entry->rx_index = qp->rx_index;
 
-	if (hdr->len > entry->len) {
+	if (hdr->len > qp->rx_max_frame - sizeof(struct ntb_payload_header)) {
+		dev_err_ratelimited(&qp->ndev->pdev->dev,
+			"qp %d: RX frame too large from peer: %u > %zu\n",
+			qp->qp_num, hdr->len,
+			qp->rx_max_frame - sizeof(struct ntb_payload_header));
+		qp->rx_err_oflow++;
+
+		entry->len = -EIO;
+		entry->flags |= DESC_DONE_FLAG;
+
+		ntb_complete_rxc(qp);
+	} else if (hdr->len > entry->len) {
 		dev_dbg(&qp->ndev->pdev->dev,
 			"receive buffer overflow! Wanted %d got %d\n",
 			hdr->len, entry->len);
