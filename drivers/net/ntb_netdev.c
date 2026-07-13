@@ -170,8 +170,26 @@ deliver:
 	}
 
 enqueue_again:
+	/* A recycled buffer may predate an MTU increase that change_mtu()
+	 * could not drain because this handler was holding it. It is then too
+	 * small for the current MTU and, once we post its true capacity below,
+	 * would reject every full-size frame for its ring slot until it drains.
+	 * Swap in a right-sized buffer; on allocation failure keep the smaller
+	 * one, which stays safe and is replaced on a later pass. Steady state
+	 * takes neither branch, so the hot path adds no allocation.
+	 */
+	if (skb_tailroom(nskb) < ndev->mtu + ETH_HLEN) {
+		struct sk_buff *rskb;
+
+		rskb = netdev_alloc_skb(ndev, ndev->mtu + ETH_HLEN);
+		if (rskb) {
+			dev_kfree_skb_any(nskb);
+			nskb = rskb;
+		}
+	}
+
 	rc = ntb_transport_rx_enqueue(qp, nskb, nskb->data,
-	    ndev->mtu + ETH_HLEN);
+	    skb_tailroom(nskb));
 	if (rc) {
 		dev_kfree_skb_any(nskb);
 		ndev->stats.rx_errors++;
