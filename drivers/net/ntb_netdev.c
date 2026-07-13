@@ -71,6 +71,21 @@ static unsigned int tx_start = 10;
 /* Number of descriptors still available before stop upper layer tx */
 static unsigned int tx_stop = 5;
 
+/* Copy received frames of this many bytes or less into a right-sized skb
+ * and recycle the full-MTU ring buffer.  Posted ring buffers are always
+ * ndev->mtu + ETH_HLEN bytes, so without this a 54-byte pure TCP ACK is
+ * delivered with the truesize of a full-MTU allocation (~128KB at the
+ * default 64KB MTU), overcharging socket receive-buffer accounting by
+ * three orders of magnitude and collapsing TCP receive windows to zero.
+ *
+ * Default is SKB_MAX_ORDER(NET_SKB_PAD, 0) - NET_IP_ALIGN (3646 on x86-64),
+ * the largest frame whose right-sized copy still fits one order-0 page after
+ * netdev_alloc_skb_ip_align() reserves its NET_IP_ALIGN headroom.
+ */
+static unsigned int rx_copybreak = 3646;
+module_param(rx_copybreak, uint, 0644);
+MODULE_PARM_DESC(rx_copybreak, "Copy RX frames of this size or less into right-sized skbs");
+
 struct ntb_netdev {
 	struct pci_dev *pdev;
 	struct net_device *ndev;
@@ -112,11 +127,25 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
 
 	netdev_dbg(ndev, "%s: %d byte payload received\n", __func__, len);
 
-	if (len < 0) {
+	if (len < ETH_HLEN) {
 		ndev->stats.rx_errors++;
 		ndev->stats.rx_length_errors++;
 		nskb = skb;
 		goto enqueue_again;
+	}
+
+	if (len <= rx_copybreak) {
+		struct sk_buff *cskb;
+
+		cskb = netdev_alloc_skb_ip_align(ndev, len);
+		if (cskb) {
+			skb_put_data(cskb, skb->data, len);
+			/* Recycle the ring buffer, deliver the copy */
+			nskb = skb;
+			skb = cskb;
+			goto deliver;
+		}
+		/* Fall back to handing off the ring buffer itself */
 	}
 
 	nskb = netdev_alloc_skb(ndev, ndev->mtu + ETH_HLEN);
@@ -128,6 +157,7 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
 	}
 
 	skb_put(skb, len);
+deliver:
 	skb->protocol = eth_type_trans(skb, ndev);
 	skb->ip_summed = CHECKSUM_NONE;
 
@@ -140,8 +170,26 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
 	}
 
 enqueue_again:
+	/* A recycled buffer may predate an MTU increase that change_mtu()
+	 * could not drain because this handler was holding it. It is then too
+	 * small for the current MTU and, once we post its true capacity below,
+	 * would reject every full-size frame for its ring slot until it drains.
+	 * Swap in a right-sized buffer; on allocation failure keep the smaller
+	 * one, which stays safe and is replaced on a later pass. Steady state
+	 * takes neither branch, so the hot path adds no allocation.
+	 */
+	if (skb_tailroom(nskb) < ndev->mtu + ETH_HLEN) {
+		struct sk_buff *rskb;
+
+		rskb = netdev_alloc_skb(ndev, ndev->mtu + ETH_HLEN);
+		if (rskb) {
+			dev_kfree_skb_any(nskb);
+			nskb = rskb;
+		}
+	}
+
 	rc = ntb_transport_rx_enqueue(qp, nskb, nskb->data,
-	    ndev->mtu + ETH_HLEN);
+	    skb_tailroom(nskb));
 	if (rc) {
 		dev_kfree_skb_any(nskb);
 		ndev->stats.rx_errors++;
