@@ -203,6 +203,9 @@ struct svc_rqst {
 	struct page *		*rq_respages;	/* points into rq_pages */
 	struct page *		*rq_next_page; /* next reply page to use */
 	struct page *		*rq_page_end;  /* one past the last page */
+	struct page *		*rq_stash;	/* sent reply pages awaiting reuse,
+						 * one svc_rqst reference held each */
+	unsigned long		rq_stash_count;
 
 	struct folio_batch	rq_fbatch;
 	struct bio_vec		*rq_bvec;
@@ -440,6 +443,7 @@ struct svc_serv *svc_create(struct svc_program *, unsigned int,
 bool		   svc_rqst_replace_page(struct svc_rqst *rqstp,
 					 struct page *page);
 void		   svc_rqst_release_pages(struct svc_rqst *rqstp);
+unsigned long	   svc_stash_fill(struct svc_rqst *rqstp);
 void		   svc_exit_thread(struct svc_rqst *);
 struct svc_serv *  svc_create_pooled(struct svc_program *prog,
 				     unsigned int nprog,

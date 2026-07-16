@@ -656,7 +656,10 @@ static bool svc_alloc_arg(struct svc_rqst *rqstp)
 	unsigned long pages, filled, ret;
 
 	pages = rqstp->rq_maxpages;
-	for (filled = 0; filled < pages; filled = ret) {
+	/* Reuse reply pages whose transmit has completed, then top up
+	 * from the page allocator.
+	 */
+	for (filled = svc_stash_fill(rqstp); filled < pages; filled = ret) {
 		ret = alloc_pages_bulk(GFP_KERNEL, pages, rqstp->rq_pages);
 		if (ret > filled)
 			/* Made progress, don't sleep yet */

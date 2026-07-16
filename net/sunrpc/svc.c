@@ -36,6 +36,16 @@
 
 #define RPCDBG_FACILITY	RPCDBG_SVCDSP
 
+/*
+ * Reply-page stash capacity, in multiples of rq_maxpages.  Sent pages
+ * stay referenced until the TCP ACK purges them from the socket write
+ * queue, typically several RPC turnarounds later, so the stash must
+ * hold several RPCs' worth of in-flight pages to bridge that gap.
+ * While a page is in flight the skb holds it alive anyway; the stash
+ * reference adds no net memory pressure beyond the ready reserve.
+ */
+#define SVC_STASH_DEPTH		16
+
 static void svc_unregister(const struct svc_serv *serv, struct net *net);
 
 #define SVC_POOL_DEFAULT	SVC_POOL_GLOBAL
@@ -646,6 +656,15 @@ svc_init_buffer(struct svc_rqst *rqstp, const struct svc_serv *serv, int node)
 	if (!rqstp->rq_pages)
 		return false;
 
+	rqstp->rq_stash = kcalloc_node(SVC_STASH_DEPTH * rqstp->rq_maxpages,
+				       sizeof(struct page *),
+				       GFP_KERNEL, node);
+	if (!rqstp->rq_stash) {
+		kfree(rqstp->rq_pages);
+		rqstp->rq_pages = NULL;
+		return false;
+	}
+
 	return true;
 }
 
@@ -657,10 +676,15 @@ svc_release_buffer(struct svc_rqst *rqstp)
 {
 	unsigned long i;
 
-	for (i = 0; i < rqstp->rq_maxpages; i++)
-		if (rqstp->rq_pages[i])
-			put_page(rqstp->rq_pages[i]);
-	kfree(rqstp->rq_pages);
+	if (rqstp->rq_pages) {
+		for (i = 0; i < rqstp->rq_maxpages; i++)
+			if (rqstp->rq_pages[i])
+				put_page(rqstp->rq_pages[i]);
+		kfree(rqstp->rq_pages);
+	}
+	while (rqstp->rq_stash_count)
+		put_page(rqstp->rq_stash[--rqstp->rq_stash_count]);
+	kfree(rqstp->rq_stash);
 }
 
 static void
@@ -922,22 +946,146 @@ bool svc_rqst_replace_page(struct svc_rqst *rqstp, struct page *page)
 }
 EXPORT_SYMBOL_GPL(svc_rqst_replace_page);
 
+/*
+ * Reply-page stash: recycle sent reply pages instead of freeing them.
+ *
+ * nfsd bulk-allocates ~sv_max_mesg worth of pages per RPC while holding
+ * the pcp lock; the network stack frees them again at TX-completion/ACK
+ * time from softirq or hardirq context, often on another CPU.  Under
+ * cached-read load this alloc/free churn collides with the allocator
+ * locks (pcp lock, and zone->lock via free_one_page when the pcp
+ * trylock fails) and dominates the profile.
+ *
+ * Instead of dropping our reference in svc_rqst_release_pages(), keep
+ * it and stash the page.  The skb's put at TX completion is then never
+ * the final put - it is a plain atomic decrement - so the free-side
+ * collision disappears entirely.  At the next svc_alloc_arg(), stashed
+ * pages whose refcount has dropped back to 1 (transmit finished, we are
+ * the sole owner) are reused in place, so the steady state allocates
+ * almost nothing from the page allocator either.
+ *
+ * Pages that might be owned by somebody else (spliced file pages:
+ * mapping set, on the LRU, or carrying private data) are never stashed;
+ * a stashed page is only reused once its refcount is exactly 1.
+ */
+static bool svc_reply_page_stash __read_mostly = true;
+module_param_named(reply_page_stash, svc_reply_page_stash, bool, 0644);
+MODULE_PARM_DESC(reply_page_stash,
+		 "Recycle reply pages via a per-thread stash");
+
+/* diagnostic counters (racy adds, informational only) */
+static unsigned long svc_stash_reused;
+module_param_named(reply_page_stash_reused, svc_stash_reused, ulong, 0444);
+static unsigned long svc_stash_overflow;
+module_param_named(reply_page_stash_overflow, svc_stash_overflow, ulong, 0444);
+
+static void svc_stash_drain(struct svc_rqst *rqstp)
+{
+	while (rqstp->rq_stash_count)
+		put_page(rqstp->rq_stash[--rqstp->rq_stash_count]);
+}
+
+static bool svc_stash_page(struct svc_rqst *rqstp, struct page *page)
+{
+	struct folio *folio = page_folio(page);
+
+	if (rqstp->rq_stash_count >= SVC_STASH_DEPTH * rqstp->rq_maxpages) {
+		svc_stash_overflow++;
+		return false;
+	}
+	if (folio->mapping || folio_test_lru(folio) ||
+	    folio_test_private(folio))
+		return false;
+	rqstp->rq_stash[rqstp->rq_stash_count++] = page;
+	return true;
+}
+
+/**
+ * svc_stash_fill - refill rq_pages[] from the reply-page stash
+ * @rqstp: RPC transaction context
+ *
+ * Move stashed pages whose transmit has completed (refcount back to 1)
+ * into empty rq_pages[] slots.  Busy pages stay in the stash for a
+ * later pass.
+ *
+ * Return: the number of populated entries in rq_pages[], as a starting
+ * point for alloc_pages_bulk().
+ */
+unsigned long svc_stash_fill(struct svc_rqst *rqstp)
+{
+	unsigned long populated = 0, reused = 0, ready_kept = 0;
+	unsigned long kept = 0, scan = 0, i;
+	bool stash = READ_ONCE(svc_reply_page_stash) && rqstp->rq_stash;
+
+	for (i = 0; i < rqstp->rq_maxpages; i++) {
+		if (rqstp->rq_pages[i]) {
+			populated++;
+			continue;
+		}
+		while (stash && scan < rqstp->rq_stash_count) {
+			struct page *page = rqstp->rq_stash[scan++];
+
+			if (page_ref_count(page) == 1) {
+				rqstp->rq_pages[i] = page;
+				populated++;
+				reused++;
+				break;
+			}
+			/* still in flight - keep it for a later pass */
+			rqstp->rq_stash[kept++] = page;
+		}
+	}
+	while (stash && scan < rqstp->rq_stash_count) {
+		struct page *page = rqstp->rq_stash[scan++];
+
+		/*
+		 * Keep the in-flight pages and up to one RPC's worth of
+		 * ready surplus; release the rest so an idle thread does
+		 * not sit on completed pages forever.
+		 */
+		if (page_ref_count(page) == 1 &&
+		    ++ready_kept > rqstp->rq_maxpages) {
+			put_page(page);
+			continue;
+		}
+		rqstp->rq_stash[kept++] = page;
+	}
+	if (stash) {
+		rqstp->rq_stash_count = kept;
+		svc_stash_reused += reused;
+	}
+	return populated;
+}
+
 /**
  * svc_rqst_release_pages - Release Reply buffer pages
  * @rqstp: RPC transaction context
  *
  * Release response pages that might still be in flight after
- * svc_send, and any spliced filesystem-owned pages.
+ * svc_send, and any spliced filesystem-owned pages.  Eligible
+ * pages are stashed for reuse instead of being freed.
  */
 void svc_rqst_release_pages(struct svc_rqst *rqstp)
 {
 	int i, count = rqstp->rq_next_page - rqstp->rq_respages;
 
+	if (READ_ONCE(svc_reply_page_stash) && rqstp->rq_stash) {
+		for (i = 0; i < count; i++) {
+			struct page *page = rqstp->rq_respages[i];
+
+			rqstp->rq_respages[i] = NULL;
+			if (page && !svc_stash_page(rqstp, page))
+				put_page(page);
+		}
+		return;
+	}
 	if (count) {
 		release_pages(rqstp->rq_respages, count);
 		for (i = 0; i < count; i++)
 			rqstp->rq_respages[i] = NULL;
 	}
+	if (rqstp->rq_stash)
+		svc_stash_drain(rqstp);
 }
 
 /**
