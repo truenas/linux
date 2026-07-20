@@ -93,9 +93,19 @@ jobs:
   build_production_kernel:
 
     needs: pre_build
-    if: ${{ needs.pre_build.outputs.should_skip != 'true' }}
+    # Never skip pushes to the publishing branches, even when an identical
+    # tree was already built by a PR run - publish_latest_debs needs this
+    # run's own artifacts.
+    if: ${{ needs.pre_build.outputs.should_skip != 'true' || (github.event_name == 'push' && (github.ref == 'refs/heads/truenas/linux-6.18' || github.ref == 'refs/heads/stable/26')) }}
 
     runs-on: ubuntu-22.04
+
+    # Kernel build environment as used by truenas_build
+    # (conf/build.manifest, "kernel" entry).  The Makefile only defaults
+    # EXTRAVERSION when it is absent from the environment.
+    env:
+      EXTRAVERSION: "-production"
+      PYTHON: "python3"
 
     steps:
 
@@ -112,13 +122,12 @@ jobs:
           python3-dev liblzma-dev libzstd-dev libcap-dev libnuma-dev \
           libbabeltrace-dev openjdk-11-jdk devscripts libncurses-dev \
           libssl-dev debhelper-compat libpfm4-dev libtraceevent-dev \
-          libcapstone-dev llvm-dev
+          libcapstone-dev llvm-dev zstd
 
       - name: Generate .config
         run: |
           rm -rf .git .gitattributes .gitignore
-          export EXTRAVERSION="-production"
-          make ARCH=x86_64 defconfig
+          make defconfig
           ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/debian_amd64.config
           ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/truenas.config
           ./scripts/kconfig/merge_config.sh .config ./scripts/package/truenas/tn-production.config
@@ -143,10 +152,7 @@ jobs:
 
       - name: Build Kernel
         run: |
-          export EXTRAVERSION="-production"
-          cp .config /tmp/
-          make distclean
-          mv /tmp/.config .config
+          rm -rf .config.old
           make -j$(nproc) bindeb-pkg
 
       - name: Prepare artifacts
@@ -166,3 +172,133 @@ jobs:
       - name: Status
         run: |
           echo "Status: ${{job.status}}"
+
+  # On every merge to truenas/linux-6.18 or stable/26, republish the
+  # production debs built above as assets of a per-train rolling prerelease
+  # (master-nightly and 26-nightly respectively).  Tags are named after the
+  # TrueNAS train rather than the kernel series so that consumer URLs
+  # survive a kernel rebase of the master branch.  Release assets (unlike
+  # Actions artifacts) never expire and are downloadable anonymously at
+  # stable URLs:
+  #   https://github.com/truenas/linux/releases/download/master-nightly/<file>
+  # Consumers should fetch manifest.json first to learn the current kernel
+  # release and file names, then verify downloads against SHA256SUMS.
+  publish_latest_debs:
+
+    needs: build_production_kernel
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/truenas/linux-6.18' || github.ref == 'refs/heads/stable/26') }}
+
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+      actions: read
+
+    concurrency:
+      group: publish-latest-debs-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+
+      - name: Download production kernel debs
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{github.sha}}-production
+          path: production-kernel
+
+      - name: Assemble release assets
+        run: |
+          mkdir release-assets
+          # Skip debug-symbols packages: they are huge, nothing downstream
+          # consumes them from this release, and each asset must stay under
+          # GitHub's 2 GiB limit.
+          for deb in production-kernel/*.deb; do
+            case "$(basename "$deb")" in
+              *-dbg_*)
+                echo "Skipping debug-symbols package $(basename "$deb")"
+                ;;
+              *)
+                cp "$deb" release-assets/
+                ;;
+            esac
+          done
+
+          # The package names carry no kernel version, so read the kernel
+          # release from the vmlinuz path inside the image deb.
+          image_deb=$(ls production-kernel/linux-image-*.deb | grep -v -- '-dbg_' | head -n1)
+          release=$(dpkg-deb -c "$image_deb" | sed -n 's|.*\./boot/vmlinuz-||p')
+          if [ -z "$release" ]; then
+            echo "ERROR: could not determine kernel release from $image_deb"
+            exit 1
+          fi
+          echo "KERNEL_RELEASE=$release" >> "$GITHUB_ENV"
+
+      - name: Generate checksums and manifest
+        run: |
+          cd release-assets
+          sha256sum *.deb > SHA256SUMS
+          ls *.deb | jq -R . | jq -s \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg commit "$GITHUB_SHA" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg release "$KERNEL_RELEASE" \
+            '{
+              branch: $branch,
+              commit: $commit,
+              date: $date,
+              run_url: $run_url,
+              release: $release,
+              debs: .
+            }' > manifest.json
+          cat manifest.json
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # If the branch has already moved past this commit, let the run
+          # building the new tip publish instead - the release must never
+          # go back to older debs.
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$GITHUB_REF_NAME" --jq .object.sha)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME is now at $tip, not publishing $GITHUB_SHA"
+            exit 0
+          fi
+
+          # Map the branch to its TrueNAS train.  Exact matches only: if a
+          # branch is added to this job's if-gate it must be mapped here
+          # too, otherwise two branches could fight over one release.
+          case "$GITHUB_REF_NAME" in
+            truenas/linux-6.18) train="master" ;;
+            stable/26)          train="26" ;;
+            *)
+              echo "ERROR: no train mapping for branch $GITHUB_REF_NAME"
+              exit 1
+              ;;
+          esac
+          tag="${train}-nightly"
+
+          {
+            echo "Rolling production kernel build of \`$GITHUB_REF_NAME\` at $GITHUB_SHA."
+            echo
+            echo "- Kernel release: \`$KERNEL_RELEASE\`"
+            echo "- Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "The tag and all assets are replaced on every merge to"
+            echo "\`$GITHUB_REF_NAME\`. Asset file names do not embed the kernel"
+            echo "release, so fetch \`manifest.json\` to see what is currently"
+            echo "published and verify downloads against \`SHA256SUMS\`."
+          } > release-notes.md
+
+          gh release delete "$tag" --cleanup-tag --yes || true
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" 2>/dev/null || true
+          gh release create "$tag" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "TrueNAS $train kernel (nightly)" \
+            --notes-file release-notes.md \
+            release-assets/*.deb \
+            release-assets/SHA256SUMS \
+            release-assets/manifest.json
