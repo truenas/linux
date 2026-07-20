@@ -256,6 +256,7 @@ jobs:
       - name: Publish rolling release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           # If the branch has already moved past this commit, let the run
           # building the new tip publish instead - the release must never
