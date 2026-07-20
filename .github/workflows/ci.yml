@@ -96,7 +96,7 @@ jobs:
     # Never skip pushes to the publishing branches, even when an identical
     # tree was already built by a PR run - publish_latest_debs needs this
     # run's own artifacts.
-    if: ${{ needs.pre_build.outputs.should_skip != 'true' || (github.event_name == 'push' && (github.ref == 'refs/heads/truenas/linux-6.18' || github.ref == 'refs/heads/stable/26')) }}
+    if: ${{ needs.pre_build.outputs.should_skip != 'true' || (github.event_name == 'push' && (github.ref == 'refs/heads/truenas/linux-6.18' || github.ref == 'refs/heads/stable/26' || github.ref == 'refs/heads/ci-test/publish-check')) }}
 
     runs-on: ubuntu-22.04
 
@@ -186,7 +186,7 @@ jobs:
   publish_latest_debs:
 
     needs: build_production_kernel
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/truenas/linux-6.18' || github.ref == 'refs/heads/stable/26') }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/truenas/linux-6.18' || github.ref == 'refs/heads/stable/26' || github.ref == 'refs/heads/ci-test/publish-check') }}
 
     runs-on: ubuntu-22.04
 
@@ -271,8 +271,9 @@ jobs:
           # branch is added to this job's if-gate it must be mapped here
           # too, otherwise two branches could fight over one release.
           case "$GITHUB_REF_NAME" in
-            truenas/linux-6.18) train="master" ;;
-            stable/26)          train="26" ;;
+            truenas/linux-6.18)     train="master" ;;
+            stable/26)              train="26" ;;
+            ci-test/publish-check)  train="citest" ;;
             *)
               echo "ERROR: no train mapping for branch $GITHUB_REF_NAME"
               exit 1
