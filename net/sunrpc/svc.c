@@ -352,7 +352,7 @@ static int svc_pool_map_get_node(unsigned int pidx)
 		if (m->mode == SVC_POOL_PERNODE)
 			return m->pool_to[pidx];
 	}
-	return numa_mem_id();
+	return NUMA_NO_NODE;
 }
 /*
  * Set the given thread's cpus_allowed mask so that it
@@ -691,7 +691,10 @@ svc_prepare_thread(struct svc_serv *serv, struct svc_pool *pool, int node)
 	rqstp->rq_server = serv;
 	rqstp->rq_pool = pool;
 
-	rqstp->rq_scratch_folio = __folio_alloc_node(GFP_KERNEL, 0, node);
+	if (node == NUMA_NO_NODE)
+		rqstp->rq_scratch_folio = folio_alloc(GFP_KERNEL, 0);
+	else
+		rqstp->rq_scratch_folio = __folio_alloc_node(GFP_KERNEL, 0, node);
 	if (!rqstp->rq_scratch_folio)
 		goto out_enomem;
 
