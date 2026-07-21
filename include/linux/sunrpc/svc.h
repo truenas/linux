@@ -203,6 +203,8 @@ struct svc_rqst {
 	struct page *		*rq_respages;	/* points into rq_pages */
 	struct page *		*rq_next_page; /* next reply page to use */
 	struct page *		*rq_page_end;  /* one past the last page */
+	struct page		**rq_recycle;	/* parked reply pages for reuse */
+	unsigned int		rq_recycle_count;
 
 	struct folio_batch	rq_fbatch;
 	struct bio_vec		*rq_bvec;

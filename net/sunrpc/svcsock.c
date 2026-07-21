@@ -809,6 +809,7 @@ static const struct svc_xprt_ops svc_udp_ops = {
 	.xpo_has_wspace = svc_udp_has_wspace,
 	.xpo_accept = svc_udp_accept,
 	.xpo_kill_temp_xprt = svc_udp_kill_temp_xprt,
+	.xpo_reply_pages_pinned = true,
 };
 
 static struct svc_xprt_class svc_udp_class = {
@@ -1318,6 +1319,7 @@ static const struct svc_xprt_ops svc_tcp_ops = {
 	.xpo_accept = svc_tcp_accept,
 	.xpo_kill_temp_xprt = svc_tcp_kill_temp_xprt,
 	.xpo_handshake = svc_tcp_handshake,
+	.xpo_reply_pages_pinned = true,
 };
 
 static struct svc_xprt_class svc_tcp_class = {

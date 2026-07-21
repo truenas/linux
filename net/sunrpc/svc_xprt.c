@@ -10,6 +10,7 @@
 #include <linux/errno.h>
 #include <linux/freezer.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <net/sock.h>
 #include <linux/sunrpc/addr.h>
 #include <linux/sunrpc/stats.h>
@@ -650,12 +651,52 @@ static void svc_check_conn_limits(struct svc_serv *serv)
 	}
 }
 
+/*
+ * Reuse reply pages parked by svc_rqst_release_pages() in preference to
+ * allocating fresh ones.  A parked page whose refcount has fallen back to
+ * one has been fully transmitted and is svc's alone, so it can be handed
+ * straight back into an empty rq_pages[] slot without touching the buddy
+ * allocator -- the contended path this avoids.  Pages still in flight
+ * (refcount > one) stay parked at no extra memory cost (the skb pins them
+ * regardless), and any page that came to rest on a remote node is returned
+ * to the allocator so that a reused buffer is never remote.
+ */
+static void svc_reuse_reply_pages(struct svc_rqst *rqstp)
+{
+	unsigned long slot = 0;
+	unsigned int i = 0;
+
+	while (i < rqstp->rq_recycle_count) {
+		struct page *page = rqstp->rq_recycle[i];
+
+		if (folio_ref_count(page_folio(page)) != 1) {
+			i++;			/* still in flight; leave parked */
+			continue;
+		}
+		if (page_to_nid(page) == numa_mem_id()) {
+			while (slot < rqstp->rq_maxpages && rqstp->rq_pages[slot])
+				slot++;
+			if (slot < rqstp->rq_maxpages)
+				rqstp->rq_pages[slot++] = page;
+			else
+				put_page(page);	/* no free slot; return it */
+		} else {
+			put_page(page);		/* remote node; return it */
+		}
+		rqstp->rq_recycle[i] =
+			rqstp->rq_recycle[--rqstp->rq_recycle_count];
+	}
+}
+
 static bool svc_alloc_arg(struct svc_rqst *rqstp)
 {
 	struct xdr_buf *arg = &rqstp->rq_arg;
 	unsigned long pages, filled, ret;
 
 	pages = rqstp->rq_maxpages;
+
+	svc_reuse_reply_pages(rqstp);
+
 	for (filled = 0; filled < pages; filled = ret) {
 		ret = alloc_pages_bulk(GFP_KERNEL, pages, rqstp->rq_pages);
 		if (ret > filled)
@@ -719,6 +760,28 @@ static void svc_thread_wait_for_work(struct svc_rqst *rqstp)
 	struct svc_pool *pool = rqstp->rq_pool;
 
 	if (svc_thread_should_sleep(rqstp)) {
+		unsigned int i = 0;
+
+		/*
+		 * About to go idle with no work pending: release every parked
+		 * reply page that is free to release, so an idle thread
+		 * retains no memory the system could use.  Pages the network
+		 * still holds stay parked -- releasing them would save
+		 * nothing, since the socket pins them regardless, and would
+		 * only move their eventual free back into interrupt context.
+		 */
+		while (i < rqstp->rq_recycle_count) {
+			struct page *page = rqstp->rq_recycle[i];
+
+			if (folio_ref_count(page_folio(page)) != 1) {
+				i++;
+				continue;
+			}
+			put_page(page);
+			rqstp->rq_recycle[i] =
+				rqstp->rq_recycle[--rqstp->rq_recycle_count];
+		}
+
 		set_current_state(TASK_IDLE | TASK_FREEZABLE);
 		llist_add(&rqstp->rq_idle, &pool->sp_idle_threads);
 		if (likely(svc_thread_should_sleep(rqstp)))

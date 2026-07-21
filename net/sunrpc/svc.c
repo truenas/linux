@@ -36,6 +36,20 @@
 
 #define RPCDBG_FACILITY	RPCDBG_SVCDSP
 
+/*
+ * How many requests' worth of sent reply pages a thread may track for
+ * recycling.  The transport keeps reply pages referenced until the peer
+ * has acknowledged the data, typically for several round trips, while a
+ * busy thread turns its next request around in a fraction of that time;
+ * tracking only a single request's worth would overflow almost at once
+ * and fall back to the allocator for most pages.  A tracked in-flight
+ * page costs only its pointer slot -- the page itself is pinned by the
+ * socket regardless -- and every page whose refcount has returned to
+ * one is reused or released at each allocation, so this depth does not
+ * increase how much free memory a thread can withhold.
+ */
+#define SVC_RECYCLE_DEPTH	16
+
 static void svc_unregister(const struct svc_serv *serv, struct net *net);
 
 #define SVC_POOL_DEFAULT	SVC_POOL_GLOBAL
@@ -646,6 +660,23 @@ svc_init_buffer(struct svc_rqst *rqstp, const struct svc_serv *serv, int node)
 	if (!rqstp->rq_pages)
 		return false;
 
+	/*
+	 * Reply page recycling reuses sent pages in place of freeing and
+	 * reallocating them.  It must not run when the kernel is hardened to
+	 * zero pages on allocation or free, or to poison freed pages, because
+	 * a recycled page bypasses that zeroing or poisoning; leaving
+	 * rq_recycle NULL keeps the release and alloc paths byte-for-byte
+	 * identical to the stock behaviour there.  A NULL rq_recycle
+	 * (including on allocation failure) simply disables the optimisation
+	 * for this thread.
+	 */
+	if (!want_init_on_alloc(GFP_KERNEL) && !want_init_on_free() &&
+	    !page_poisoning_enabled_static())
+		rqstp->rq_recycle = kvmalloc_node(array3_size(SVC_RECYCLE_DEPTH,
+							      rqstp->rq_maxpages,
+							      sizeof(struct page *)),
+						  GFP_KERNEL, node);
+
 	return true;
 }
 
@@ -656,6 +687,10 @@ static void
 svc_release_buffer(struct svc_rqst *rqstp)
 {
 	unsigned long i;
+
+	while (rqstp->rq_recycle_count)
+		put_page(rqstp->rq_recycle[--rqstp->rq_recycle_count]);
+	kvfree(rqstp->rq_recycle);
 
 	for (i = 0; i < rqstp->rq_maxpages; i++)
 		if (rqstp->rq_pages[i])
@@ -932,12 +967,52 @@ EXPORT_SYMBOL_GPL(svc_rqst_replace_page);
 void svc_rqst_release_pages(struct svc_rqst *rqstp)
 {
 	int i, count = rqstp->rq_next_page - rqstp->rq_respages;
+	struct page **pages = rqstp->rq_respages;
+	unsigned int release = 0;
 
-	if (count) {
-		release_pages(rqstp->rq_respages, count);
-		for (i = 0; i < count; i++)
-			rqstp->rq_respages[i] = NULL;
+	if (!count)
+		return;
+
+	if (rqstp->rq_recycle &&
+	    rqstp->rq_xprt->xpt_ops->xpo_reply_pages_pinned) {
+		/*
+		 * Park each eligible reply page with svc's reference held
+		 * rather than freeing it, so the network stack's ACK-time put
+		 * drops the page to a refcount of one instead of colliding
+		 * with the next allocation on the buddy zone lock.  The reply
+		 * header page (rq_respages[0], index 0) is left out so that
+		 * recycled pages are only ever payload buffers, as are pages
+		 * that are not plain svc-owned order-0 memory -- borrowed page
+		 * cache, sparse-hole ZERO_PAGE, large folios, and LRU pages
+		 * (a borrowed page truncated while the reply was in flight
+		 * loses its mapping but remains on the LRU).  Ineligible
+		 * pages are compacted and freed in a single batched
+		 * release_pages().
+		 */
+		for (i = 0; i < count; i++) {
+			struct page *page = pages[i];
+			struct folio *folio = page_folio(page);
+
+			if (i != 0 &&
+			    rqstp->rq_recycle_count <
+				SVC_RECYCLE_DEPTH * rqstp->rq_maxpages &&
+			    !folio_test_large(folio) &&
+			    !folio->mapping &&
+			    !folio_test_lru(folio) &&
+			    !folio_test_reserved(folio)) {
+				rqstp->rq_recycle[rqstp->rq_recycle_count++] = page;
+				continue;
+			}
+			pages[release++] = page;
+		}
+		if (release)
+			release_pages(pages, release);
+	} else {
+		release_pages(pages, count);
 	}
+
+	for (i = 0; i < count; i++)
+		pages[i] = NULL;
 }
 
 /**

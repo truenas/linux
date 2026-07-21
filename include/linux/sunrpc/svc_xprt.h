@@ -28,6 +28,18 @@ struct svc_xprt_ops {
 	void		(*xpo_free)(struct svc_xprt *);
 	void		(*xpo_kill_temp_xprt)(struct svc_xprt *);
 	void		(*xpo_handshake)(struct svc_xprt *xprt);
+
+	/* True when this transport either holds a struct page reference on
+	 * a reply page for as long as it may touch that page (sockets
+	 * transmit with MSG_SPLICE_PAGES, which takes a get_page()
+	 * reference) or has copied the data out before sendmsg returns.
+	 * Reply page recycling relies on this: a page refcount of one then
+	 * means the network stack is done with the page and svc is its sole
+	 * owner.  Transports that send by DMA (RDMA) hold no such reference
+	 * and leave this false, which excludes them from recycling by
+	 * construction.
+	 */
+	bool		xpo_reply_pages_pinned;
 };
 
 struct svc_xprt_class {
