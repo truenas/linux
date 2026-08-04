@@ -204,6 +204,10 @@ struct svc_rqst {
 	struct page *		*rq_next_page; /* next reply page to use */
 	struct page *		*rq_page_end;  /* one past the last page */
 
+	struct page		**rq_reuse_pages; /* sent pages held for reuse */
+	unsigned long		rq_nreuse;	/* entries in rq_reuse_pages */
+	unsigned long		rq_reuse_cursor; /* where the last scan stopped */
+
 	struct folio_batch	rq_fbatch;
 	struct bio_vec		*rq_bvec;
 
@@ -259,6 +263,7 @@ enum {
 	RQ_DROPME,		/* drop current reply */
 	RQ_VICTIM,		/* Have agreed to shut down */
 	RQ_DATA,		/* request has data */
+	RQ_RES_REPLACED,	/* splice actor installed Reply pages */
 };
 
 #define SVC_NET(rqst) (rqst->rq_xprt ? rqst->rq_xprt->xpt_net : rqst->rq_bc_net)
