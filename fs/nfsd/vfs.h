@@ -8,6 +8,7 @@
 
 #include <linux/fs.h>
 #include <linux/posix_acl.h>
+#include <linux/splice.h>
 #include "nfsfh.h"
 #include "nfsd.h"
 
@@ -148,6 +149,21 @@ __be32		nfsd_iter_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				unsigned long *count, unsigned int base,
 				u32 *eof);
 bool		nfsd_read_splice_ok(struct svc_rqst *rqstp);
+
+/**
+ * nfsd_file_splice_read_ok - can a spliced READ avoid copying?
+ * @file: file to be read from
+ *
+ * copy_splice_read() is not zero-copy: it calls ->read_iter on
+ * freshly allocated pages, exactly as nfsd_iter_read() does on
+ * pages nfsd already holds. Filesystems that use it as their
+ * ->splice_read gain nothing from the splice path.
+ */
+static inline bool nfsd_file_splice_read_ok(struct file *file)
+{
+	return file->f_op->splice_read &&
+	       file->f_op->splice_read != copy_splice_read;
+}
 __be32		nfsd_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				loff_t offset, unsigned long *count,
 				u32 *eof);
