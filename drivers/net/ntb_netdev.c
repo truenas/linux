@@ -49,6 +49,7 @@
  */
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
+#include <linux/hrtimer.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/ntb.h>
@@ -62,7 +63,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Intel Corporation");
 
 /* Time in usecs for tx resource reaper */
-static unsigned int tx_time = 1;
+static unsigned int tx_time = 250;
 
 /* Number of descriptors to free before resuming tx */
 static unsigned int tx_start = 10;
@@ -70,11 +71,28 @@ static unsigned int tx_start = 10;
 /* Number of descriptors still available before stop upper layer tx */
 static unsigned int tx_stop = 5;
 
+/* Copy received frames of this many bytes or less into a right-sized skb
+ * and recycle the full-MTU ring buffer.  Posted ring buffers are always
+ * ndev->mtu + ETH_HLEN bytes, so without this a 54-byte pure TCP ACK is
+ * delivered with the truesize of a full-MTU allocation (~128KB at the
+ * default 64KB MTU), overcharging socket receive-buffer accounting by
+ * three orders of magnitude and collapsing TCP receive windows to zero.
+ *
+ * Default is SKB_MAX_ORDER(NET_SKB_PAD, 0) - NET_IP_ALIGN (3646 on x86-64),
+ * the largest frame whose right-sized copy still fits one order-0 page after
+ * netdev_alloc_skb_ip_align() reserves its NET_IP_ALIGN headroom.
+ */
+static unsigned int rx_copybreak = 3646;
+module_param(rx_copybreak, uint, 0644);
+MODULE_PARM_DESC(rx_copybreak, "Copy RX frames of this size or less into right-sized skbs");
+
 struct ntb_netdev {
 	struct pci_dev *pdev;
 	struct net_device *ndev;
 	struct ntb_transport_qp *qp;
-	struct timer_list tx_timer;
+	struct hrtimer tx_timer;
+	unsigned int tx_stop_thresh;
+	unsigned int tx_start_thresh;
 };
 
 #define	NTB_TX_TIMEOUT_MS	1000
@@ -109,11 +127,25 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
 
 	netdev_dbg(ndev, "%s: %d byte payload received\n", __func__, len);
 
-	if (len < 0) {
+	if (len < ETH_HLEN) {
 		ndev->stats.rx_errors++;
 		ndev->stats.rx_length_errors++;
 		nskb = skb;
 		goto enqueue_again;
+	}
+
+	if (len <= rx_copybreak) {
+		struct sk_buff *cskb;
+
+		cskb = netdev_alloc_skb_ip_align(ndev, len);
+		if (cskb) {
+			skb_put_data(cskb, skb->data, len);
+			/* Recycle the ring buffer, deliver the copy */
+			nskb = skb;
+			skb = cskb;
+			goto deliver;
+		}
+		/* Fall back to handing off the ring buffer itself */
 	}
 
 	nskb = netdev_alloc_skb(ndev, ndev->mtu + ETH_HLEN);
@@ -125,6 +157,7 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
 	}
 
 	skb_put(skb, len);
+deliver:
 	skb->protocol = eth_type_trans(skb, ndev);
 	skb->ip_summed = CHECKSUM_NONE;
 
@@ -137,8 +170,26 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
 	}
 
 enqueue_again:
+	/* A recycled buffer may predate an MTU increase that change_mtu()
+	 * could not drain because this handler was holding it. It is then too
+	 * small for the current MTU and, once we post its true capacity below,
+	 * would reject every full-size frame for its ring slot until it drains.
+	 * Swap in a right-sized buffer; on allocation failure keep the smaller
+	 * one, which stays safe and is replaced on a later pass. Steady state
+	 * takes neither branch, so the hot path adds no allocation.
+	 */
+	if (skb_tailroom(nskb) < ndev->mtu + ETH_HLEN) {
+		struct sk_buff *rskb;
+
+		rskb = netdev_alloc_skb(ndev, ndev->mtu + ETH_HLEN);
+		if (rskb) {
+			dev_kfree_skb_any(nskb);
+			nskb = rskb;
+		}
+	}
+
 	rc = ntb_transport_rx_enqueue(qp, nskb, nskb->data,
-	    ndev->mtu + ETH_HLEN);
+	    skb_tailroom(nskb));
 	if (rc) {
 		dev_kfree_skb_any(nskb);
 		ndev->stats.rx_errors++;
@@ -158,7 +209,9 @@ static int __ntb_netdev_maybe_stop_tx(struct net_device *netdev,
 	smp_mb();
 
 	if (likely(ntb_transport_tx_free_entry(qp) < size)) {
-		mod_timer(&dev->tx_timer, jiffies + usecs_to_jiffies(tx_time));
+		hrtimer_start(&dev->tx_timer,
+			      ns_to_ktime((u64)tx_time * NSEC_PER_USEC),
+			      HRTIMER_MODE_REL);
 		return -EBUSY;
 	}
 
@@ -197,7 +250,7 @@ static void ntb_netdev_tx_handler(struct ntb_transport_qp *qp, void *qp_data,
 
 	dev_kfree_skb_any(skb);
 
-	if (ntb_transport_tx_free_entry(dev->qp) >= tx_start) {
+	if (ntb_transport_tx_free_entry(dev->qp) >= dev->tx_start_thresh) {
 		/* Make sure anybody stopping the queue after this sees the new
 		 * value of ntb_transport_tx_free_entry()
 		 */
@@ -213,38 +266,44 @@ static netdev_tx_t ntb_netdev_start_xmit(struct sk_buff *skb,
 	struct ntb_netdev *dev = netdev_priv(ndev);
 	int rc;
 
-	ntb_netdev_maybe_stop_tx(ndev, dev->qp, tx_stop);
+	ntb_netdev_maybe_stop_tx(ndev, dev->qp, dev->tx_stop_thresh);
 
 	rc = ntb_transport_tx_enqueue(dev->qp, skb, skb->data, skb->len);
 	if (rc)
 		goto err;
 
 	/* check for next submit */
-	ntb_netdev_maybe_stop_tx(ndev, dev->qp, tx_stop);
+	ntb_netdev_maybe_stop_tx(ndev, dev->qp, dev->tx_stop_thresh);
 
 	return NETDEV_TX_OK;
 
 err:
+	if (rc == -EBUSY)
+		return NETDEV_TX_BUSY;
 	ndev->stats.tx_dropped++;
 	ndev->stats.tx_errors++;
-	return NETDEV_TX_BUSY;
+	dev_kfree_skb_any(skb);
+	return NETDEV_TX_OK;
 }
 
-static void ntb_netdev_tx_timer(struct timer_list *t)
+static enum hrtimer_restart ntb_netdev_tx_timer(struct hrtimer *hrtimer)
 {
-	struct ntb_netdev *dev = timer_container_of(dev, t, tx_timer);
+	struct ntb_netdev *dev = container_of(hrtimer, struct ntb_netdev, tx_timer);
 	struct net_device *ndev = dev->ndev;
 
-	if (ntb_transport_tx_free_entry(dev->qp) < tx_stop) {
-		mod_timer(&dev->tx_timer, jiffies + usecs_to_jiffies(tx_time));
-	} else {
-		/* Make sure anybody stopping the queue after this sees the new
-		 * value of ntb_transport_tx_free_entry()
-		 */
-		smp_mb();
-		if (netif_queue_stopped(ndev))
-			netif_wake_queue(ndev);
+	if (ntb_transport_tx_free_entry(dev->qp) < dev->tx_stop_thresh) {
+		hrtimer_forward_now(hrtimer,
+				    ns_to_ktime((u64)tx_time * NSEC_PER_USEC));
+		return HRTIMER_RESTART;
 	}
+
+	/* Make sure anybody stopping the queue after this sees the new
+	 * value of ntb_transport_tx_free_entry()
+	 */
+	smp_mb();
+	if (netif_queue_stopped(ndev))
+		netif_wake_queue(ndev);
+	return HRTIMER_NORESTART;
 }
 
 static int ntb_netdev_open(struct net_device *ndev)
@@ -269,8 +328,6 @@ static int ntb_netdev_open(struct net_device *ndev)
 		}
 	}
 
-	timer_setup(&dev->tx_timer, ntb_netdev_tx_timer, 0);
-
 	netif_carrier_off(ndev);
 	ntb_transport_link_up(dev->qp);
 	netif_start_queue(ndev);
@@ -289,12 +346,11 @@ static int ntb_netdev_close(struct net_device *ndev)
 	struct sk_buff *skb;
 	int len;
 
+	hrtimer_cancel(&dev->tx_timer);
 	ntb_transport_link_down(dev->qp);
 
 	while ((skb = ntb_transport_rx_remove(dev->qp, &len)))
 		dev_kfree_skb(skb);
-
-	timer_delete_sync(&dev->tx_timer);
 
 	return 0;
 }
@@ -314,6 +370,8 @@ static int ntb_netdev_change_mtu(struct net_device *ndev, int new_mtu)
 	}
 
 	/* Bring down the link and dispose of posted rx entries */
+	netif_stop_queue(ndev);
+	hrtimer_cancel(&dev->tx_timer);
 	ntb_transport_link_down(dev->qp);
 
 	if (ndev->mtu < new_mtu) {
@@ -341,6 +399,7 @@ static int ntb_netdev_change_mtu(struct net_device *ndev, int new_mtu)
 	WRITE_ONCE(ndev->mtu, new_mtu);
 
 	ntb_transport_link_up(dev->qp);
+	netif_wake_queue(ndev);
 
 	return 0;
 
@@ -423,6 +482,8 @@ static int ntb_netdev_probe(struct device *client_dev)
 	dev = netdev_priv(ndev);
 	dev->ndev = ndev;
 	dev->pdev = pdev;
+	hrtimer_setup(&dev->tx_timer, ntb_netdev_tx_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 	ndev->features = NETIF_F_HIGHDMA;
 
 	ndev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
@@ -444,6 +505,20 @@ static int ntb_netdev_probe(struct device *client_dev)
 	if (!dev->qp) {
 		rc = -EIO;
 		goto err;
+	}
+
+	/*
+	 * At creation all ring slots are free, so tx_free_entry() returns
+	 * the usable ring depth.  Scale down thresholds for small rings to
+	 * avoid deadlock (tx_start > ring_size means the queue never wakes).
+	 */
+	{
+		unsigned int ring_size = ntb_transport_tx_free_entry(dev->qp);
+
+		dev->tx_start_thresh = min(tx_start, max(1U, ring_size / 2));
+		dev->tx_stop_thresh = max(1U, min(tx_stop, dev->tx_start_thresh - 1));
+		netdev_dbg(ndev, "tx ring depth %u: stop<%u wake>=%u\n",
+			   ring_size, dev->tx_stop_thresh, dev->tx_start_thresh);
 	}
 
 	ndev->mtu = ntb_transport_max_size(dev->qp) - ETH_HLEN;
