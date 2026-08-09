@@ -148,6 +148,32 @@ __be32		nfsd_iter_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				unsigned long *count, unsigned int base,
 				u32 *eof);
 bool		nfsd_read_splice_ok(struct svc_rqst *rqstp);
+
+/**
+ * nfsd_file_splice_read_ok - check whether splice avoids a data copy
+ * @file: file to be read from
+ *
+ * copy_splice_read() reads via ->read_iter into freshly allocated
+ * pages, exactly as nfsd_iter_read() does into pages nfsd already
+ * holds. Filesystems that implement ->splice_read with it gain
+ * nothing from the splice path, and neither do DAX files, for
+ * which the VFS substitutes copy_splice_read() no matter what
+ * the filesystem registered. The VFS substitutes it for O_DIRECT
+ * files as well, but nfsd never opens files O_DIRECT. Fallbacks
+ * inside a filesystem's own ->splice_read method cannot be
+ * detected here.
+ *
+ * Return values:
+ *   %true: splicing from @file avoids copying
+ *   %false: splicing would copy; use nfsd_iter_read()
+ */
+static inline bool nfsd_file_splice_read_ok(struct file *file)
+{
+	return file->f_op->splice_read &&
+	       file->f_op->splice_read != copy_splice_read &&
+	       !IS_DAX(file_inode(file));
+}
+
 __be32		nfsd_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				loff_t offset, unsigned long *count,
 				u32 *eof);
