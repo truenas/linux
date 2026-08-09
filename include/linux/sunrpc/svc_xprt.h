@@ -8,6 +8,7 @@
 #ifndef SUNRPC_SVC_XPRT_H
 #define SUNRPC_SVC_XPRT_H
 
+#include <linux/bits.h>
 #include <linux/sunrpc/svc.h>
 
 struct module;
@@ -37,7 +38,16 @@ struct svc_xprt_class {
 	struct list_head	xcl_list;
 	u32			xcl_max_payload;
 	int			xcl_ident;
+	unsigned long		xcl_flags;
 };
+
+/*
+ * Every consumer of a sent Reply page in this transport holds a
+ * page reference for as long as it uses the page, so a Reply page
+ * whose folio_ref_count() has returned to one is no longer in use
+ * and may be reused (see svc_rqst_release_pages()).
+ */
+#define XCL_FL_REPLY_PAGE_REUSE	BIT(0)
 
 /*
  * This is embedded in an object that wants a callback before deleting

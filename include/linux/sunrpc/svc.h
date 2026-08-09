@@ -204,6 +204,19 @@ struct svc_rqst {
 	struct page *		*rq_next_page; /* next reply page to use */
 	struct page *		*rq_page_end;  /* one past the last page */
 
+	/*
+	 * On a transport that holds a reference on every sent Reply
+	 * page (XCL_FL_REPLY_PAGE_REUSE), Reply pages this thread
+	 * allocated and sent are moved to rq_reuse_pages instead of
+	 * being released; once the transport has dropped its
+	 * references, they refill released slots in place of fresh
+	 * page allocations. Pages installed by nfsd_splice_actor()
+	 * are never moved there.
+	 */
+	struct page		**rq_reuse_pages; /* sent pages held for reuse */
+	unsigned long		rq_nreuse;	/* entries in rq_reuse_pages */
+	unsigned long		rq_reuse_cursor; /* where the last scan stopped */
+
 	struct folio_batch	rq_fbatch;
 	struct bio_vec		*rq_bvec;
 
@@ -259,6 +272,7 @@ enum {
 	RQ_DROPME,		/* drop current reply */
 	RQ_VICTIM,		/* Have agreed to shut down */
 	RQ_DATA,		/* request has data */
+	RQ_RES_REPLACED,	/* splice actor installed Reply pages */
 };
 
 #define SVC_NET(rqst) (rqst->rq_xprt ? rqst->rq_xprt->xpt_net : rqst->rq_bc_net)
@@ -440,6 +454,9 @@ struct svc_serv *svc_create(struct svc_program *, unsigned int,
 bool		   svc_rqst_replace_page(struct svc_rqst *rqstp,
 					 struct page *page);
 void		   svc_rqst_release_pages(struct svc_rqst *rqstp);
+unsigned long	   svc_rqst_refill_pages(struct svc_rqst *rqstp,
+					 struct page **first,
+					 struct page **last);
 void		   svc_exit_thread(struct svc_rqst *);
 struct svc_serv *  svc_create_pooled(struct svc_program *prog,
 				     unsigned int nprog,
