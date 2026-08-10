@@ -537,6 +537,19 @@ static int unix_gid_parse(struct cache_detail *cd,
 	if (ugp) {
 		struct cache_head *ch;
 		ug.h.flags = 0;
+		/*
+		 * A reply with no groups can only mean the lookup failed
+		 * in userspace: on success rpc.mountd answers with the
+		 * result of getgrouplist(3), which always contains at
+		 * least the user's primary group.  Record a negative
+		 * entry so svcauth_unix_set_client() keeps the groups
+		 * the RPC credential already carries instead of
+		 * replacing them with an empty list, which would strip
+		 * the sender's supplementary groups for the lifetime of
+		 * the entry.
+		 */
+		if (gids == 0)
+			set_bit(CACHE_NEGATIVE, &ug.h.flags);
 		ug.h.expiry_time = expiry;
 		ch = sunrpc_cache_update(cd,
 					 &ug.h, &ugp->h,
