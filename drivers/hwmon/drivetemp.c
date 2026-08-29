@@ -337,11 +337,12 @@ static int drivetemp_retrieve_temp_log(struct drivetemp_data *st,
 {
 	int err;
 	u8 scsi_cmd[MAX_COMMAND_SIZE];
-	char buf[TEMP_LOG_PAGE_LEN];
+	u8 *buf = st->smartdata;
 	int i = TEMP_LOG_HEADER_LEN;
 	u16 page_len;
 
 	memset(scsi_cmd, 0, sizeof(scsi_cmd));
+	memset(buf, 0, TEMP_LOG_PAGE_LEN);
 	scsi_cmd[0] = LOG_SENSE;
 	scsi_cmd[2] = 0x40 | TEMP_LOG_PAGE;    /* Page control (PC)==1 */
 	put_unaligned_be16(TEMP_LOG_PAGE_LEN, &scsi_cmd[7]);
@@ -358,10 +359,12 @@ static int drivetemp_retrieve_temp_log(struct drivetemp_data *st,
 		u16 param_code = get_unaligned_be16(&buf[i]);
 		if (i + param_len > page_len)
 			break;
-		if (param_code == 0x0)
-			*temp = (u8) buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
-		if (reftemp && param_code == 0x1)
-			*reftemp = (u8) buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
+		if (param_len > TEMP_LOG_PARAM_TEMP_OFFSET) {
+			if (param_code == 0x0)
+				*temp = buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
+			if (reftemp && param_code == 0x1)
+				*reftemp = buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
+		}
 		i += param_len;
 	}
 
