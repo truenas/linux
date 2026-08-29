@@ -145,17 +145,32 @@ static LIST_HEAD(drivetemp_devlist);
 #define  SMART_READ_LOG			0xd5
 #define  SMART_WRITE_LOG		0xd6
 #define  TEMP_LOG_PAGE			0xd
+#define  TEMP_LOG_SUBPAGE		0x0
+#define  ENV_LIMITS_SUBPAGE		0x2
 #define  TEMP_LOG_PAGE_LEN		0x10
+#define  ENV_LIMITS_PAGE_LEN		0x80
 #define  TEMP_LOG_INVALID		0xFF
 #define  TEMP_LOG_HEADER_LEN		4
 #define  TEMP_LOG_PARAM_HEADER_LEN	4
 #define  TEMP_LOG_LEN_OFFSET		2
 #define  TEMP_LOG_PARAM_TEMP_OFFSET	5
+#define  LOG_SENSE_PC_CUMULATIVE	0x40
+#define  LOG_PAGE_CODE_MASK		0x3f
+#define  LOG_PAGE_SPF			0x40
+#define  ENV_LIMITS_PARAM_MIN_LEN	12
+#define  ENV_LIMITS_HIGH_CRIT_OFFSET	4
+#define  ENV_LIMITS_HIGH_OP_OFFSET	8
 
 #define INVALID_TEMP		0x80
 
 #define temp_is_valid(temp)	((temp) != INVALID_TEMP)
 #define temp_from_sct(temp)	(((s8)(temp)) * 1000)
+/*
+ * A drive which implements the environmental limits subpage but not an
+ * individual limit reports that limit as 0. 0xFF is not a plausible high
+ * limit either, and is what a drive which reports nothing at all returns.
+ */
+#define env_limit_is_valid(temp)	((temp) != 0 && (temp) != TEMP_LOG_INVALID)
 
 static inline bool ata_id_smart_supported(u16 *id)
 {
@@ -332,29 +347,75 @@ static bool drivetemp_sct_avoid(struct drivetemp_data *st)
 	return false;
 }
 
+/*
+ * Issue LOG SENSE for the requested subpage of the temperature log page
+ * (0x0d) into st->smartdata and report the length of the returned page in
+ * *page_len. Returns 0 on success or a negative error code.
+ *
+ * Drives which do not implement the requested subpage terminate the command
+ * with ILLEGAL REQUEST; that is reported as -EOPNOTSUPP so that the caller
+ * can fall back to a subpage the drive does implement. The additional sense
+ * code is deliberately not looked at: 0x24 (invalid field in CDB) is the
+ * expected response, but firmware varies.
+ */
+static int drivetemp_log_sense(struct drivetemp_data *st, u8 subpage,
+    u16 alloc_len, u16 *page_len)
+{
+	int err;
+	u8 scsi_cmd[MAX_COMMAND_SIZE];
+	struct scsi_sense_hdr sshdr;
+	const struct scsi_exec_args exec_args = {
+		.sshdr = &sshdr,
+	};
+	u8 *buf = st->smartdata;
+
+	if (alloc_len < TEMP_LOG_HEADER_LEN ||
+	    alloc_len > sizeof(st->smartdata))
+		return (-EINVAL);
+
+	memset(scsi_cmd, 0, sizeof(scsi_cmd));
+	memset(buf, 0, alloc_len);
+	scsi_cmd[0] = LOG_SENSE;
+	/* Page control (PC)==1, as sg_logs also defaults to */
+	scsi_cmd[2] = LOG_SENSE_PC_CUMULATIVE | TEMP_LOG_PAGE;
+	scsi_cmd[3] = subpage;
+	put_unaligned_be16(alloc_len, &scsi_cmd[7]);
+	err = scsi_execute_cmd(st->sdev, scsi_cmd, REQ_OP_DRV_IN, buf,
+			alloc_len, 10 * HZ, 5, &exec_args);
+	if (err > 0) {
+		if (scsi_sense_valid(&sshdr) &&
+		    sshdr.sense_key == ILLEGAL_REQUEST)
+			err = -EOPNOTSUPP;
+		else
+			err = -EIO;
+	}
+	if (err)
+		return (err);
+
+	*page_len = min(get_unaligned_be16(&buf[TEMP_LOG_LEN_OFFSET]),
+		(u16) (alloc_len - TEMP_LOG_HEADER_LEN)) + TEMP_LOG_HEADER_LEN;
+
+	return (0);
+}
+
 static int drivetemp_retrieve_temp_log(struct drivetemp_data *st,
     u8 *temp, u8 *reftemp)
 {
 	int err;
-	u8 scsi_cmd[MAX_COMMAND_SIZE];
 	u8 *buf = st->smartdata;
 	int i = TEMP_LOG_HEADER_LEN;
 	u16 page_len;
 
-	memset(scsi_cmd, 0, sizeof(scsi_cmd));
-	memset(buf, 0, TEMP_LOG_PAGE_LEN);
-	scsi_cmd[0] = LOG_SENSE;
-	scsi_cmd[2] = 0x40 | TEMP_LOG_PAGE;    /* Page control (PC)==1 */
-	put_unaligned_be16(TEMP_LOG_PAGE_LEN, &scsi_cmd[7]);
-	err = scsi_execute_cmd(st->sdev, scsi_cmd, REQ_OP_DRV_IN, buf,
-			TEMP_LOG_PAGE_LEN, 10 * HZ, 5, NULL);
-	if (err > 0)
-		err = -EIO;
-	if (err)
-		return (err);
-
-	page_len = min(get_unaligned_be16(&buf[TEMP_LOG_LEN_OFFSET]),
-		TEMP_LOG_PAGE_LEN - TEMP_LOG_HEADER_LEN) + TEMP_LOG_HEADER_LEN;
+	err = drivetemp_log_sense(st, TEMP_LOG_SUBPAGE, TEMP_LOG_PAGE_LEN,
+			&page_len);
+	if (err) {
+		/*
+		 * Only the environmental limits probe distinguishes an
+		 * unimplemented subpage; every other caller of this
+		 * function is a plain temperature read.
+		 */
+		return (err == -EOPNOTSUPP ? -EIO : err);
+	}
 
 	while (i + TEMP_LOG_PARAM_HEADER_LEN <= page_len) {
 		u8 param_len = (u8) buf[i + 3] + TEMP_LOG_PARAM_HEADER_LEN;
@@ -371,6 +432,72 @@ static int drivetemp_retrieve_temp_log(struct drivetemp_data *st,
 	}
 
 	return (0);
+}
+
+/*
+ * Read the high critical and the high operating temperature limit trigger
+ * of the first temperature sensor from the environmental limits subpage
+ * (log page 0x0d, subpage 0x02) added in SPC-5.
+ */
+static int drivetemp_retrieve_env_limits(struct drivetemp_data *st,
+    u8 *crit, u8 *opmax)
+{
+	int err;
+	u8 *buf = st->smartdata;
+	int i = TEMP_LOG_HEADER_LEN;
+	u16 page_len;
+
+	err = drivetemp_log_sense(st, ENV_LIMITS_SUBPAGE, ENV_LIMITS_PAGE_LEN,
+			&page_len);
+	if (err)
+		return (err);
+
+	/*
+	 * Drives which ignore the subpage code answer with subpage 0x00
+	 * rather than failing the command. The subpage format (SPF) bit,
+	 * the page code and the subpage code say what we actually got.
+	 */
+	if (!(buf[0] & LOG_PAGE_SPF) ||
+	    (buf[0] & LOG_PAGE_CODE_MASK) != TEMP_LOG_PAGE ||
+	    buf[1] != ENV_LIMITS_SUBPAGE)
+		return (-EOPNOTSUPP);
+
+	while (i + TEMP_LOG_PARAM_HEADER_LEN <= page_len) {
+		u8 param_len = (u8) buf[i + 3] + TEMP_LOG_PARAM_HEADER_LEN;
+		u16 param_code = get_unaligned_be16(&buf[i]);
+		if (i + param_len > page_len)
+			break;
+		/*
+		 * Parameter 0x0000 describes the sensor whose current
+		 * temperature parameter 0x0000 of subpage 0x00 reports.
+		 * Parameters 0x0100-0x01ff are humidity limits. A parameter
+		 * shorter than 12 bytes does not reach the high operating
+		 * limit trigger at offset 8.
+		 */
+		if (param_code == 0x0) {
+			if (param_len < ENV_LIMITS_PARAM_MIN_LEN)
+				return (-EOPNOTSUPP);
+			*crit = buf[i + ENV_LIMITS_HIGH_CRIT_OFFSET];
+			*opmax = buf[i + ENV_LIMITS_HIGH_OP_OFFSET];
+			return (0);
+		}
+		i += param_len;
+	}
+
+	return (-EOPNOTSUPP);
+}
+
+/*
+ * The two limits are only usable if the drive reports both of them and the
+ * critical limit is above the operating limit, as the hwmon ABI requires.
+ */
+static bool drivetemp_env_limits_usable(u8 crit, u8 opmax)
+{
+	if (!env_limit_is_valid(crit) || !env_limit_is_valid(opmax))
+		return false;
+	if (temp_from_sct(opmax) <= 0)
+		return false;
+	return temp_from_sct(crit) > temp_from_sct(opmax);
 }
 
 static int drivetemp_get_scsitemp(struct drivetemp_data *st, u32 attr,
@@ -393,20 +520,36 @@ static int drivetemp_identify_scsi(struct drivetemp_data *st)
 {
 	int err;
 	u8 temp = TEMP_LOG_INVALID, reftemp = TEMP_LOG_INVALID;
+	u8 crit = 0, opmax = 0;
 
 	if ((err = drivetemp_retrieve_temp_log(st, &temp,
 	    &reftemp)) == 0) {
 		if (temp != TEMP_LOG_INVALID) {
+			bool have_limits = false;
+
 			st->get_temp = drivetemp_get_scsitemp;
-			if (reftemp != TEMP_LOG_INVALID) {
-				/*
-				 * The reference temperature is the highest
-				 * temperature the drive can operate at
-				 * continuously, and is defined with ETC = 0,
-				 * i.e. no threshold comparison is made
-				 * against it. That is a temp_max, not a
-				 * temp_crit.
-				 */
+			/*
+			 * Prefer the environmental limits subpage, which
+			 * reports a real critical limit as well as the
+			 * high operating limit.
+			 */
+			if (drivetemp_retrieve_env_limits(st, &crit,
+			    &opmax) == 0 &&
+			    drivetemp_env_limits_usable(crit, opmax)) {
+				have_limits = true;
+				st->have_temp_max = true;
+				st->temp_max = temp_from_sct(opmax);
+				st->have_temp_crit = true;
+				st->temp_crit = temp_from_sct(crit);
+			}
+			/*
+			 * Otherwise fall back to the reference temperature,
+			 * the highest temperature the drive can operate at
+			 * continuously. It is defined with ETC = 0, i.e. no
+			 * threshold comparison is made against it, so it is
+			 * a temp_max, not a temp_crit.
+			 */
+			if (!have_limits && reftemp != TEMP_LOG_INVALID) {
 				st->have_temp_max = true;
 				st->temp_max = reftemp * 1000;
 			}
