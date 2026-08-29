@@ -348,6 +348,8 @@ static int drivetemp_retrieve_temp_log(struct drivetemp_data *st,
 	put_unaligned_be16(TEMP_LOG_PAGE_LEN, &scsi_cmd[7]);
 	err = scsi_execute_cmd(st->sdev, scsi_cmd, REQ_OP_DRV_IN, buf,
 			TEMP_LOG_PAGE_LEN, 10 * HZ, 5, NULL);
+	if (err > 0)
+		err = -EIO;
 	if (err)
 		return (err);
 
