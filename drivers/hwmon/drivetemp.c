@@ -399,8 +399,16 @@ static int drivetemp_identify_scsi(struct drivetemp_data *st)
 		if (temp != TEMP_LOG_INVALID) {
 			st->get_temp = drivetemp_get_scsitemp;
 			if (reftemp != TEMP_LOG_INVALID) {
-				st->have_temp_crit = true;
-				st->temp_crit = reftemp * 1000;
+				/*
+				 * The reference temperature is the highest
+				 * temperature the drive can operate at
+				 * continuously, and is defined with ETC = 0,
+				 * i.e. no threshold comparison is made
+				 * against it. That is a temp_max, not a
+				 * temp_crit.
+				 */
+				st->have_temp_max = true;
+				st->temp_max = reftemp * 1000;
 			}
 		} else {
 			err = -EIO;
