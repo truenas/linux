@@ -300,6 +300,15 @@ void target_dev_ua_allocate(struct se_device *dev, u8 asc, u8 ascq)
 	spin_unlock(&dev->se_port_lock);
 }
 
+#ifdef CONFIG_TRUENAS
+/*
+ * Exported so backend modules (iblock, fileio -- separate loadable modules)
+ * can raise CAPACITY DATA HAS CHANGED on all attached I_T nexuses when a
+ * backing store is resized; see the "rescan=1" configfs control token.
+ */
+EXPORT_SYMBOL(target_dev_ua_allocate);
+#endif /* CONFIG_TRUENAS */
+
 static void
 target_luns_data_has_changed(struct se_node_acl *nacl, struct se_dev_entry *new,
 			     bool skip_new)

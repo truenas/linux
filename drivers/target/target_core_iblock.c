@@ -595,7 +595,11 @@ fail:
 }
 
 enum {
-	Opt_udev_path, Opt_readonly, Opt_force, Opt_exclusive, Opt_err,
+	Opt_udev_path, Opt_readonly, Opt_force, Opt_exclusive,
+#ifdef CONFIG_TRUENAS
+	Opt_rescan,
+#endif
+	Opt_err,
 };
 
 static match_table_t tokens = {
@@ -603,6 +607,9 @@ static match_table_t tokens = {
 	{Opt_readonly, "readonly=%d"},
 	{Opt_force, "force=%d"},
 	{Opt_exclusive, "exclusive=%d"},
+#ifdef CONFIG_TRUENAS
+	{Opt_rescan, "rescan=%d"},
+#endif
 	{Opt_err, NULL}
 };
 
@@ -677,6 +684,29 @@ static ssize_t iblock_set_configfs_dev_params(struct se_device *dev,
 			break;
 		case Opt_force:
 			break;
+#ifdef CONFIG_TRUENAS
+		case Opt_rescan: {
+			int arg;
+
+			ret = match_int(args, &arg);
+			if (ret)
+				goto out;
+			if (arg != 1) {
+				pr_err("bogus rescan=%d value\n", arg);
+				ret = -EINVAL;
+				goto out;
+			}
+			/*
+			 * iblock_get_blocks() always reads the backing
+			 * bdev's current size live, so there is nothing to
+			 * refresh here -- just tell every attached I_T nexus
+			 * to re-check capacity on its next command.
+			 */
+			target_dev_ua_allocate(dev, 0x2A,
+					       ASCQ_2AH_CAPACITY_DATA_HAS_CHANGED);
+			break;
+		}
+#endif /* CONFIG_TRUENAS */
 		default:
 			break;
 		}

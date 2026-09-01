@@ -81,6 +81,12 @@ struct exec_cmd_ops {
 
 int	transport_backend_register(const struct target_backend_ops *);
 void	target_backend_unregister(const struct target_backend_ops *);
+#ifdef CONFIG_TRUENAS
+/* Establish a UA condition (asc/ascq) on every I_T nexus attached to dev. */
+void	target_dev_ua_allocate(struct se_device *, u8, u8);
+/* SPC Table D.1; mirrors drivers/target/target_core_ua.h's ASCQ_2AH_* table. */
+#define ASCQ_2AH_CAPACITY_DATA_HAS_CHANGED			0x09
+#endif /* CONFIG_TRUENAS */
 
 void	target_complete_cmd(struct se_cmd *, u8);
 void	target_set_cmd_data_length(struct se_cmd *, int);

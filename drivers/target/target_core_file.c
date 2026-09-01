@@ -714,7 +714,11 @@ fd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 
 enum {
 	Opt_fd_dev_name, Opt_fd_dev_size, Opt_fd_buffered_io,
-	Opt_fd_async_io, Opt_err
+	Opt_fd_async_io,
+#ifdef CONFIG_TRUENAS
+	Opt_fd_rescan,
+#endif
+	Opt_err
 };
 
 static match_table_t tokens = {
@@ -722,6 +726,9 @@ static match_table_t tokens = {
 	{Opt_fd_dev_size, "fd_dev_size=%s"},
 	{Opt_fd_buffered_io, "fd_buffered_io=%d"},
 	{Opt_fd_async_io, "fd_async_io=%d"},
+#ifdef CONFIG_TRUENAS
+	{Opt_fd_rescan, "rescan=%d"},
+#endif
 	{Opt_err, NULL}
 };
 
@@ -802,6 +809,27 @@ static ssize_t fd_set_configfs_dev_params(struct se_device *dev,
 
 			fd_dev->fbd_flags |= FDBD_HAS_ASYNC_IO;
 			break;
+#ifdef CONFIG_TRUENAS
+		case Opt_fd_rescan:
+			ret = match_int(args, &arg);
+			if (ret)
+				goto out;
+			if (arg != 1) {
+				pr_err("bogus rescan=%d value\n", arg);
+				ret = -EINVAL;
+				goto out;
+			}
+			/*
+			 * fd_get_blocks() always reads the current inode
+			 * size live for a block-backed file, so there is
+			 * nothing to refresh here -- just tell every
+			 * attached I_T nexus to re-check capacity on its
+			 * next command.
+			 */
+			target_dev_ua_allocate(dev, 0x2A,
+					       ASCQ_2AH_CAPACITY_DATA_HAS_CHANGED);
+			break;
+#endif /* CONFIG_TRUENAS */
 		default:
 			break;
 		}
