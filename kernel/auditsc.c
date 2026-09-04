@@ -2259,6 +2259,24 @@ static void audit_copy_inode(struct audit_names *name,
 	audit_copy_fcaps(name, dentry);
 }
 
+/*
+ * Find the audit_names record this context holds for @name.  io_uring can make
+ * a filename outlive the context its record was created in, so the record is
+ * looked up by identity among the records this context actually owns rather
+ * than followed through the filename's ->aname back-pointer, which nothing
+ * invalidates.
+ */
+static struct audit_names *audit_name_lookup(struct audit_context *ctx,
+					     const struct filename *name)
+{
+	struct audit_names *n;
+
+	list_for_each_entry_reverse(n, &ctx->names_list, list)
+		if (n->name == name)
+			return n;
+	return NULL;
+}
+
 /**
  * __audit_inode - store the inode and device from a lookup
  * @name: name being audited
@@ -2299,10 +2317,10 @@ void __audit_inode(struct filename *name, const struct dentry *dentry,
 		goto out_alloc;
 
 	/*
-	 * If we have a pointer to an audit_names entry already, then we can
-	 * just use it directly if the type is correct.
+	 * If this context already holds a record for this filename, use it
+	 * directly, provided the type is right.
 	 */
-	n = name->aname;
+	n = audit_name_lookup(context, name);
 	if (n) {
 		if (parent) {
 			if (n->type == AUDIT_TYPE_PARENT ||
