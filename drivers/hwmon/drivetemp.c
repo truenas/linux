@@ -348,20 +348,22 @@ static int drivetemp_retrieve_temp_log(struct drivetemp_data *st,
 	err = scsi_execute_cmd(st->sdev, scsi_cmd, REQ_OP_DRV_IN, buf,
 			TEMP_LOG_PAGE_LEN, 10 * HZ, 5, NULL);
 	if (err)
-		return (err);
+		return err > 0 ? -EIO : err;
 
 	page_len = min(get_unaligned_be16(&buf[TEMP_LOG_LEN_OFFSET]),
 		TEMP_LOG_PAGE_LEN - TEMP_LOG_HEADER_LEN) + TEMP_LOG_HEADER_LEN;
 
 	while (i + TEMP_LOG_PARAM_HEADER_LEN <= page_len) {
-		u8 param_len = (u8) buf[i + 3] + TEMP_LOG_PARAM_HEADER_LEN;
+		unsigned int param_len = (u8) buf[i + 3] + TEMP_LOG_PARAM_HEADER_LEN;
 		u16 param_code = get_unaligned_be16(&buf[i]);
 		if (i + param_len > page_len)
 			break;
-		if (param_code == 0x0)
-			*temp = (u8) buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
-		if (reftemp && param_code == 0x1)
-			*reftemp = (u8) buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
+		if (param_len > TEMP_LOG_PARAM_TEMP_OFFSET) {
+			if (param_code == 0x0)
+				*temp = (u8) buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
+			if (reftemp && param_code == 0x1)
+				*reftemp = (u8) buf[i + TEMP_LOG_PARAM_TEMP_OFFSET];
+		}
 		i += param_len;
 	}
 
