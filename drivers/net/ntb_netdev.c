@@ -184,10 +184,8 @@ static int __ntb_netdev_maybe_stop_tx(struct net_device *netdev,
 static int ntb_netdev_maybe_stop_tx(struct net_device *ndev,
 				    struct ntb_netdev_queue *q, int size)
 {
-	if (__netif_subqueue_stopped(ndev, q->qid))
-		return -EBUSY;
-
-	if (ntb_transport_tx_free_entry(q->qp) >= size)
+	if (__netif_subqueue_stopped(ndev, q->qid) ||
+	    (ntb_transport_tx_free_entry(q->qp) >= size))
 		return 0;
 
 	return __ntb_netdev_maybe_stop_tx(ndev, q, size);
@@ -236,30 +234,21 @@ static netdev_tx_t ntb_netdev_start_xmit(struct sk_buff *skb,
 
 	q = &dev->queues[qid];
 
-	if (unlikely(ntb_netdev_maybe_stop_tx(ndev, q, tx_stop)))
-		return NETDEV_TX_BUSY;
+	ntb_netdev_maybe_stop_tx(ndev, q, tx_stop);
 
 	rc = ntb_transport_tx_enqueue(q->qp, skb, skb->data, skb->len);
-	if (rc) {
-		if (rc == -EAGAIN || rc == -EBUSY) {
-			netif_stop_subqueue(ndev, q->qid);
-			mod_timer(&q->tx_timer,
-				  jiffies + usecs_to_jiffies(tx_time));
-			return NETDEV_TX_BUSY;
-		}
-
-		goto drop;
-	}
+	if (rc)
+		goto err;
 
 	/* check for next submit */
 	ntb_netdev_maybe_stop_tx(ndev, q, tx_stop);
 
 	return NETDEV_TX_OK;
 
-drop:
-	dev_kfree_skb_any(skb);
+err:
 	ndev->stats.tx_dropped++;
-	return NETDEV_TX_OK;
+	ndev->stats.tx_errors++;
+	return NETDEV_TX_BUSY;
 }
 
 static void ntb_netdev_tx_timer(struct timer_list *t)
