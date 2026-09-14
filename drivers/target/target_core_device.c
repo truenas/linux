@@ -339,6 +339,8 @@ int core_enable_device_list_for_node(
 	spin_lock_init(&new->ua_lock);
 	INIT_LIST_HEAD(&new->ua_list);
 	INIT_LIST_HEAD(&new->lun_link);
+	spin_lock_init(&new->sess_list_lock);
+	INIT_LIST_HEAD(&new->sess_list);
 
 	new->mapped_lun = mapped_lun;
 	kref_init(&new->pr_kref);

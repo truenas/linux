@@ -278,7 +278,9 @@ void transport_init_session(struct se_session *se_sess)
 {
 	INIT_LIST_HEAD(&se_sess->sess_list);
 	INIT_LIST_HEAD(&se_sess->sess_acl_list);
+	INIT_LIST_HEAD(&se_sess->deve_list);
 	spin_lock_init(&se_sess->sess_cmd_lock);
+	spin_lock_init(&se_sess->deve_list_lock);
 }
 EXPORT_SYMBOL(transport_init_session);
 
@@ -490,6 +492,10 @@ target_setup_session(struct se_portal_group *tpg,
 		rc = -EACCES;
 		goto free_sess;
 	}
+
+	rc = target_setup_session_deve_entries(sess);
+	if (rc)
+		goto free_sess;
 	/*
 	 * Go ahead and perform any remaining fabric setup that is
 	 * required before transport_register_session().
@@ -595,6 +601,8 @@ EXPORT_SYMBOL(transport_deregister_session_configfs);
 void transport_free_session(struct se_session *se_sess)
 {
 	struct se_node_acl *se_nacl = se_sess->se_node_acl;
+
+	target_free_session_deve_entries(se_sess);
 
 	/*
 	 * Drop the se_node_acl->nacl_kref obtained from within
