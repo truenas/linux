@@ -272,7 +272,7 @@ target_emulate_set_target_port_groups(struct se_cmd *cmd)
 {
 	struct se_device *dev = cmd->se_dev;
 	struct se_lun *l_lun = cmd->se_lun;
-	struct se_node_acl *nacl = cmd->se_sess->se_node_acl;
+	struct se_session *sess = cmd->se_sess;
 	struct t10_alua_tg_pt_gp *tg_pt_gp = NULL, *l_tg_pt_gp;
 	unsigned char *buf;
 	unsigned char *ptr;
@@ -374,7 +374,7 @@ target_emulate_set_target_port_groups(struct se_cmd *cmd)
 				spin_unlock(&dev->t10_alua.tg_pt_gps_lock);
 
 				if (!core_alua_do_port_transition(tg_pt_gp,
-						dev, l_lun, nacl,
+						dev, l_lun, sess,
 						alua_access_state, 1))
 					found = true;
 
@@ -911,7 +911,6 @@ static void core_alua_queue_state_change_ua(struct t10_alua_tg_pt_gp *tg_pt_gp)
 {
 	struct se_dev_entry *se_deve;
 	struct se_lun *lun;
-	struct se_lun_acl *lacl;
 
 	spin_lock(&tg_pt_gp->tg_pt_gp_lock);
 	list_for_each_entry(lun, &tg_pt_gp->tg_pt_gp_lun_list,
@@ -936,8 +935,6 @@ static void core_alua_queue_state_change_ua(struct t10_alua_tg_pt_gp *tg_pt_gp)
 
 		spin_lock(&lun->lun_deve_lock);
 		list_for_each_entry(se_deve, &lun->lun_deve_list, lun_link) {
-			lacl = se_deve->se_lun_acl;
-
 			/*
 			 * spc4r37 p.242:
 			 * After an explicit target port asymmetric access
@@ -946,25 +943,13 @@ static void core_alua_queue_state_change_ua(struct t10_alua_tg_pt_gp *tg_pt_gp)
 			 * code set to ASYMMETRIC ACCESS STATE CHANGED for
 			 * the initiator port associated with every I_T nexus
 			 * other than the I_T nexus on which the SET TARGET
-			 * PORT GROUPS command was received.
+			 * PORT GROUPS command was received. tg_pt_gp_alua_sess
+			 * is that nexus for an explicit transition, and NULL
+			 * for an implicit one.
 			 */
-			if ((tg_pt_gp->tg_pt_gp_alua_access_status ==
-			     ALUA_STATUS_ALTERED_BY_EXPLICIT_STPG) &&
-			   (tg_pt_gp->tg_pt_gp_alua_lun != NULL) &&
-			    (tg_pt_gp->tg_pt_gp_alua_lun == lun))
-				continue;
-
-			/*
-			 * se_deve->se_lun_acl pointer may be NULL for a
-			 * entry created without explicit Node+MappedLUN ACLs
-			 */
-			if (lacl && (tg_pt_gp->tg_pt_gp_alua_nacl != NULL) &&
-			    (tg_pt_gp->tg_pt_gp_alua_nacl == lacl->se_lun_nacl))
-				continue;
-
 			core_scsi3_ua_allocate_all(se_deve, 0x2A,
 						   ASCQ_2AH_ASYMMETRIC_ACCESS_STATE_CHANGED,
-						   NULL);
+						   tg_pt_gp->tg_pt_gp_alua_sess);
 		}
 		spin_unlock(&lun->lun_deve_lock);
 
@@ -1054,7 +1039,7 @@ int core_alua_do_port_transition(
 	struct t10_alua_tg_pt_gp *l_tg_pt_gp,
 	struct se_device *l_dev,
 	struct se_lun *l_lun,
-	struct se_node_acl *l_nacl,
+	struct se_session *l_sess,
 	int new_state,
 	int explicit)
 {
@@ -1088,7 +1073,7 @@ int core_alua_do_port_transition(
 		 * success.
 		 */
 		l_tg_pt_gp->tg_pt_gp_alua_lun = l_lun;
-		l_tg_pt_gp->tg_pt_gp_alua_nacl = l_nacl;
+		l_tg_pt_gp->tg_pt_gp_alua_sess = l_sess;
 		rc = core_alua_do_transition_tg_pt(l_tg_pt_gp,
 						   new_state, explicit);
 		atomic_dec_mb(&lu_gp->lu_gp_ref_cnt);
@@ -1127,10 +1112,10 @@ int core_alua_do_port_transition(
 
 			if (l_tg_pt_gp == tg_pt_gp) {
 				tg_pt_gp->tg_pt_gp_alua_lun = l_lun;
-				tg_pt_gp->tg_pt_gp_alua_nacl = l_nacl;
+				tg_pt_gp->tg_pt_gp_alua_sess = l_sess;
 			} else {
 				tg_pt_gp->tg_pt_gp_alua_lun = NULL;
-				tg_pt_gp->tg_pt_gp_alua_nacl = NULL;
+				tg_pt_gp->tg_pt_gp_alua_sess = NULL;
 			}
 			atomic_inc_mb(&tg_pt_gp->tg_pt_gp_ref_cnt);
 			spin_unlock(&dev->t10_alua.tg_pt_gps_lock);
