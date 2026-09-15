@@ -211,7 +211,8 @@ void	core_tmr_release_req(struct se_tmr_req *);
 int	transport_generic_handle_tmr(struct se_cmd *);
 void	transport_generic_request_failure(struct se_cmd *, sense_reason_t);
 int	transport_lookup_tmr_lun(struct se_cmd *);
-void	core_allocate_nexus_loss_ua(struct se_node_acl *acl);
+void	core_allocate_nexus_loss_ua(struct se_node_acl *acl,
+			struct se_session *exclude_sess);
 
 struct se_node_acl *core_tpg_get_initiator_node_acl(struct se_portal_group *tpg,
 		unsigned char *);

@@ -855,7 +855,7 @@ static ssize_t tcm_loop_tpg_transport_status_store(struct config_item *item,
 		if (tl_tpg->tl_nexus) {
 			struct se_session *tl_sess = tl_tpg->tl_nexus->se_sess;
 
-			core_allocate_nexus_loss_ua(tl_sess->se_node_acl);
+			core_allocate_nexus_loss_ua(tl_sess->se_node_acl, NULL);
 		}
 		return count;
 	}

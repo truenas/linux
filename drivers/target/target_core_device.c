@@ -291,7 +291,7 @@ void target_dev_ua_allocate(struct se_device *dev, u8 asc, u8 ascq)
 
 		spin_lock(&lun->lun_deve_lock);
 		list_for_each_entry(se_deve, &lun->lun_deve_list, lun_link)
-			core_scsi3_ua_allocate(se_deve, asc, ascq);
+			core_scsi3_ua_allocate_all(se_deve, asc, ascq, NULL);
 		spin_unlock(&lun->lun_deve_lock);
 	}
 	spin_unlock(&dev->se_port_lock);
@@ -307,8 +307,9 @@ target_luns_data_has_changed(struct se_node_acl *nacl, struct se_dev_entry *new,
 	hlist_for_each_entry_rcu(tmp, &nacl->lun_entry_hlist, link) {
 		if (skip_new && tmp == new)
 			continue;
-		core_scsi3_ua_allocate(tmp, 0x3F,
-				       ASCQ_3FH_REPORTED_LUNS_DATA_HAS_CHANGED);
+		core_scsi3_ua_allocate_all(tmp, 0x3F,
+					   ASCQ_3FH_REPORTED_LUNS_DATA_HAS_CHANGED,
+					   NULL);
 	}
 	rcu_read_unlock();
 }
@@ -336,8 +337,6 @@ int core_enable_device_list_for_node(
 		goto free_deve;
 	}
 
-	spin_lock_init(&new->ua_lock);
-	INIT_LIST_HEAD(&new->ua_list);
 	INIT_LIST_HEAD(&new->lun_link);
 	spin_lock_init(&new->sess_list_lock);
 	INIT_LIST_HEAD(&new->sess_list);
