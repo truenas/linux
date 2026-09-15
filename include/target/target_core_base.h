@@ -690,13 +690,11 @@ struct se_dev_entry {
 	struct kref		pr_kref;
 	struct completion	pr_comp;
 	struct se_lun_acl	*se_lun_acl;
-	spinlock_t		ua_lock;
 	struct se_lun		*se_lun;
 #define DEF_PR_REG_ACTIVE		1
 	unsigned long		deve_flags;
 	struct list_head	alua_port_list;
 	struct list_head	lun_link;
-	struct list_head	ua_list;
 	struct hlist_node	link;
 	struct rcu_head		rcu_head;
 	/* Per-I_T-nexus se_session_deve join objects mapping this LUN, RCU-protected */

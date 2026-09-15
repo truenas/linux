@@ -2223,7 +2223,8 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 					pr_reg_p->pr_reg_nacl,
 					pr_reg_p->pr_res_mapped_lun,
 					0x2A,
-					ASCQ_2AH_RESERVATIONS_RELEASED);
+					ASCQ_2AH_RESERVATIONS_RELEASED,
+					NULL);
 			}
 		}
 
@@ -2644,7 +2645,7 @@ core_scsi3_emulate_pro_release(struct se_cmd *cmd, int type, int scope,
 
 		target_ua_allocate_lun(pr_reg_p->pr_reg_nacl,
 				pr_reg_p->pr_res_mapped_lun,
-				0x2A, ASCQ_2AH_RESERVATIONS_RELEASED);
+				0x2A, ASCQ_2AH_RESERVATIONS_RELEASED, NULL);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 
@@ -2728,7 +2729,7 @@ core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
 		 */
 		if (!calling_it_nexus)
 			target_ua_allocate_lun(pr_reg_nacl, pr_res_mapped_lun,
-				0x2A, ASCQ_2AH_RESERVATIONS_PREEMPTED);
+				0x2A, ASCQ_2AH_RESERVATIONS_PREEMPTED, NULL);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 
@@ -2936,7 +2937,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 			if (!calling_it_nexus)
 				target_ua_allocate_lun(pr_reg_nacl,
 					pr_res_mapped_lun, 0x2A,
-					ASCQ_2AH_REGISTRATIONS_PREEMPTED);
+					ASCQ_2AH_REGISTRATIONS_PREEMPTED, NULL);
 		}
 		spin_unlock(&pr_tmpl->registration_lock);
 		/*
@@ -3056,7 +3057,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 		 *    additional sense code set to REGISTRATIONS PREEMPTED;
 		 */
 		target_ua_allocate_lun(pr_reg_nacl, pr_res_mapped_lun, 0x2A,
-				ASCQ_2AH_REGISTRATIONS_PREEMPTED);
+				ASCQ_2AH_REGISTRATIONS_PREEMPTED, NULL);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 	/*
@@ -3090,7 +3091,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 
 			target_ua_allocate_lun(pr_reg->pr_reg_nacl,
 					pr_reg->pr_res_mapped_lun, 0x2A,
-					ASCQ_2AH_RESERVATIONS_RELEASED);
+					ASCQ_2AH_RESERVATIONS_RELEASED, NULL);
 		}
 		spin_unlock(&pr_tmpl->registration_lock);
 	}

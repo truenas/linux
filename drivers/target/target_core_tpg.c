@@ -82,7 +82,8 @@ struct se_node_acl *core_tpg_get_initiator_node_acl(
 EXPORT_SYMBOL(core_tpg_get_initiator_node_acl);
 
 void core_allocate_nexus_loss_ua(
-	struct se_node_acl *nacl)
+	struct se_node_acl *nacl,
+	struct se_session *exclude_sess)
 {
 	struct se_dev_entry *deve;
 
@@ -91,8 +92,8 @@ void core_allocate_nexus_loss_ua(
 
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link)
-		core_scsi3_ua_allocate(deve, 0x29,
-			ASCQ_29H_NEXUS_LOSS_OCCURRED);
+		core_scsi3_ua_allocate_all(deve, 0x29,
+			ASCQ_29H_NEXUS_LOSS_OCCURRED, exclude_sess);
 	rcu_read_unlock();
 }
 EXPORT_SYMBOL(core_allocate_nexus_loss_ua);
