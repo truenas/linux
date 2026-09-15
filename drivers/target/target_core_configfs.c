@@ -2925,7 +2925,7 @@ static ssize_t target_tg_pt_gp_alua_access_state_store(struct config_item *item,
 	}
 
 	ret = core_alua_do_port_transition(tg_pt_gp, dev,
-					NULL, NULL, new_state, 0);
+					NULL, new_state, 0);
 	return (!ret) ? count : -EINVAL;
 }
 
