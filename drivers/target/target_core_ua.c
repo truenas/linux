@@ -31,11 +31,8 @@
  * struct se_session_deve is a join object binding one active session to
  * one of its mapped LUNs, holding that nexus's own independent Unit
  * Attention queue (see the struct definition in target_core_base.h).
- *
- * This block adds the struct and its setup/teardown lifecycle only; the
- * producer/consumer functions below still read/write the legacy
- * deve->ua_lock/ua_list directly until a following patch migrates them
- * onto se_session_deve and removes those two fields from se_dev_entry.
+ * Every producer and consumer below raises, checks, and clears UAs
+ * through this per-session queue.
  * ============================================================================
  */
 
@@ -172,31 +169,60 @@ void target_free_session_deve_entries(struct se_session *sess)
 	}
 }
 
+/*
+ * Resolve cmd->se_sess's struct se_session_deve for cmd->orig_fe_lun and
+ * return it with ua_lock held (caller must unlock), or NULL with
+ * nothing held if there is no session, or no such mapped LUN.
+ *
+ * Acquires sess_deve->ua_lock before releasing sess->deve_list_lock
+ * (lock-coupling), which is what prevents
+ * target_free_session_deve_entries()'s final stage from freeing
+ * sess_deve out from under a concurrent lookup: that stage must take
+ * the same ua_lock before kfree(), so it blocks until this function's
+ * caller releases it.
+ */
+static struct se_session_deve *
+target_lookup_and_lock_sess_deve(struct se_session *sess, u64 mapped_lun)
+{
+	struct se_session_deve *tmp, *sess_deve = NULL;
+
+	if (!sess)
+		return NULL;
+
+	spin_lock(&sess->deve_list_lock);
+	list_for_each_entry(tmp, &sess->deve_list, sess_link) {
+		if (tmp->mapped_lun == mapped_lun) {
+			sess_deve = tmp;
+			break;
+		}
+	}
+
+	if (!sess_deve) {
+		spin_unlock(&sess->deve_list_lock);
+		return NULL;
+	}
+
+	spin_lock(&sess_deve->ua_lock);
+	spin_unlock(&sess->deve_list_lock);
+
+	return sess_deve;
+}
+
 sense_reason_t
 target_scsi3_ua_check(struct se_cmd *cmd)
 {
-	struct se_dev_entry *deve;
-	struct se_session *sess = cmd->se_sess;
-	struct se_node_acl *nacl;
+	struct se_session_deve *sess_deve;
 
-	if (!sess)
+	sess_deve = target_lookup_and_lock_sess_deve(cmd->se_sess,
+						     cmd->orig_fe_lun);
+	if (!sess_deve)
 		return 0;
 
-	nacl = sess->se_node_acl;
-	if (!nacl)
-		return 0;
-
-	rcu_read_lock();
-	deve = target_nacl_find_deve(nacl, cmd->orig_fe_lun);
-	if (!deve) {
-		rcu_read_unlock();
+	if (list_empty(&sess_deve->ua_list)) {
+		spin_unlock(&sess_deve->ua_lock);
 		return 0;
 	}
-	if (list_empty_careful(&deve->ua_list)) {
-		rcu_read_unlock();
-		return 0;
-	}
-	rcu_read_unlock();
+	spin_unlock(&sess_deve->ua_lock);
 	/*
 	 * From sam4r14, section 5.14 Unit attention condition:
 	 *
@@ -222,89 +248,117 @@ target_scsi3_ua_check(struct se_cmd *cmd)
 	}
 }
 
-int core_scsi3_ua_allocate(
-	struct se_dev_entry *deve,
-	u8 asc,
-	u8 ascq)
+/*
+ * Insert @ua into sess_deve->ua_list, deduplicating against any
+ * already-queued UA with the same ASC/ASCQ and otherwise
+ * priority-sorting per sam4r14 Section 5.14 (see the ordering table
+ * below). Caller must hold sess_deve->ua_lock. Returns -EEXIST on a
+ * duplicate without freeing @ua (caller's responsibility); otherwise
+ * inserts it and returns 0.
+ */
+static int __core_scsi3_ua_insert_sorted(struct se_session_deve *sess_deve,
+					 struct se_ua *ua)
 {
-	struct se_ua *ua, *ua_p, *ua_tmp;
+	struct se_ua *ua_p;
 
-	ua = kmem_cache_zalloc(se_ua_cache, GFP_ATOMIC);
-	if (!ua) {
-		pr_err("Unable to allocate struct se_ua\n");
-		return -ENOMEM;
+	list_for_each_entry(ua_p, &sess_deve->ua_list, ua_nacl_list) {
+		if (ua_p->ua_asc == ua->ua_asc && ua_p->ua_ascq == ua->ua_ascq)
+			return -EEXIST;
 	}
-	INIT_LIST_HEAD(&ua->ua_nacl_list);
 
-	ua->ua_asc = asc;
-	ua->ua_ascq = ascq;
-
-	spin_lock(&deve->ua_lock);
-	list_for_each_entry_safe(ua_p, ua_tmp, &deve->ua_list, ua_nacl_list) {
-		/*
-		 * Do not report the same UNIT ATTENTION twice..
-		 */
-		if ((ua_p->ua_asc == asc) && (ua_p->ua_ascq == ascq)) {
-			spin_unlock(&deve->ua_lock);
-			kmem_cache_free(se_ua_cache, ua);
-			return 0;
-		}
-		/*
-		 * Attach the highest priority Unit Attention to
-		 * the head of the list following sam4r14,
-		 * Section 5.14 Unit Attention Condition:
-		 *
-		 * POWER ON, RESET, OR BUS DEVICE RESET OCCURRED highest
-		 * POWER ON OCCURRED or
-		 * DEVICE INTERNAL RESET
-		 * SCSI BUS RESET OCCURRED or
-		 * MICROCODE HAS BEEN CHANGED or
-		 * protocol specific
-		 * BUS DEVICE RESET FUNCTION OCCURRED
-		 * I_T NEXUS LOSS OCCURRED
-		 * COMMANDS CLEARED BY POWER LOSS NOTIFICATION
-		 * all others                                    Lowest
-		 *
-		 * Each of the ASCQ codes listed above are defined in
-		 * the 29h ASC family, see spc4r17 Table D.1
-		 */
+	/*
+	 * Attach the highest priority Unit Attention to the head of
+	 * the list following sam4r14, Section 5.14 Unit Attention
+	 * Condition:
+	 *
+	 * POWER ON, RESET, OR BUS DEVICE RESET OCCURRED highest
+	 * POWER ON OCCURRED or
+	 * DEVICE INTERNAL RESET
+	 * SCSI BUS RESET OCCURRED or
+	 * MICROCODE HAS BEEN CHANGED or
+	 * protocol specific
+	 * BUS DEVICE RESET FUNCTION OCCURRED
+	 * I_T NEXUS LOSS OCCURRED
+	 * COMMANDS CLEARED BY POWER LOSS NOTIFICATION
+	 * all others                                    Lowest
+	 *
+	 * Each of the ASCQ codes listed above are defined in the 29h
+	 * ASC family, see spc4r17 Table D.1
+	 */
+	list_for_each_entry(ua_p, &sess_deve->ua_list, ua_nacl_list) {
 		if (ua_p->ua_asc == 0x29) {
-			if ((asc == 0x29) && (ascq > ua_p->ua_ascq))
-				list_add(&ua->ua_nacl_list,
-						&deve->ua_list);
-			else
-				list_add_tail(&ua->ua_nacl_list,
-						&deve->ua_list);
+			if (ua->ua_asc == 0x29 && ua->ua_ascq < ua_p->ua_ascq) {
+				list_add_tail(&ua->ua_nacl_list, &ua_p->ua_nacl_list);
+				return 0;
+			}
 		} else if (ua_p->ua_asc == 0x2a) {
 			/*
 			 * Incoming Family 29h ASCQ codes will override
 			 * Family 2AHh ASCQ codes for Unit Attention condition.
 			 */
-			if ((asc == 0x29) || (ascq > ua_p->ua_asc))
-				list_add(&ua->ua_nacl_list,
-					&deve->ua_list);
-			else
-				list_add_tail(&ua->ua_nacl_list,
-						&deve->ua_list);
-		} else
-			list_add_tail(&ua->ua_nacl_list,
-				&deve->ua_list);
-		spin_unlock(&deve->ua_lock);
-
-		return 0;
+			if (ua->ua_asc == 0x29 ||
+			    (ua->ua_asc == 0x2a && ua->ua_ascq < ua_p->ua_ascq)) {
+				list_add_tail(&ua->ua_nacl_list, &ua_p->ua_nacl_list);
+				return 0;
+			}
+		} else {
+			if (ua->ua_asc == 0x29 || ua->ua_asc == 0x2a) {
+				list_add_tail(&ua->ua_nacl_list, &ua_p->ua_nacl_list);
+				return 0;
+			}
+		}
 	}
-	list_add_tail(&ua->ua_nacl_list, &deve->ua_list);
-	spin_unlock(&deve->ua_lock);
+
+	list_add_tail(&ua->ua_nacl_list, &sess_deve->ua_list);
+	return 0;
+}
+
+/*
+ * Raise a Unit Attention with the given ASC/ASCQ on every I_T nexus
+ * mapped to @deve, except @exclude_sess if non-NULL (pass NULL to
+ * exclude nobody -- e.g. for administrative/config-time conditions
+ * with no single originating command).
+ */
+int core_scsi3_ua_allocate_all(struct se_dev_entry *deve, u8 asc, u8 ascq,
+			       struct se_session *exclude_sess)
+{
+	struct se_session_deve *sess_deve;
+	struct se_ua *ua;
+	int rc;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(sess_deve, &deve->sess_list, deve_link) {
+		if (exclude_sess && sess_deve->se_sess == exclude_sess)
+			continue;
+
+		ua = kmem_cache_zalloc(se_ua_cache, GFP_ATOMIC);
+		if (!ua) {
+			pr_err("Unable to allocate struct se_ua\n");
+			rcu_read_unlock();
+			return -ENOMEM;
+		}
+		INIT_LIST_HEAD(&ua->ua_nacl_list);
+		ua->ua_asc = asc;
+		ua->ua_ascq = ascq;
+
+		spin_lock(&sess_deve->ua_lock);
+		rc = __core_scsi3_ua_insert_sorted(sess_deve, ua);
+		spin_unlock(&sess_deve->ua_lock);
+
+		if (rc < 0)
+			kmem_cache_free(se_ua_cache, ua);
+	}
+	rcu_read_unlock();
 
 	pr_debug("Allocated UNIT ATTENTION, mapped LUN: %llu, ASC:"
-		" 0x%02x, ASCQ: 0x%02x\n", deve->mapped_lun,
-		asc, ascq);
+		" 0x%02x, ASCQ: 0x%02x\n", deve->mapped_lun, asc, ascq);
 
 	return 0;
 }
 
 void target_ua_allocate_lun(struct se_node_acl *nacl,
-			    u32 unpacked_lun, u8 asc, u8 ascq)
+			    u32 unpacked_lun, u8 asc, u8 ascq,
+			    struct se_session *exclude_sess)
 {
 	struct se_dev_entry *deve;
 
@@ -318,39 +372,24 @@ void target_ua_allocate_lun(struct se_node_acl *nacl,
 		return;
 	}
 
-	core_scsi3_ua_allocate(deve, asc, ascq);
+	core_scsi3_ua_allocate_all(deve, asc, ascq, exclude_sess);
 	rcu_read_unlock();
 }
 
 /*
- * Releases every form of UA state associated with @deve before it is
- * unmapped/freed: the legacy per-identity queue, and every struct
- * se_session_deve still pointing at @deve (freed via call_rcu()
- * immediately after this function returns to its caller -- see the
- * comment below for why the latter must happen synchronously here).
+ * Releases every struct se_session_deve still pointing at @deve before
+ * it is unmapped/freed (freed via call_rcu() immediately after this
+ * function returns to its caller -- see the comment below for why this
+ * must happen synchronously here).
  */
 void core_scsi3_ua_release_all(
 	struct se_dev_entry *deve)
 {
 	struct se_session_deve *sess_deve, *sess_deve_tmp;
 	LIST_HEAD(local_claimed_list);
-	struct se_ua *ua, *ua_p;
 
 	if (!deve)
 		return;
-
-	/*
-	 * Legacy drain: deve->ua_lock/ua_list remain the live UA queue for
-	 * every producer/consumer not yet converted onto struct
-	 * se_session_deve. This half is deleted once a following patch
-	 * finishes that conversion and removes deve->ua_lock/ua_list.
-	 */
-	spin_lock(&deve->ua_lock);
-	list_for_each_entry_safe(ua, ua_p, &deve->ua_list, ua_nacl_list) {
-		list_del(&ua->ua_nacl_list);
-		kmem_cache_free(se_ua_cache, ua);
-	}
-	spin_unlock(&deve->ua_lock);
 
 	/*
 	 * This deve is being unmapped; the caller frees it shortly after
@@ -410,81 +449,67 @@ void core_scsi3_ua_release_all(
 }
 
 /*
- * Dequeue a unit attention from the unit attention list. This function
- * returns true if the dequeuing succeeded and if *@key, *@asc and *@ascq have
- * been set.
+ * Dequeue a unit attention from the calling I_T nexus's unit attention
+ * queue. This function returns true if the dequeuing succeeded and if
+ * *@key, *@asc and *@ascq have been set.
  */
 bool core_scsi3_ua_for_check_condition(struct se_cmd *cmd, u8 *key, u8 *asc,
 				       u8 *ascq)
 {
 	struct se_device *dev = cmd->se_dev;
-	struct se_dev_entry *deve;
-	struct se_session *sess = cmd->se_sess;
-	struct se_node_acl *nacl;
-	struct se_ua *ua = NULL, *ua_p;
-	int head = 1;
-	bool dev_ua_intlck_clear = (dev->dev_attrib.emulate_ua_intlck_ctrl
-						== TARGET_UA_INTLCK_CTRL_CLEAR);
+	struct se_session_deve *sess_deve;
+	struct se_ua *ua;
+	bool dev_ua_intlck_clear;
 
-	if (WARN_ON_ONCE(!sess))
+	if (!cmd->se_sess)
 		return false;
 
-	nacl = sess->se_node_acl;
-	if (WARN_ON_ONCE(!nacl))
-		return false;
-
-	rcu_read_lock();
-	deve = target_nacl_find_deve(nacl, cmd->orig_fe_lun);
-	if (!deve) {
-		rcu_read_unlock();
+	sess_deve = target_lookup_and_lock_sess_deve(cmd->se_sess,
+						     cmd->orig_fe_lun);
+	if (!sess_deve) {
 		*key = ILLEGAL_REQUEST;
 		*asc = 0x25; /* LOGICAL UNIT NOT SUPPORTED */
 		*ascq = 0;
 		return true;
 	}
 	*key = UNIT_ATTENTION;
-	/*
-	 * The highest priority Unit Attentions are placed at the head of the
-	 * struct se_dev_entry->ua_list, and will be returned in CHECK_CONDITION +
-	 * sense data for the received CDB.
-	 */
-	spin_lock(&deve->ua_lock);
-	list_for_each_entry_safe(ua, ua_p, &deve->ua_list, ua_nacl_list) {
+
+	if (list_empty(&sess_deve->ua_list)) {
+		spin_unlock(&sess_deve->ua_lock);
+		return false;
+	}
+
+	dev_ua_intlck_clear = (dev && dev->dev_attrib.emulate_ua_intlck_ctrl
+						== TARGET_UA_INTLCK_CTRL_CLEAR);
+
+	if (!dev_ua_intlck_clear) {
 		/*
 		 * For ua_intlck_ctrl code not equal to 00b, only report the
 		 * highest priority UNIT_ATTENTION and ASC/ASCQ without
 		 * clearing it.
 		 */
-		if (!dev_ua_intlck_clear) {
-			*asc = ua->ua_asc;
-			*ascq = ua->ua_ascq;
-			break;
-		}
+		ua = list_first_entry(&sess_deve->ua_list, struct se_ua,
+				      ua_nacl_list);
+		*asc = ua->ua_asc;
+		*ascq = ua->ua_ascq;
+		spin_unlock(&sess_deve->ua_lock);
+	} else {
 		/*
 		 * Otherwise for the default 00b, release the UNIT ATTENTION
 		 * condition.  Return the ASC/ASCQ of the highest priority UA
 		 * (head of the list) in the outgoing CHECK_CONDITION + sense.
 		 */
-		if (head) {
-			*asc = ua->ua_asc;
-			*ascq = ua->ua_ascq;
-			head = 0;
-		}
-		list_del(&ua->ua_nacl_list);
-		kmem_cache_free(se_ua_cache, ua);
+		__target_ua_drain_queue(sess_deve, asc, ascq);
+		spin_unlock(&sess_deve->ua_lock);
 	}
-	spin_unlock(&deve->ua_lock);
-	rcu_read_unlock();
 
-	pr_debug("[%s]: %s UNIT ATTENTION condition with"
-		" INTLCK_CTRL: %d, mapped LUN: %llu, got CDB: 0x%02x"
-		" reported ASC: 0x%02x, ASCQ: 0x%02x\n",
-		nacl->se_tpg->se_tpg_tfo->fabric_name,
+	pr_debug("[%s]: %s UNIT ATTENTION condition, mapped LUN: %llu, "
+		"got CDB: 0x%02x reported ASC: 0x%02x, ASCQ: 0x%02x\n",
+		cmd->se_tfo->fabric_name,
 		dev_ua_intlck_clear ? "Releasing" : "Reporting",
-		dev->dev_attrib.emulate_ua_intlck_ctrl,
 		cmd->orig_fe_lun, cmd->t_task_cdb[0], *asc, *ascq);
 
-	return head == 0;
+	return true;
 }
 
 int core_scsi3_ua_clear_for_request_sense(
@@ -492,56 +517,31 @@ int core_scsi3_ua_clear_for_request_sense(
 	u8 *asc,
 	u8 *ascq)
 {
-	struct se_dev_entry *deve;
-	struct se_session *sess = cmd->se_sess;
-	struct se_node_acl *nacl;
-	struct se_ua *ua = NULL, *ua_p;
-	int head = 1;
+	struct se_session_deve *sess_deve;
 
-	if (!sess)
+	sess_deve = target_lookup_and_lock_sess_deve(cmd->se_sess,
+						     cmd->orig_fe_lun);
+	if (!sess_deve)
 		return -EINVAL;
 
-	nacl = sess->se_node_acl;
-	if (!nacl)
-		return -EINVAL;
-
-	rcu_read_lock();
-	deve = target_nacl_find_deve(nacl, cmd->orig_fe_lun);
-	if (!deve) {
-		rcu_read_unlock();
-		return -EINVAL;
-	}
-	if (list_empty_careful(&deve->ua_list)) {
-		rcu_read_unlock();
+	if (list_empty(&sess_deve->ua_list)) {
+		spin_unlock(&sess_deve->ua_lock);
 		return -EPERM;
 	}
 	/*
-	 * The highest priority Unit Attentions are placed at the head of the
-	 * struct se_dev_entry->ua_list.  The First (and hence highest priority)
-	 * ASC/ASCQ will be returned in REQUEST_SENSE payload data for the
-	 * matching struct se_lun.
-	 *
-	 * Once the returning ASC/ASCQ values are set, we go ahead and
-	 * release all of the Unit Attention conditions for the associated
-	 * struct se_lun.
+	 * The highest priority Unit Attention is at the head of the
+	 * queue and will be returned in REQUEST_SENSE payload data for
+	 * the matching struct se_lun. Once the returning ASC/ASCQ
+	 * values are set, we go ahead and release all of the Unit
+	 * Attention conditions for the associated struct se_lun.
 	 */
-	spin_lock(&deve->ua_lock);
-	list_for_each_entry_safe(ua, ua_p, &deve->ua_list, ua_nacl_list) {
-		if (head) {
-			*asc = ua->ua_asc;
-			*ascq = ua->ua_ascq;
-			head = 0;
-		}
-		list_del(&ua->ua_nacl_list);
-		kmem_cache_free(se_ua_cache, ua);
-	}
-	spin_unlock(&deve->ua_lock);
-	rcu_read_unlock();
+	__target_ua_drain_queue(sess_deve, asc, ascq);
+	spin_unlock(&sess_deve->ua_lock);
 
 	pr_debug("[%s]: Released UNIT ATTENTION condition, mapped"
 		" LUN: %llu, got REQUEST_SENSE reported ASC: 0x%02x,"
-		" ASCQ: 0x%02x\n", nacl->se_tpg->se_tpg_tfo->fabric_name,
+		" ASCQ: 0x%02x\n", cmd->se_tfo->fabric_name,
 		cmd->orig_fe_lun, *asc, *ascq);
 
-	return (head) ? -EPERM : 0;
+	return 0;
 }
