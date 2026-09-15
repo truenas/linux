@@ -962,8 +962,9 @@ static void core_alua_queue_state_change_ua(struct t10_alua_tg_pt_gp *tg_pt_gp)
 			    (tg_pt_gp->tg_pt_gp_alua_nacl == lacl->se_lun_nacl))
 				continue;
 
-			core_scsi3_ua_allocate(se_deve, 0x2A,
-				ASCQ_2AH_ASYMMETRIC_ACCESS_STATE_CHANGED);
+			core_scsi3_ua_allocate_all(se_deve, 0x2A,
+						   ASCQ_2AH_ASYMMETRIC_ACCESS_STATE_CHANGED,
+						   NULL);
 		}
 		spin_unlock(&lun->lun_deve_lock);
 
@@ -1812,8 +1813,9 @@ static void __target_attach_tg_pt_gp(struct se_lun *lun,
 	tg_pt_gp->tg_pt_gp_members++;
 	spin_lock(&lun->lun_deve_lock);
 	list_for_each_entry(se_deve, &lun->lun_deve_list, lun_link)
-		core_scsi3_ua_allocate(se_deve, 0x3f,
-				       ASCQ_3FH_INQUIRY_DATA_HAS_CHANGED);
+		core_scsi3_ua_allocate_all(se_deve, 0x3f,
+					   ASCQ_3FH_INQUIRY_DATA_HAS_CHANGED,
+					   NULL);
 	spin_unlock(&lun->lun_deve_lock);
 	spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
 }
