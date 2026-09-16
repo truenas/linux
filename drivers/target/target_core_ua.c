@@ -356,6 +356,42 @@ int core_scsi3_ua_allocate_all(struct se_dev_entry *deve, u8 asc, u8 ascq,
 	return 0;
 }
 
+/*
+ * Raise a Unit Attention with the given ASC/ASCQ on exactly this I_T
+ * nexus's own queue -- for conditions where the reporting nexus and
+ * the affected nexus are the same one, unlike core_scsi3_ua_allocate_all()
+ * which fans out to every other nexus mapped to the LUN.
+ */
+int target_ua_allocate_sess(struct se_session *sess, u64 mapped_lun,
+			    u8 asc, u8 ascq)
+{
+	struct se_session_deve *sess_deve;
+	struct se_ua *ua;
+	int rc;
+
+	sess_deve = target_lookup_and_lock_sess_deve(sess, mapped_lun);
+	if (!sess_deve)
+		return 0;
+
+	ua = kmem_cache_zalloc(se_ua_cache, GFP_ATOMIC);
+	if (!ua) {
+		spin_unlock(&sess_deve->ua_lock);
+		pr_err("Unable to allocate struct se_ua\n");
+		return -ENOMEM;
+	}
+	INIT_LIST_HEAD(&ua->ua_nacl_list);
+	ua->ua_asc = asc;
+	ua->ua_ascq = ascq;
+
+	rc = __core_scsi3_ua_insert_sorted(sess_deve, ua);
+	spin_unlock(&sess_deve->ua_lock);
+
+	if (rc < 0)
+		kmem_cache_free(se_ua_cache, ua);
+
+	return 0;
+}
+
 void target_ua_allocate_lun(struct se_node_acl *nacl,
 			    u32 unpacked_lun, u8 asc, u8 ascq,
 			    struct se_session *exclude_sess)

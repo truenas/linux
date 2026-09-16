@@ -380,6 +380,16 @@ struct t10_pr_registration {
 	u64 pr_res_key;
 	atomic_t pr_res_holders;
 	struct se_node_acl *pr_reg_nacl;
+	/*
+	 * The live I_T nexus currently backing this registration, or NULL
+	 * when unbound (no session logged in for pr_reg_nacl right now).
+	 * Re-bound across reconnects by core_scsi3_bind_pr_reg_sess().
+	 */
+	struct se_session __rcu *pr_reg_sess;
+	/* Anchor in pr_reg_sess's sess_pr_list once bound */
+	struct list_head pr_sess_link;
+	/* Back-pointer so unbind knows which registration_lock to take */
+	struct se_device *pr_reg_dev;
 	/* Used by ALL_TG_PT=1 registration with deve->pr_ref taken */
 	struct se_dev_entry *pr_reg_deve;
 	struct list_head pr_reg_list;
@@ -653,6 +663,9 @@ struct se_session {
 	/* Per-I_T-nexus se_session_deve join objects, one per mapped LUN */
 	struct list_head	deve_list;
 	spinlock_t		deve_list_lock;	/* protects deve_list */
+	/* PR registrations currently bound to this session, via pr_sess_link */
+	struct list_head	sess_pr_list;
+	spinlock_t		sess_pr_lock;	/* protects sess_pr_list */
 };
 
 struct se_device;
