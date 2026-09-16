@@ -5823,17 +5823,27 @@ static inline void trace_insert_eval_map_file(struct module *mod,
 			      struct trace_eval_map **start, int len) { }
 #endif /* !CONFIG_TRACE_EVAL_MAP_FILE */
 
-static void trace_insert_eval_map(struct module *mod,
-				  struct trace_eval_map **start, int len)
+static void
+trace_event_update_with_eval_map(struct module *mod,
+				 struct trace_eval_map **start,
+				 int len)
 {
 	struct trace_eval_map **map;
 
-	if (len <= 0)
-		return;
+	/* Always run sanitizer only if btf_type_tag attr exists. */
+	if (len <= 0) {
+		if (!(IS_ENABLED(CONFIG_DEBUG_INFO_BTF) &&
+		      IS_ENABLED(CONFIG_PAHOLE_HAS_BTF_TAG) &&
+		      __has_attribute(btf_type_tag)))
+			return;
+	}
 
 	map = start;
 
-	trace_event_eval_update(map, len);
+	trace_event_update_all(map, len, mod);
+
+	if (len <= 0)
+		return;
 
 	trace_insert_eval_map_file(mod, start, len);
 }
@@ -9148,6 +9158,8 @@ buffer_subbuf_size_write(struct file *filp, const char __user *ubuf,
 	/* Do not allow tracing while changing the order of the ring buffer */
 	tracing_stop_tr(tr);
 
+	trace_access_lock(RING_BUFFER_ALL_CPUS);
+
 	old_order = ring_buffer_subbuf_order_get(tr->array_buffer.buffer);
 	if (old_order == order)
 		goto out;
@@ -9187,6 +9199,7 @@ buffer_subbuf_size_write(struct file *filp, const char __user *ubuf,
 #endif
 	(*ppos)++;
  out:
+	trace_access_unlock(RING_BUFFER_ALL_CPUS);
 	if (ret)
 		cnt = ret;
 	tracing_start_tr(tr);
@@ -9802,7 +9815,7 @@ static void __init eval_map_work_func(struct work_struct *work)
 	int len;
 
 	len = __stop_ftrace_eval_maps - __start_ftrace_eval_maps;
-	trace_insert_eval_map(NULL, __start_ftrace_eval_maps, len);
+	trace_event_update_with_eval_map(NULL, __start_ftrace_eval_maps, len);
 }
 
 static int __init trace_eval_init(void)
@@ -9837,9 +9850,6 @@ late_initcall_sync(trace_eval_sync);
 #ifdef CONFIG_MODULES
 static void trace_module_add_evals(struct module *mod)
 {
-	if (!mod->num_trace_evals)
-		return;
-
 	/*
 	 * Modules with bad taint do not have events created, do
 	 * not bother with enums either.
@@ -9847,7 +9857,8 @@ static void trace_module_add_evals(struct module *mod)
 	if (trace_module_has_bad_taint(mod))
 		return;
 
-	trace_insert_eval_map(mod, mod->trace_evals, mod->num_trace_evals);
+	/* Even if no trace_evals, this need to sanitize field types. */
+	trace_event_update_with_eval_map(mod, mod->trace_evals, mod->num_trace_evals);
 }
 
 #ifdef CONFIG_TRACE_EVAL_MAP_FILE
@@ -10431,7 +10442,8 @@ __init static void enable_instances(void)
 
 		tr = trace_array_create_systems(name, NULL, addr, size);
 		if (IS_ERR(tr)) {
-			pr_warn("Tracing: Failed to create instance buffer %s\n", curr_str);
+			pr_warn("Tracing: Failed to create instance buffer '%s' (%ld)\n", name,
+				PTR_ERR(tr));
 			continue;
 		}
 
