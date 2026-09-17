@@ -507,6 +507,19 @@ skip_nacl_sess_update:;
 #endif /* CONFIG_TRUENAS */
 
 		/*
+		 * Allocate this I_T nexus's own per-LUN UA queues. Called
+		 * here rather than in target_setup_session() so that fabric
+		 * modules calling this function directly (iSCSI always does;
+		 * see target_ha_session_create()'s comment) also get it.
+		 * Degrades gracefully on -ENOMEM: the session still works
+		 * for I/O, just without per-nexus UA tracking until it
+		 * reconnects under less memory pressure.
+		 */
+		if (target_setup_session_deve_entries(se_sess))
+			pr_err("Unable to allocate per-nexus UA queues for %s\n",
+			       se_nacl->initiatorname);
+
+		/*
 		 * Re-bind any PR registrations left behind by this I_T
 		 * nexus's previous session, matched by nacl + ISID. Called
 		 * here rather than in transport_register_session() so that
@@ -575,10 +588,6 @@ target_setup_session(struct se_portal_group *tpg,
 		rc = -EACCES;
 		goto free_sess;
 	}
-
-	rc = target_setup_session_deve_entries(sess);
-	if (rc)
-		goto free_sess;
 	/*
 	 * Go ahead and perform any remaining fabric setup that is
 	 * required before transport_register_session().
