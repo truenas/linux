@@ -299,7 +299,7 @@ void target_move_deve_sess_entries(struct se_dev_entry *from,
  * its node ACL. Caller is in an RCU read-side critical section, and may use
  * the entry until it leaves it.
  */
-static struct se_session_deve *
+struct se_session_deve *
 target_find_sess_deve(struct se_session *sess, u64 mapped_lun)
 {
 	struct se_session_deve *sess_deve;
