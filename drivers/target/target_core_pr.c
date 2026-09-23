@@ -86,6 +86,28 @@ static bool core_scsi3_pr_match_nexus(struct t10_pr_registration *pr_reg,
 }
 
 /*
+ * Return true if the I_T nexus of @sess holds a registration on @dev.
+ */
+static bool core_scsi3_sess_is_registered(struct se_session *sess,
+					  struct se_device *dev)
+{
+	struct t10_reservation *pr_tmpl = &dev->t10_pr;
+	struct t10_pr_registration *pr_reg;
+	bool found = false;
+
+	spin_lock(&pr_tmpl->registration_lock);
+	list_for_each_entry(pr_reg, &pr_tmpl->registration_list, pr_reg_list) {
+		if (core_scsi3_pr_match_nexus(pr_reg, sess)) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock(&pr_tmpl->registration_lock);
+
+	return found;
+}
+
+/*
  * Establish a unit attention condition on the logical unit of @pr_reg for
  * every session that is its I_T nexus, other than @exclude_sess. Caller
  * holds registration_lock, so @pr_reg cannot be freed under us.
@@ -360,12 +382,10 @@ out:
  * This function is called by those initiator ports who are *NOT*
  * the active PR reservation holder when a reservation is present.
  */
-static int core_scsi3_pr_seq_non_holder(struct se_cmd *cmd, u32 pr_reg_type,
-					bool isid_mismatch)
+static int core_scsi3_pr_seq_non_holder(struct se_cmd *cmd, u32 pr_reg_type)
 {
 	unsigned char *cdb = cmd->t_task_cdb;
 	struct se_session *se_sess = cmd->se_sess;
-	struct se_node_acl *nacl = se_sess->se_node_acl;
 	int other_cdb = 0;
 	int registered_nexus = 0, ret = 1; /* Conflict by default */
 	int all_reg = 0, reg_only = 0; /* ALL_REG, REG_ONLY */
@@ -373,18 +393,7 @@ static int core_scsi3_pr_seq_non_holder(struct se_cmd *cmd, u32 pr_reg_type,
 	int legacy = 0; /* Act like a legacy device and return
 			 * RESERVATION CONFLICT on some CDBs */
 
-	if (isid_mismatch) {
-		registered_nexus = 0;
-	} else {
-		struct se_dev_entry *se_deve;
-
-		rcu_read_lock();
-		se_deve = target_nacl_find_deve(nacl, cmd->orig_fe_lun);
-		if (se_deve)
-			registered_nexus = test_bit(DEF_PR_REG_ACTIVE,
-						    &se_deve->deve_flags);
-		rcu_read_unlock();
-	}
+	registered_nexus = core_scsi3_sess_is_registered(se_sess, cmd->se_dev);
 
 	switch (pr_reg_type) {
 	case PR_TYPE_WRITE_EXCLUSIVE:
@@ -618,29 +627,23 @@ target_scsi3_pr_reservation_check(struct se_cmd *cmd)
 {
 	struct se_device *dev = cmd->se_dev;
 	struct se_session *sess = cmd->se_sess;
+	struct t10_pr_registration *pr_reg;
 	u32 pr_reg_type;
-	bool isid_mismatch = false;
 
 	if (!dev->dev_pr_res_holder)
 		return 0;
 
-	pr_reg_type = dev->dev_pr_res_holder->pr_res_type;
-	cmd->pr_res_key = dev->dev_pr_res_holder->pr_res_key;
-	if (dev->dev_pr_res_holder->pr_reg_nacl != sess->se_node_acl)
-		goto check_nonholder;
+	pr_reg = dev->dev_pr_res_holder;
+	pr_reg_type = pr_reg->pr_res_type;
+	cmd->pr_res_key = pr_reg->pr_res_key;
 
-	if (dev->dev_pr_res_holder->isid_present_at_reg) {
-		if (dev->dev_pr_res_holder->pr_reg_bin_isid !=
-		    sess->sess_bin_isid) {
-			isid_mismatch = true;
-			goto check_nonholder;
-		}
-	}
+	if (!core_scsi3_pr_match_nexus(pr_reg, sess))
+		goto check_nonholder;
 
 	return 0;
 
 check_nonholder:
-	if (core_scsi3_pr_seq_non_holder(cmd, pr_reg_type, isid_mismatch))
+	if (core_scsi3_pr_seq_non_holder(cmd, pr_reg_type))
 		return TCM_RESERVATION_CONFLICT;
 	return 0;
 }
@@ -1160,7 +1163,6 @@ static void __core_scsi3_add_registration(
 		rcu_read_lock();
 		deve = pr_reg_tmp->pr_reg_deve;
 		if (deve) {
-			set_bit(DEF_PR_REG_ACTIVE, &deve->deve_flags);
 			core_scsi3_lunacl_undepend_item(deve);
 			pr_reg_tmp->pr_reg_deve = NULL;
 		}
@@ -1173,7 +1175,6 @@ out:
 	rcu_read_lock();
 	deve = pr_reg->pr_reg_deve;
 	if (deve) {
-		set_bit(DEF_PR_REG_ACTIVE, &deve->deve_flags);
 		kref_put(&deve->pr_kref, target_pr_kref_release);
 		pr_reg->pr_reg_deve = NULL;
 	}
@@ -1383,8 +1384,6 @@ static void __core_scsi3_free_registration(
 	const struct target_core_fabric_ops *tfo =
 			pr_reg->pr_reg_nacl->se_tpg->se_tpg_tfo;
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
-	struct se_node_acl *nacl = pr_reg->pr_reg_nacl;
-	struct se_dev_entry *deve;
 	char i_buf[PR_REG_ISID_ID_LEN] = { };
 
 	lockdep_assert_held(&pr_tmpl->registration_lock);
@@ -1412,12 +1411,6 @@ static void __core_scsi3_free_registration(
 				tfo->fabric_name);
 		cpu_relax();
 	}
-
-	rcu_read_lock();
-	deve = target_nacl_find_deve(nacl, pr_reg->pr_res_mapped_lun);
-	if (deve)
-		clear_bit(DEF_PR_REG_ACTIVE, &deve->deve_flags);
-	rcu_read_unlock();
 
 	spin_lock(&pr_tmpl->registration_lock);
 	pr_debug("SPC-3 PR [%s] Service Action: UNREGISTER Initiator"
