@@ -466,7 +466,6 @@ void core_disable_device_list_for_node(
 	core_scsi3_ua_release_all(orig);
 
 	hlist_del_rcu(&orig->link);
-	clear_bit(DEF_PR_REG_ACTIVE, &orig->deve_flags);
 	orig->lun_access_ro = false;
 	orig->creation_time = 0;
 	orig->attach_count--;
