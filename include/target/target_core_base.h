@@ -704,8 +704,6 @@ struct se_dev_entry {
 	struct completion	pr_comp;
 	struct se_lun_acl	*se_lun_acl;
 	struct se_lun		*se_lun;
-#define DEF_PR_REG_ACTIVE		1
-	unsigned long		deve_flags;
 	struct list_head	alua_port_list;
 	struct list_head	lun_link;
 	struct hlist_node	link;
