@@ -29,6 +29,10 @@ struct user_struct {
 	defined(CONFIG_SECRETMEM)
 	atomic_long_t locked_vm;
 #endif
+#ifdef CONFIG_PERF_EVENTS
+	/* perf ring buffer pages within perf_event_mlock_kb, not locked_vm */
+	atomic_long_t perf_locked_vm;
+#endif
 #ifdef CONFIG_WATCH_QUEUE
 	atomic_t nr_watches;	/* The number of watches this user currently has */
 #endif
