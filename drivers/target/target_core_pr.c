@@ -2971,7 +2971,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 		u64 sa_res_key, enum preempt_type preempt_type)
 {
 	struct se_device *dev = cmd->se_dev;
-	struct se_node_acl *pr_reg_nacl;
+	struct se_session *pr_reg_sess;
 	struct se_session *se_sess = cmd->se_sess;
 	LIST_HEAD(preempt_and_abort_list);
 	struct t10_pr_registration *pr_reg, *pr_reg_tmp, *pr_reg_n, *pr_res_holder;
@@ -3056,7 +3056,8 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 				sa_res_key_unmatched = false;
 
 				calling_it_nexus = (pr_reg_n == pr_reg) ? 1 : 0;
-				pr_reg_nacl = pr_reg->pr_reg_nacl;
+				pr_reg_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
+						lockdep_is_held(&pr_tmpl->registration_lock));
 				pr_res_mapped_lun = pr_reg->pr_res_mapped_lun;
 				__core_scsi3_free_registration(dev, pr_reg,
 					(preempt_type == PREEMPT_AND_ABORT) ? &preempt_and_abort_list :
@@ -3084,16 +3085,17 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 				if (calling_it_nexus)
 					continue;
 
-				pr_reg_nacl = pr_reg->pr_reg_nacl;
+				pr_reg_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
+						lockdep_is_held(&pr_tmpl->registration_lock));
 				pr_res_mapped_lun = pr_reg->pr_res_mapped_lun;
 				__core_scsi3_free_registration(dev, pr_reg,
 					(preempt_type == PREEMPT_AND_ABORT) ? &preempt_and_abort_list :
 						NULL, 0);
 			}
-			if (!calling_it_nexus)
-				target_ua_allocate_lun(pr_reg_nacl,
+			if (!calling_it_nexus && pr_reg_sess)
+				target_ua_allocate_sess(pr_reg_sess,
 					pr_res_mapped_lun, 0x2A,
-					ASCQ_2AH_REGISTRATIONS_PREEMPTED, se_sess);
+					ASCQ_2AH_REGISTRATIONS_PREEMPTED);
 		}
 		spin_unlock(&pr_tmpl->registration_lock);
 		/*
@@ -3201,7 +3203,8 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 		if (sa_res_key && pr_reg->pr_res_key != sa_res_key)
 			continue;
 
-		pr_reg_nacl = pr_reg->pr_reg_nacl;
+		pr_reg_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
+				lockdep_is_held(&pr_tmpl->registration_lock));
 		pr_res_mapped_lun = pr_reg->pr_res_mapped_lun;
 		__core_scsi3_free_registration(dev, pr_reg,
 				(preempt_type == PREEMPT_AND_ABORT) ? &preempt_and_abort_list : NULL,
@@ -3212,8 +3215,9 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 		 *    persistent reservation and/or registration, with the
 		 *    additional sense code set to REGISTRATIONS PREEMPTED;
 		 */
-		target_ua_allocate_lun(pr_reg_nacl, pr_res_mapped_lun, 0x2A,
-				ASCQ_2AH_REGISTRATIONS_PREEMPTED, se_sess);
+		if (pr_reg_sess)
+			target_ua_allocate_sess(pr_reg_sess, pr_res_mapped_lun, 0x2A,
+					ASCQ_2AH_REGISTRATIONS_PREEMPTED);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 	/*
@@ -3245,9 +3249,12 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 			if (calling_it_nexus)
 				continue;
 
-			target_ua_allocate_lun(pr_reg->pr_reg_nacl,
-					pr_reg->pr_res_mapped_lun, 0x2A,
-					ASCQ_2AH_RESERVATIONS_RELEASED, se_sess);
+			pr_reg_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
+					lockdep_is_held(&pr_tmpl->registration_lock));
+			if (pr_reg_sess)
+				target_ua_allocate_sess(pr_reg_sess,
+						pr_reg->pr_res_mapped_lun, 0x2A,
+						ASCQ_2AH_RESERVATIONS_RELEASED);
 		}
 		spin_unlock(&pr_tmpl->registration_lock);
 	}
