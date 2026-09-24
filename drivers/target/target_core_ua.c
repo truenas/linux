@@ -513,26 +513,6 @@ int target_ua_allocate_sess(struct se_session *sess, u64 mapped_lun,
 	return rc;
 }
 
-void target_ua_allocate_lun(struct se_node_acl *nacl,
-			    u32 unpacked_lun, u8 asc, u8 ascq,
-			    struct se_session *exclude_sess)
-{
-	struct se_dev_entry *deve;
-
-	if (!nacl)
-		return;
-
-	rcu_read_lock();
-	deve = target_nacl_find_deve(nacl, unpacked_lun);
-	if (!deve) {
-		rcu_read_unlock();
-		return;
-	}
-
-	core_scsi3_ua_allocate_all(deve, asc, ascq, exclude_sess);
-	rcu_read_unlock();
-}
-
 /*
  * Unlink and free every struct se_session_deve of @deve, which is being
  * unmapped and is freed (via call_rcu()) after this returns. Caller holds the
