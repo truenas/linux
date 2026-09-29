@@ -130,9 +130,16 @@ static bool core_scsi3_sess_is_registered(struct se_session *sess,
 }
 
 /*
- * Bind every registration matching this session's identity that isn't
- * already bound to a live nexus. Called on login, so a reconnecting
- * session re-attaches to registrations left behind by its predecessor.
+ * Bind every registration matching this session's identity, taking over
+ * from whichever session (if any) currently backs it. A registration's
+ * registered nexus is defined by identity (nacl + ISID), not by which
+ * live struct se_session happens to be bound to it, so a matching
+ * session always takes the binding -- iSCSI itself never allows two
+ * live sessions with the same identity at once, so whatever session
+ * currently holds it is either this one already, or one that is by
+ * definition on its way out. Called on login, so a reconnecting session
+ * re-attaches to registrations left behind by its predecessor without
+ * waiting on that predecessor's own teardown to run first.
  */
 void core_scsi3_bind_pr_reg_sess(struct se_session *sess)
 {
@@ -156,16 +163,25 @@ void core_scsi3_bind_pr_reg_sess(struct se_session *sess)
 		spin_lock(&dev->t10_pr.registration_lock);
 		list_for_each_entry(pr_reg, &dev->t10_pr.registration_list,
 				    pr_reg_list) {
+			struct se_session *old_sess;
+
 			if (!core_scsi3_pr_match_nexus(pr_reg, sess))
 				continue;
-			if (rcu_access_pointer(pr_reg->pr_reg_sess))
+
+			old_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
+					lockdep_is_held(&dev->t10_pr.registration_lock));
+			if (old_sess == sess)
 				continue;
+
+			if (old_sess) {
+				spin_lock(&old_sess->sess_pr_lock);
+				list_del_init(&pr_reg->pr_sess_link);
+				spin_unlock(&old_sess->sess_pr_lock);
+			}
 
 			rcu_assign_pointer(pr_reg->pr_reg_sess, sess);
 			spin_lock(&sess->sess_pr_lock);
-			if (list_empty(&pr_reg->pr_sess_link))
-				list_add_tail(&pr_reg->pr_sess_link,
-					      &sess->sess_pr_list);
+			list_add_tail(&pr_reg->pr_sess_link, &sess->sess_pr_list);
 			spin_unlock(&sess->sess_pr_lock);
 		}
 		spin_unlock(&dev->t10_pr.registration_lock);
@@ -174,30 +190,49 @@ void core_scsi3_bind_pr_reg_sess(struct se_session *sess)
 }
 
 /*
- * Unbind every registration this session currently backs, without ever
- * holding sess_pr_lock and a registration_lock at the same time: splice
- * the session's list under sess_pr_lock alone, then clear each entry
- * under its own registration's registration_lock alone.
+ * Unbind every registration this session currently backs. Mirrors
+ * core_scsi3_bind_pr_reg_sess()'s own traversal -- by the nacl's mapped
+ * devices, under each device's registration_lock -- rather than walking
+ * sess->sess_pr_list directly, so every pr_reg is only ever touched
+ * while holding the same lock that also gates its removal in
+ * __core_scsi3_free_registration(). Also only clears a registration
+ * that is still actually bound to @sess: a concurrent login from a
+ * reconnecting nexus with the same identity may already have taken it
+ * over via core_scsi3_bind_pr_reg_sess(), and that binding must win.
  */
 void core_scsi3_unbind_pr_reg_sess(struct se_session *sess)
 {
-	struct t10_pr_registration *pr_reg, *pr_reg_tmp;
+	struct se_node_acl *nacl = sess->se_node_acl;
+	struct se_dev_entry *deve;
 	struct se_device *dev;
-	LIST_HEAD(local_pr_list);
+	struct t10_pr_registration *pr_reg;
 
-	spin_lock(&sess->sess_pr_lock);
-	list_splice_init(&sess->sess_pr_list, &local_pr_list);
-	spin_unlock(&sess->sess_pr_lock);
+	if (!nacl)
+		return;
 
-	list_for_each_entry_safe(pr_reg, pr_reg_tmp, &local_pr_list,
-				 pr_sess_link) {
-		dev = pr_reg->pr_reg_dev;
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
+		if (!deve->se_lun)
+			continue;
+
+		dev = rcu_dereference(deve->se_lun->lun_se_dev);
+		if (!dev)
+			continue;
 
 		spin_lock(&dev->t10_pr.registration_lock);
-		rcu_assign_pointer(pr_reg->pr_reg_sess, NULL);
-		list_del_init(&pr_reg->pr_sess_link);
+		list_for_each_entry(pr_reg, &dev->t10_pr.registration_list,
+				    pr_reg_list) {
+			if (rcu_access_pointer(pr_reg->pr_reg_sess) != sess)
+				continue;
+
+			spin_lock(&sess->sess_pr_lock);
+			list_del_init(&pr_reg->pr_sess_link);
+			spin_unlock(&sess->sess_pr_lock);
+			rcu_assign_pointer(pr_reg->pr_reg_sess, NULL);
+		}
 		spin_unlock(&dev->t10_pr.registration_lock);
 	}
+	rcu_read_unlock();
 }
 
 static int is_reservation_holder(
