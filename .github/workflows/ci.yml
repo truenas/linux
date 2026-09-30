@@ -10,6 +10,8 @@ jobs:
 
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
+      train: ${{ steps.train.outputs.train }}
+      publish: ${{ steps.train.outputs.publish }}
 
     steps:
       - name: Skip Duplicate Actions
@@ -17,6 +19,36 @@ jobs:
         uses: fkirc/skip-duplicate-actions@v5
         with:
           concurrent_skipping: 'outdated_runs'
+
+      - name: Check out train config
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Map branch to TrueNAS train
+        id: train
+        run: |
+          # Look up on every event so PRs validate trains.json.  Only
+          # branch pushes publish; a tag can share a branch's name.
+          rc=0
+          entry=$(.github/workflows/scripts/resolve-train.py branch "$GITHUB_REF_NAME") || rc=$?
+          case $rc in
+            0) ;;
+            3) entry="" ;;    # not listed
+            *) exit "$rc" ;;  # invalid config
+          esac
+          train=""
+          publish=false
+          if [ -n "$entry" ] && [ "$GITHUB_EVENT_NAME" = push ] &&
+              [ "$GITHUB_REF_TYPE" = branch ]; then
+            echo "Publishing branch: $entry"
+            train=$(jq -r '.train' <<< "$entry")
+            publish=true
+          fi
+          {
+            echo "train=$train"
+            echo "publish=$publish"
+          } | tee -a "$GITHUB_OUTPUT"
 
   build_debug_kernel:
 
@@ -96,7 +128,7 @@ jobs:
     # Never skip pushes to the publishing branches, even when an identical
     # tree was already built by a PR run - publish_latest_debs needs this
     # run's own artifacts.
-    if: ${{ needs.pre_build.outputs.should_skip != 'true' || (github.event_name == 'push' && (github.ref == 'refs/heads/truenas/linux-6.18' || github.ref == 'refs/heads/stable/26')) }}
+    if: ${{ needs.pre_build.outputs.should_skip != 'true' || needs.pre_build.outputs.publish == 'true' }}
 
     runs-on: ubuntu-22.04
 
@@ -173,9 +205,9 @@ jobs:
         run: |
           echo "Status: ${{job.status}}"
 
-  # On every merge to truenas/linux-6.18 or stable/26, republish the
+  # On every merge to a branch listed in .github/trains.json, republish the
   # production debs built above as assets of a per-train rolling prerelease
-  # (master-nightly and 26-nightly respectively).  Tags are named after the
+  # (<train>-nightly).  Tags are named after the
   # TrueNAS train rather than the kernel series so that consumer URLs
   # survive a kernel rebase of the master branch.  Release assets (unlike
   # Actions artifacts) never expire and are downloadable anonymously at
@@ -185,8 +217,8 @@ jobs:
   # release and file names, then verify downloads against SHA256SUMS.
   publish_latest_debs:
 
-    needs: build_production_kernel
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/truenas/linux-6.18' || github.ref == 'refs/heads/stable/26') }}
+    needs: [pre_build, build_production_kernel]
+    if: ${{ needs.pre_build.outputs.publish == 'true' }}
 
     runs-on: ubuntu-22.04
 
@@ -257,6 +289,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TRAIN: ${{ needs.pre_build.outputs.train }}
         run: |
           # If the branch has already moved past this commit, let the run
           # building the new tip publish instead - the release must never
@@ -267,18 +300,11 @@ jobs:
             exit 0
           fi
 
-          # Map the branch to its TrueNAS train.  Exact matches only: if a
-          # branch is added to this job's if-gate it must be mapped here
-          # too, otherwise two branches could fight over one release.
-          case "$GITHUB_REF_NAME" in
-            truenas/linux-6.18) train="master" ;;
-            stable/26)          train="26" ;;
-            *)
-              echo "ERROR: no train mapping for branch $GITHUB_REF_NAME"
-              exit 1
-              ;;
-          esac
-          tag="${train}-nightly"
+          if [ -z "$TRAIN" ]; then
+            echo "ERROR: no train resolved for branch $GITHUB_REF_NAME"
+            exit 1
+          fi
+          tag="${TRAIN}-nightly"
 
           {
             echo "Rolling production kernel build of \`$GITHUB_REF_NAME\` at $GITHUB_SHA."
@@ -297,7 +323,7 @@ jobs:
           gh release create "$tag" \
             --prerelease \
             --target "$GITHUB_SHA" \
-            --title "TrueNAS $train kernel (nightly)" \
+            --title "TrueNAS $TRAIN kernel (nightly)" \
             --notes-file release-notes.md \
             release-assets/*.deb \
             release-assets/SHA256SUMS \
