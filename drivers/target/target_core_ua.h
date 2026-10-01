@@ -43,6 +43,10 @@ extern void target_move_deve_sess_entries(struct se_dev_entry *from,
 extern sense_reason_t target_scsi3_ua_check(struct se_cmd *);
 extern int core_scsi3_ua_allocate_all(struct se_dev_entry *deve, u8 asc,
 				      u8 ascq, struct se_session *exclude_sess);
+extern int target_ua_allocate_sess(struct se_session *sess, u64 mapped_lun,
+				   u8 asc, u8 ascq);
+extern int target_ua_allocate_sess_deve_locked(struct se_session_deve *sess_deve,
+					       u8 asc, u8 ascq);
 extern void target_ua_allocate_lun(struct se_node_acl *nacl, u32 unpacked_lun,
 				   u8 asc, u8 ascq,
 				   struct se_session *exclude_sess);
