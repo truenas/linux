@@ -12,6 +12,8 @@
 
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/bitops.h>
+#include <linux/rculist.h>
 #include <scsi/scsi_proto.h>
 
 #include <target/target_core_base.h>
@@ -21,6 +23,154 @@
 #include "target_core_alua.h"
 #include "target_core_pr.h"
 #include "target_core_ua.h"
+
+/*
+ * ============================================================================
+ * Per-I_T-Nexus Session/Device-Entry Join Lifecycle (se_session_deve)
+ *
+ * struct se_session_deve is a join object binding one active session to
+ * one of its mapped LUNs, holding that nexus's own independent Unit
+ * Attention queue (see the struct definition in target_core_base.h).
+ *
+ * This block adds the struct and its setup/teardown lifecycle only; the
+ * producer/consumer functions below still read/write the legacy
+ * deve->ua_lock/ua_list directly until a following patch migrates them
+ * onto se_session_deve and removes those two fields from se_dev_entry.
+ * ============================================================================
+ */
+
+/*
+ * Drain and free every UA queued on sess_deve, optionally returning the
+ * head (highest-priority) entry's ASC/ASCQ in *asc and *ascq before
+ * freeing it. Caller must hold sess_deve->ua_lock.
+ */
+static void __target_ua_drain_queue(struct se_session_deve *sess_deve,
+				    u8 *asc, u8 *ascq)
+{
+	struct se_ua *ua, *ua_tmp;
+	int head = 1;
+
+	list_for_each_entry_safe(ua, ua_tmp, &sess_deve->ua_list, ua_nacl_list) {
+		if (head && asc && ascq) {
+			*asc = ua->ua_asc;
+			*ascq = ua->ua_ascq;
+			head = 0;
+		}
+		list_del(&ua->ua_nacl_list);
+		kmem_cache_free(se_ua_cache, ua);
+	}
+}
+
+/*
+ * Assumes sess->se_node_acl is already assigned and that no fabric
+ * command can yet arrive on this session (the session isn't registered
+ * with its fabric until after this returns). Allocates one struct
+ * se_session_deve per LUN currently mapped to sess->se_node_acl and
+ * links it into both deve->sess_list and sess->deve_list. LUNs mapped
+ * to the node ACL after this point are not retroactively picked up.
+ *
+ * On failure partway through, entries already linked are unwound via
+ * target_free_session_deve_entries() before returning.
+ */
+int target_setup_session_deve_entries(struct se_session *sess)
+{
+	struct se_node_acl *nacl = sess->se_node_acl;
+	struct se_dev_entry *deve;
+	struct se_session_deve *sess_deve;
+	int rc = 0;
+
+	if (!nacl)
+		return 0;
+
+	mutex_lock(&nacl->lun_entry_mutex);
+	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link,
+				 lockdep_is_held(&nacl->lun_entry_mutex)) {
+		sess_deve = kzalloc(sizeof(*sess_deve), GFP_KERNEL);
+		if (!sess_deve) {
+			rc = -ENOMEM;
+			break;
+		}
+
+		sess_deve->se_sess = sess;
+		sess_deve->se_deve = deve;
+		sess_deve->mapped_lun = deve->mapped_lun;
+		spin_lock_init(&sess_deve->ua_lock);
+		INIT_LIST_HEAD(&sess_deve->ua_list);
+		INIT_LIST_HEAD(&sess_deve->deve_link);
+		INIT_LIST_HEAD(&sess_deve->sess_link);
+		INIT_LIST_HEAD(&sess_deve->teardown_link);
+
+		/* Link into parent deve's RCU-protected session list */
+		spin_lock(&deve->sess_list_lock);
+		list_add_tail_rcu(&sess_deve->deve_link, &deve->sess_list);
+		spin_unlock(&deve->sess_list_lock);
+
+		/* Link into parent session's spinlock-protected deve list */
+		spin_lock(&sess->deve_list_lock);
+		list_add_tail(&sess_deve->sess_link, &sess->deve_list);
+		spin_unlock(&sess->deve_list_lock);
+	}
+	mutex_unlock(&nacl->lun_entry_mutex);
+
+	if (rc < 0)
+		target_free_session_deve_entries(sess);
+
+	return rc;
+}
+
+/*
+ * Unlinks and frees every struct se_session_deve owned by @sess. Safe
+ * to call even when one of @sess's mapped LUNs is concurrently being
+ * unmapped -- core_scsi3_ua_release_all() runs the mirror-image
+ * teardown from the se_dev_entry side, and the two paths arbitrate
+ * ownership of any shared se_session_deve via SE_SESS_DEVE_CLAIMED so
+ * exactly one of them frees a given object.
+ */
+void target_free_session_deve_entries(struct se_session *sess)
+{
+	struct se_session_deve *sess_deve, *tmp;
+	LIST_HEAD(local_claimed_list);
+
+	if (!sess)
+		return;
+
+	/* STAGE 1: Unlink from sess->deve_list and atomically claim ownership */
+	spin_lock(&sess->deve_list_lock);
+	list_for_each_entry_safe(sess_deve, tmp, &sess->deve_list, sess_link) {
+		list_del_init(&sess_deve->sess_link);
+		set_bit(SE_SESS_DEVE_SESS_UNLINKED, &sess_deve->flags);
+
+		if (!test_and_set_bit(SE_SESS_DEVE_CLAIMED, &sess_deve->flags))
+			list_add_tail(&sess_deve->teardown_link, &local_claimed_list);
+	}
+	spin_unlock(&sess->deve_list_lock);
+
+	/* STAGE 2: Ensure unlinked from deve->sess_list for claimed entries */
+	list_for_each_entry(sess_deve, &local_claimed_list, teardown_link) {
+		struct se_dev_entry *deve = sess_deve->se_deve;
+
+		if (deve) {
+			spin_lock(&deve->sess_list_lock);
+			if (!test_and_set_bit(SE_SESS_DEVE_DEVE_UNLINKED, &sess_deve->flags))
+				list_del_rcu(&sess_deve->deve_link);
+			spin_unlock(&deve->sess_list_lock);
+		}
+	}
+
+	/* STAGE 3: single-pass RCU synchronization */
+	synchronize_rcu();
+
+	/* STAGE 4: batch drain UAs and free claimed objects */
+	list_for_each_entry_safe(sess_deve, tmp, &local_claimed_list, teardown_link) {
+		list_del(&sess_deve->teardown_link);
+
+		spin_lock(&sess_deve->ua_lock);
+		__target_ua_drain_queue(sess_deve, NULL, NULL);
+		spin_unlock(&sess_deve->ua_lock);
+
+		kfree(sess_deve);
+	}
+}
 
 sense_reason_t
 target_scsi3_ua_check(struct se_cmd *cmd)
@@ -172,17 +322,91 @@ void target_ua_allocate_lun(struct se_node_acl *nacl,
 	rcu_read_unlock();
 }
 
+/*
+ * Releases every form of UA state associated with @deve before it is
+ * unmapped/freed: the legacy per-identity queue, and every struct
+ * se_session_deve still pointing at @deve (freed via call_rcu()
+ * immediately after this function returns to its caller -- see the
+ * comment below for why the latter must happen synchronously here).
+ */
 void core_scsi3_ua_release_all(
 	struct se_dev_entry *deve)
 {
+	struct se_session_deve *sess_deve, *sess_deve_tmp;
+	LIST_HEAD(local_claimed_list);
 	struct se_ua *ua, *ua_p;
 
+	if (!deve)
+		return;
+
+	/*
+	 * Legacy drain: deve->ua_lock/ua_list remain the live UA queue for
+	 * every producer/consumer not yet converted onto struct
+	 * se_session_deve. This half is deleted once a following patch
+	 * finishes that conversion and removes deve->ua_lock/ua_list.
+	 */
 	spin_lock(&deve->ua_lock);
 	list_for_each_entry_safe(ua, ua_p, &deve->ua_list, ua_nacl_list) {
 		list_del(&ua->ua_nacl_list);
 		kmem_cache_free(se_ua_cache, ua);
 	}
 	spin_unlock(&deve->ua_lock);
+
+	/*
+	 * This deve is being unmapped; the caller frees it shortly after
+	 * we return (via call_rcu()). Any se_session_deve still pointing
+	 * at it -- one per session that had this LUN mapped at login --
+	 * must be unlinked from both lists and freed now, or a session
+	 * logging out afterward would dereference this, by then freed,
+	 * deve through sess_deve->se_deve.
+	 *
+	 * target_free_session_deve_entries() can be tearing down the same
+	 * se_session_deve concurrently from a session logging out right
+	 * now. SE_SESS_DEVE_CLAIMED arbitrates exactly-once ownership
+	 * between the two paths so only one of them frees a given object;
+	 * SESS_UNLINKED/DEVE_UNLINKED guard against either path double
+	 * list_del()'ing a link the other side already removed. Neither
+	 * path ever holds more than one of {sess->deve_list_lock,
+	 * deve->sess_list_lock, ua_lock} at a time, so no lock-ordering
+	 * cycle is possible between them.
+	 */
+
+	/* STAGE 1: Unlink from deve->sess_list via RCU and atomically claim ownership */
+	spin_lock(&deve->sess_list_lock);
+	list_for_each_entry_safe(sess_deve, sess_deve_tmp, &deve->sess_list, deve_link) {
+		if (!test_and_set_bit(SE_SESS_DEVE_DEVE_UNLINKED, &sess_deve->flags))
+			list_del_rcu(&sess_deve->deve_link);
+
+		if (!test_and_set_bit(SE_SESS_DEVE_CLAIMED, &sess_deve->flags))
+			list_add_tail(&sess_deve->teardown_link, &local_claimed_list);
+	}
+	spin_unlock(&deve->sess_list_lock);
+
+	/* STAGE 2: Ensure unlinked from sess->deve_list for claimed entries */
+	list_for_each_entry(sess_deve, &local_claimed_list, teardown_link) {
+		struct se_session *sess = sess_deve->se_sess;
+
+		if (sess) {
+			spin_lock(&sess->deve_list_lock);
+			if (!test_and_set_bit(SE_SESS_DEVE_SESS_UNLINKED, &sess_deve->flags))
+				list_del_init(&sess_deve->sess_link);
+			spin_unlock(&sess->deve_list_lock);
+		}
+	}
+
+	/* STAGE 3: single-pass RCU synchronization */
+	synchronize_rcu();
+
+	/* STAGE 4: batch drain UAs and free claimed objects */
+	list_for_each_entry_safe(sess_deve, sess_deve_tmp, &local_claimed_list, teardown_link) {
+		list_del(&sess_deve->teardown_link);
+
+		spin_lock(&sess_deve->ua_lock);
+		__target_ua_drain_queue(sess_deve, NULL, NULL);
+		spin_unlock(&sess_deve->ua_lock);
+
+		kfree(sess_deve);
+	}
 }
 
 /*
