@@ -650,6 +650,9 @@ struct se_session {
 	void			*sess_cmd_map;
 	struct sbitmap_queue	sess_tag_pool;
 	struct target_cmd_counter *cmd_cnt;
+	/* Per-I_T-nexus se_session_deve join objects, one per mapped LUN */
+	struct list_head	deve_list;
+	spinlock_t		deve_list_lock;	/* protects deve_list */
 };
 
 struct se_device;
@@ -696,6 +699,37 @@ struct se_dev_entry {
 	struct list_head	ua_list;
 	struct hlist_node	link;
 	struct rcu_head		rcu_head;
+	/* Per-I_T-nexus se_session_deve join objects mapping this LUN, RCU-protected */
+	struct list_head	sess_list;
+	spinlock_t		sess_list_lock;	/* protects sess_list */
+};
+
+/*
+ * Session-specific device entry: join object binding an active I_T nexus
+ * (se_session) to a mapped LUN (se_dev_entry), holding that nexus's own
+ * independent Unit Attention queue. One instance exists per session per
+ * LUN mapped to that session's node ACL at login time.
+ */
+struct se_session_deve {
+	struct se_session	*se_sess;
+	struct se_dev_entry	*se_deve;
+	u64			mapped_lun;
+
+/* Atomic ownership/unlink-tracking bits for symmetric teardown */
+#define SE_SESS_DEVE_CLAIMED		0
+#define SE_SESS_DEVE_SESS_UNLINKED	1
+#define SE_SESS_DEVE_DEVE_UNLINKED	2
+	unsigned long		flags;
+
+	spinlock_t		ua_lock;	/* protects ua_list */
+	struct list_head	ua_list;
+
+	/* Position in se_deve->sess_list. RCU-protected, deve->sess_list_lock. */
+	struct list_head	deve_link;
+	/* Position in se_sess->deve_list. Plain spinlock, sess->deve_list_lock. */
+	struct list_head	sess_link;
+	/* Private scratch anchor, used only by whichever teardown path wins ownership. */
+	struct list_head	teardown_link;
 };
 
 struct se_dev_attrib {
