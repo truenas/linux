@@ -278,7 +278,9 @@ void transport_init_session(struct se_session *se_sess)
 {
 	INIT_LIST_HEAD(&se_sess->sess_list);
 	INIT_LIST_HEAD(&se_sess->sess_acl_list);
+	INIT_LIST_HEAD(&se_sess->deve_list);
 	spin_lock_init(&se_sess->sess_cmd_lock);
+	spin_lock_init(&se_sess->deve_list_lock);
 }
 EXPORT_SYMBOL(transport_init_session);
 
@@ -432,6 +434,18 @@ void __transport_register_session(
 		list_add_tail(&se_sess->sess_acl_list,
 			      &se_nacl->acl_sess_list);
 		spin_unlock_irqrestore(&se_nacl->nacl_sess_lock, flags);
+
+		/*
+		 * Allocate this I_T nexus's own per-LUN UA queues. Called
+		 * here rather than in target_setup_session() so that fabric
+		 * modules calling this function directly (iSCSI always does)
+		 * also get it. Degrades gracefully on -ENOMEM: the session
+		 * still works for I/O, just without per-nexus UA tracking
+		 * until it reconnects under less memory pressure.
+		 */
+		if (target_setup_session_deve_entries(se_sess))
+			pr_err("Unable to allocate per-nexus UA queues for %s\n",
+			       se_nacl->initiatorname);
 	}
 	list_add_tail(&se_sess->sess_list, &se_tpg->tpg_sess_list);
 
@@ -595,6 +609,8 @@ EXPORT_SYMBOL(transport_deregister_session_configfs);
 void transport_free_session(struct se_session *se_sess)
 {
 	struct se_node_acl *se_nacl = se_sess->se_node_acl;
+
+	target_free_session_deve_entries(se_sess);
 
 	/*
 	 * Drop the se_node_acl->nacl_kref obtained from within

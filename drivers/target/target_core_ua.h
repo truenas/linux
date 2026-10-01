@@ -33,6 +33,9 @@
 
 extern struct kmem_cache *se_ua_cache;
 
+extern int target_setup_session_deve_entries(struct se_session *sess);
+extern void target_free_session_deve_entries(struct se_session *sess);
+
 extern sense_reason_t target_scsi3_ua_check(struct se_cmd *);
 extern int core_scsi3_ua_allocate(struct se_dev_entry *, u8, u8);
 extern void target_ua_allocate_lun(struct se_node_acl *, u32, u8, u8);
