@@ -278,6 +278,8 @@ void transport_init_session(struct se_session *se_sess)
 {
 	INIT_LIST_HEAD(&se_sess->sess_list);
 	INIT_LIST_HEAD(&se_sess->sess_acl_list);
+	INIT_LIST_HEAD(&se_sess->deve_list);
+	INIT_LIST_HEAD(&se_sess->ua_sess_link);
 	spin_lock_init(&se_sess->sess_cmd_lock);
 }
 EXPORT_SYMBOL(transport_init_session);
@@ -440,6 +442,36 @@ void __transport_register_session(
 }
 EXPORT_SYMBOL(__transport_register_session);
 
+/**
+ * transport_setup_session_ua - set up a session's per-LUN unit attention state
+ * @se_sess: session whose se_node_acl is already assigned
+ *
+ * Allocates one unit attention queue for each LUN mapped to the session's node
+ * ACL. LUNs mapped later get theirs when they are mapped. Takes
+ * nacl->lun_entry_mutex and allocates with GFP_KERNEL, so it must be called
+ * from process context and not under se_portal_group->session_lock.
+ *
+ * Every fabric calls it before registering the session, and before handing
+ * the session to anything that would still hold it if the login failed.
+ * target_setup_session() calls it for the fabrics that use it. On failure
+ * the fabric must refuse the login and free the session with
+ * transport_free_session(): a session without its queues would work for
+ * I/O but never see a unit attention.
+ *
+ * Return: 0, or -ENOMEM.
+ */
+int transport_setup_session_ua(struct se_session *se_sess)
+{
+	int rc;
+
+	rc = target_setup_session_deve_entries(se_sess);
+	if (rc)
+		pr_err("Unable to allocate per-nexus UA queues for %s\n",
+		       se_sess->se_node_acl->initiatorname);
+	return rc;
+}
+EXPORT_SYMBOL(transport_setup_session_ua);
+
 void transport_register_session(
 	struct se_portal_group *se_tpg,
 	struct se_node_acl *se_nacl,
@@ -490,6 +522,13 @@ target_setup_session(struct se_portal_group *tpg,
 		rc = -EACCES;
 		goto free_sess;
 	}
+	/*
+	 * Before the callback, which may publish the session to the fabric
+	 * where it could not be taken back if this failed afterwards.
+	 */
+	rc = transport_setup_session_ua(sess);
+	if (rc)
+		goto free_sess;
 	/*
 	 * Go ahead and perform any remaining fabric setup that is
 	 * required before transport_register_session().
@@ -595,6 +634,10 @@ EXPORT_SYMBOL(transport_deregister_session_configfs);
 void transport_free_session(struct se_session *se_sess)
 {
 	struct se_node_acl *se_nacl = se_sess->se_node_acl;
+
+	might_sleep();
+
+	target_free_session_deve_entries(se_sess);
 
 	/*
 	 * Drop the se_node_acl->nacl_kref obtained from within
