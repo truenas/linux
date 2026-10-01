@@ -278,8 +278,10 @@ void transport_init_session(struct se_session *se_sess)
 	INIT_LIST_HEAD(&se_sess->sess_list);
 	INIT_LIST_HEAD(&se_sess->sess_acl_list);
 	INIT_LIST_HEAD(&se_sess->deve_list);
+	INIT_LIST_HEAD(&se_sess->sess_pr_list);
 	spin_lock_init(&se_sess->sess_cmd_lock);
 	spin_lock_init(&se_sess->deve_list_lock);
+	spin_lock_init(&se_sess->sess_pr_lock);
 }
 EXPORT_SYMBOL(transport_init_session);
 
@@ -445,6 +447,15 @@ void __transport_register_session(
 		if (target_setup_session_deve_entries(se_sess))
 			pr_err("Unable to allocate per-nexus UA queues for %s\n",
 			       se_nacl->initiatorname);
+
+		/*
+		 * Re-bind any PR registrations left behind by this I_T
+		 * nexus's previous session, matched by nacl + ISID. Called
+		 * here rather than in transport_register_session() so that
+		 * fabric modules calling this function directly on reconnect
+		 * (e.g. iSCSI session reinstatement) also get it.
+		 */
+		core_scsi3_bind_pr_reg_sess(se_sess);
 	}
 	list_add_tail(&se_sess->sess_list, &se_tpg->tpg_sess_list);
 
@@ -679,6 +690,13 @@ void transport_deregister_session(struct se_session *se_sess)
 	se_sess->se_tpg = NULL;
 	se_sess->fabric_sess_ptr = NULL;
 	spin_unlock_irqrestore(&se_tpg->session_lock, flags);
+
+	/*
+	 * Unbind any PR registrations this I_T nexus backs before its
+	 * memory is reclaimed; they remain registered, just unbound until
+	 * some future session re-binds them via core_scsi3_bind_pr_reg_sess().
+	 */
+	core_scsi3_unbind_pr_reg_sess(se_sess);
 
 	/*
 	 * Since the session is being removed, release SPC-2
@@ -2126,10 +2144,9 @@ void transport_generic_request_failure(struct se_cmd *cmd,
 		if (cmd->se_sess &&
 		    cmd->se_dev->dev_attrib.emulate_ua_intlck_ctrl
 					== TARGET_UA_INTLCK_CTRL_ESTABLISH_UA) {
-			target_ua_allocate_lun(cmd->se_sess->se_node_acl,
-					       cmd->orig_fe_lun, 0x2C,
-					ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS,
-					NULL);
+			target_ua_allocate_sess(cmd->se_sess,
+						cmd->orig_fe_lun, 0x2C,
+					ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS);
 		}
 
 		goto queue_status;
