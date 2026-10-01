@@ -180,6 +180,7 @@ static struct se_node_acl *target_alloc_node_acl(struct se_portal_group *tpg,
 
 	INIT_LIST_HEAD(&acl->acl_list);
 	INIT_LIST_HEAD(&acl->acl_sess_list);
+	INIT_LIST_HEAD(&acl->ua_sess_list);
 	INIT_HLIST_HEAD(&acl->lun_entry_hlist);
 	kref_init(&acl->acl_kref);
 	init_completion(&acl->acl_free_comp);
