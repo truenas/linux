@@ -1,0 +1,29 @@
+{
+  "docs": [
+    "Pushes to a listed branch publish its production kernel debs as",
+    "the <train>-nightly release.  truenas/zfs builds against these by",
+    "tag (kernel_tag in its trains.json).",
+    "",
+    "Each branch reads its own copy of this file.  To retire a train,",
+    "remove its entry on that branch before deleting the release and",
+    "tag, or the next push recreates them.",
+    "",
+    "workflows/scripts/resolve-train.py validates this file on every CI",
+    "run: required fields, allowed characters, no duplicate branch or",
+    "train."
+  ],
+  "trains": [
+    {
+      "train": "master",
+      "branch": "truenas/linux-6.18"
+    },
+    {
+      "train": "26",
+      "branch": "stable/26"
+    },
+    {
+      "train": "27",
+      "branch": "stable/27"
+    }
+  ]
+}
