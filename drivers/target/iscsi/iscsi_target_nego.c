@@ -1300,6 +1300,18 @@ get_target:
 		ret = -1;
 		goto out;
 	}
+	/*
+	 * Here rather than in iscsi_post_login_handler(), which runs after
+	 * the final login response has gone out and cannot refuse the
+	 * login.  A login that fails from here on frees the session with
+	 * transport_free_session(), which undoes this.
+	 */
+	if (transport_setup_session_ua(sess->se_sess) < 0) {
+		iscsit_tx_login_rsp(conn, ISCSI_STATUS_CLS_TARGET_ERR,
+				    ISCSI_LOGIN_STATUS_NO_RESOURCES);
+		ret = -1;
+		goto out;
+	}
 	se_nacl = sess->se_sess->se_node_acl;
 	queue_depth = se_nacl->queue_depth;
 	/*
