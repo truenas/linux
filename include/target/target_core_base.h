@@ -596,6 +596,12 @@ struct se_node_acl {
 	struct config_group	acl_fabric_stat_group;
 	struct list_head	acl_list;
 	struct list_head	acl_sess_list;
+	/*
+	 * Sessions whose se_session_deve entries are set up, via
+	 * se_session->ua_sess_link. Protected by lun_entry_mutex, as are the
+	 * se_session_deve entries themselves being added or removed.
+	 */
+	struct list_head	ua_sess_list;
 	struct completion	acl_free_comp;
 	struct kref		acl_kref;
 };
@@ -650,6 +656,13 @@ struct se_session {
 	void			*sess_cmd_map;
 	struct sbitmap_queue	sess_tag_pool;
 	struct target_cmd_counter *cmd_cnt;
+	/*
+	 * Per-I_T-nexus se_session_deve join objects, one per mapped LUN.
+	 * RCU list; changed only under se_node_acl->lun_entry_mutex.
+	 */
+	struct list_head	deve_list;
+	/* Position in se_node_acl->ua_sess_list, under nacl->lun_entry_mutex */
+	struct list_head	ua_sess_link;
 };
 
 struct se_device;
@@ -695,6 +708,40 @@ struct se_dev_entry {
 	struct list_head	lun_link;
 	struct list_head	ua_list;
 	struct hlist_node	link;
+	struct rcu_head		rcu_head;
+	/*
+	 * Per-I_T-nexus se_session_deve join objects mapping this LUN.
+	 * RCU list; changed only under se_node_acl->lun_entry_mutex.
+	 */
+	struct list_head	sess_list;
+};
+
+/*
+ * Session-specific device entry: join object binding an active I_T nexus
+ * (se_session) to a mapped LUN (se_dev_entry), holding that nexus's own
+ * independent Unit Attention queue. One instance exists per session per
+ * LUN mapped to that session's node ACL. Entries are added to and removed
+ * from their two lists only under the node ACL's lun_entry_mutex, and freed
+ * with kfree_rcu().
+ */
+struct se_session_deve {
+	struct se_session	*se_sess;
+	struct se_dev_entry	*se_deve;
+	u64			mapped_lun;
+
+	spinlock_t		ua_lock;	/* protects ua_list and dead */
+	struct list_head	ua_list;
+	/*
+	 * Set by teardown once the entry is off both lists. No UA is queued on
+	 * a dead entry, and se_sess may already be freed.
+	 */
+	bool			dead;
+
+	/* Position in se_deve->sess_list and se_sess->deve_list (both RCU) */
+	struct list_head	deve_link;
+	struct list_head	sess_link;
+	/* Scratch anchor for teardown and moves, under nacl->lun_entry_mutex */
+	struct list_head	teardown_link;
 	struct rcu_head		rcu_head;
 };
 
