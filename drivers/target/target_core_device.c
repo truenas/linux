@@ -339,6 +339,8 @@ int core_enable_device_list_for_node(
 	spin_lock_init(&new->ua_lock);
 	INIT_LIST_HEAD(&new->ua_list);
 	INIT_LIST_HEAD(&new->lun_link);
+	spin_lock_init(&new->sess_list_lock);
+	INIT_LIST_HEAD(&new->sess_list);
 
 	new->mapped_lun = mapped_lun;
 	kref_init(&new->pr_kref);
@@ -373,6 +375,7 @@ int core_enable_device_list_for_node(
 
 		new->se_lun = lun;
 		new->se_lun_acl = lun_acl;
+		target_move_deve_sess_entries(orig, new);
 		hlist_del_rcu(&orig->link);
 		hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
 		mutex_unlock(&nacl->lun_entry_mutex);
@@ -392,6 +395,11 @@ int core_enable_device_list_for_node(
 
 	new->se_lun = lun;
 	new->se_lun_acl = lun_acl;
+	ret = target_setup_deve_sess_entries(nacl, new);
+	if (ret) {
+		mutex_unlock(&nacl->lun_entry_mutex);
+		goto free_stats;
+	}
 	hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
 	mutex_unlock(&nacl->lun_entry_mutex);
 

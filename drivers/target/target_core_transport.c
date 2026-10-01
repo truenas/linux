@@ -278,7 +278,10 @@ void transport_init_session(struct se_session *se_sess)
 {
 	INIT_LIST_HEAD(&se_sess->sess_list);
 	INIT_LIST_HEAD(&se_sess->sess_acl_list);
+	INIT_LIST_HEAD(&se_sess->deve_list);
+	INIT_LIST_HEAD(&se_sess->ua_sess_link);
 	spin_lock_init(&se_sess->sess_cmd_lock);
+	spin_lock_init(&se_sess->deve_list_lock);
 }
 EXPORT_SYMBOL(transport_init_session);
 
@@ -440,6 +443,28 @@ void __transport_register_session(
 }
 EXPORT_SYMBOL(__transport_register_session);
 
+/**
+ * transport_setup_session_ua - set up a session's per-LUN unit attention state
+ * @se_sess: session whose se_node_acl is already assigned
+ *
+ * Allocates one unit attention queue for each LUN mapped to the session's node
+ * ACL. LUNs mapped later get theirs when they are mapped. Takes
+ * nacl->lun_entry_mutex and allocates with GFP_KERNEL, so it must be called
+ * from process context and not under se_portal_group->session_lock.
+ * transport_register_session() calls it; a fabric that calls
+ * __transport_register_session() directly must call it first.
+ *
+ * On -ENOMEM the session still works for I/O, but gets no unit attentions
+ * until it reconnects.
+ */
+void transport_setup_session_ua(struct se_session *se_sess)
+{
+	if (target_setup_session_deve_entries(se_sess))
+		pr_err("Unable to allocate per-nexus UA queues for %s\n",
+		       se_sess->se_node_acl->initiatorname);
+}
+EXPORT_SYMBOL(transport_setup_session_ua);
+
 void transport_register_session(
 	struct se_portal_group *se_tpg,
 	struct se_node_acl *se_nacl,
@@ -447,6 +472,8 @@ void transport_register_session(
 	void *fabric_sess_ptr)
 {
 	unsigned long flags;
+
+	transport_setup_session_ua(se_sess);
 
 	spin_lock_irqsave(&se_tpg->session_lock, flags);
 	__transport_register_session(se_tpg, se_nacl, se_sess, fabric_sess_ptr);
@@ -595,6 +622,8 @@ EXPORT_SYMBOL(transport_deregister_session_configfs);
 void transport_free_session(struct se_session *se_sess)
 {
 	struct se_node_acl *se_nacl = se_sess->se_node_acl;
+
+	target_free_session_deve_entries(se_sess);
 
 	/*
 	 * Drop the se_node_acl->nacl_kref obtained from within
