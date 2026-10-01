@@ -39,6 +39,8 @@ extern void target_free_session_deve_entries(struct se_session *sess);
 extern sense_reason_t target_scsi3_ua_check(struct se_cmd *);
 extern int core_scsi3_ua_allocate_all(struct se_dev_entry *, u8, u8,
 				      struct se_session *);
+extern int target_ua_allocate_sess(struct se_session *, u64, u8, u8);
+extern int target_ua_allocate_sess_deve(struct se_session_deve *, u8, u8);
 extern void target_ua_allocate_lun(struct se_node_acl *, u32, u8, u8,
 				   struct se_session *);
 extern void core_scsi3_ua_release_all(struct se_dev_entry *);

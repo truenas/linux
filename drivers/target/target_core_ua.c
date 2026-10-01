@@ -314,6 +314,47 @@ static int __core_scsi3_ua_insert_sorted(struct se_session_deve *sess_deve,
 }
 
 /*
+ * Queue a Unit Attention with the given ASC/ASCQ on @sess_deve, unless the
+ * same one is already queued. Caller must hold sess_deve->ua_lock.
+ */
+static int __core_scsi3_ua_queue(struct se_session_deve *sess_deve,
+				 u8 asc, u8 ascq)
+{
+	struct se_ua *ua;
+
+	ua = kmem_cache_zalloc(se_ua_cache, GFP_ATOMIC);
+	if (!ua) {
+		pr_err("Unable to allocate struct se_ua\n");
+		return -ENOMEM;
+	}
+	INIT_LIST_HEAD(&ua->ua_nacl_list);
+	ua->ua_asc = asc;
+	ua->ua_ascq = ascq;
+
+	if (__core_scsi3_ua_insert_sorted(sess_deve, ua) < 0)
+		kmem_cache_free(se_ua_cache, ua);
+
+	return 0;
+}
+
+/*
+ * Raise a Unit Attention with the given ASC/ASCQ on one I_T nexus's queue
+ * for one LUN. Caller found @sess_deve on a se_dev_entry's sess_list and is
+ * still in the RCU read-side critical section that walk began.
+ */
+int target_ua_allocate_sess_deve(struct se_session_deve *sess_deve,
+				 u8 asc, u8 ascq)
+{
+	int rc;
+
+	spin_lock(&sess_deve->ua_lock);
+	rc = __core_scsi3_ua_queue(sess_deve, asc, ascq);
+	spin_unlock(&sess_deve->ua_lock);
+
+	return rc;
+}
+
+/*
  * Raise a Unit Attention with the given ASC/ASCQ on every I_T nexus
  * mapped to @deve, except @exclude_sess if non-NULL (pass NULL to
  * exclude nobody -- e.g. for administrative/config-time conditions
@@ -323,37 +364,45 @@ int core_scsi3_ua_allocate_all(struct se_dev_entry *deve, u8 asc, u8 ascq,
 			       struct se_session *exclude_sess)
 {
 	struct se_session_deve *sess_deve;
-	struct se_ua *ua;
-	int rc;
+	int rc = 0;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(sess_deve, &deve->sess_list, deve_link) {
 		if (exclude_sess && sess_deve->se_sess == exclude_sess)
 			continue;
 
-		ua = kmem_cache_zalloc(se_ua_cache, GFP_ATOMIC);
-		if (!ua) {
-			pr_err("Unable to allocate struct se_ua\n");
-			rcu_read_unlock();
-			return -ENOMEM;
-		}
-		INIT_LIST_HEAD(&ua->ua_nacl_list);
-		ua->ua_asc = asc;
-		ua->ua_ascq = ascq;
-
-		spin_lock(&sess_deve->ua_lock);
-		rc = __core_scsi3_ua_insert_sorted(sess_deve, ua);
-		spin_unlock(&sess_deve->ua_lock);
-
+		rc = target_ua_allocate_sess_deve(sess_deve, asc, ascq);
 		if (rc < 0)
-			kmem_cache_free(se_ua_cache, ua);
+			break;
 	}
 	rcu_read_unlock();
 
 	pr_debug("Allocated UNIT ATTENTION, mapped LUN: %llu, ASC:"
 		" 0x%02x, ASCQ: 0x%02x\n", deve->mapped_lun, asc, ascq);
 
-	return 0;
+	return rc;
+}
+
+/*
+ * Raise a Unit Attention with the given ASC/ASCQ on exactly this I_T
+ * nexus's own queue -- for conditions where the reporting nexus and
+ * the affected nexus are the same one, unlike core_scsi3_ua_allocate_all()
+ * which fans out to every other nexus mapped to the LUN.
+ */
+int target_ua_allocate_sess(struct se_session *sess, u64 mapped_lun,
+			    u8 asc, u8 ascq)
+{
+	struct se_session_deve *sess_deve;
+	int rc;
+
+	sess_deve = target_lookup_and_lock_sess_deve(sess, mapped_lun);
+	if (!sess_deve)
+		return 0;
+
+	rc = __core_scsi3_ua_queue(sess_deve, asc, ascq);
+	spin_unlock(&sess_deve->ua_lock);
+
+	return rc;
 }
 
 void target_ua_allocate_lun(struct se_node_acl *nacl,
