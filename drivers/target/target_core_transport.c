@@ -2139,10 +2139,9 @@ void transport_generic_request_failure(struct se_cmd *cmd,
 		if (cmd->se_sess &&
 		    cmd->se_dev->dev_attrib.emulate_ua_intlck_ctrl
 					== TARGET_UA_INTLCK_CTRL_ESTABLISH_UA) {
-			target_ua_allocate_lun(cmd->se_sess->se_node_acl,
-					       cmd->orig_fe_lun, 0x2C,
-					ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS,
-					NULL);
+			target_ua_allocate_sess(cmd->se_sess,
+						cmd->orig_fe_lun, 0x2C,
+					ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS);
 		}
 
 		goto queue_status;
