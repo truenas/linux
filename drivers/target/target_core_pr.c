@@ -67,6 +67,58 @@ enum preempt_type {
 static void __core_scsi3_complete_pro_release(struct se_device *, struct se_node_acl *,
 					      struct t10_pr_registration *, int, int);
 
+/*
+ * A registration records its I_T nexus as the node ACL (initiator name and
+ * target port) plus, when the fabric has one, the ISID. Return true if
+ * @sess is that nexus.
+ */
+static bool core_scsi3_pr_match_nexus(struct t10_pr_registration *pr_reg,
+				      struct se_session *sess)
+{
+	if (pr_reg->pr_reg_nacl != sess->se_node_acl)
+		return false;
+
+	if (pr_reg->isid_present_at_reg &&
+	    pr_reg->pr_reg_bin_isid != sess->sess_bin_isid)
+		return false;
+
+	return true;
+}
+
+/*
+ * Establish a unit attention condition on the logical unit of @pr_reg for
+ * every session that is its I_T nexus, other than @exclude_sess. Caller
+ * holds registration_lock, so @pr_reg cannot be freed under us.
+ */
+static void core_scsi3_pr_ua_allocate(struct t10_pr_registration *pr_reg,
+				      u8 asc, u8 ascq,
+				      struct se_session *exclude_sess)
+{
+	struct se_session_deve *sess_deve;
+	struct se_dev_entry *deve;
+
+	rcu_read_lock();
+	deve = target_nacl_find_deve(pr_reg->pr_reg_nacl,
+				     pr_reg->pr_res_mapped_lun);
+	if (deve) {
+		list_for_each_entry_rcu(sess_deve, &deve->sess_list, deve_link) {
+			if (sess_deve->se_sess == exclude_sess)
+				continue;
+			/*
+			 * The session may be freed once its entry is dead, so
+			 * match it only under ua_lock and on a live entry.
+			 */
+			spin_lock(&sess_deve->ua_lock);
+			if (!sess_deve->dead &&
+			    core_scsi3_pr_match_nexus(pr_reg, sess_deve->se_sess))
+				target_ua_allocate_sess_deve_locked(sess_deve,
+								    asc, ascq);
+			spin_unlock(&sess_deve->ua_lock);
+		}
+	}
+	rcu_read_unlock();
+}
+
 static int is_reservation_holder(
 	struct t10_pr_registration *pr_res_holder,
 	struct t10_pr_registration *pr_reg)
@@ -2294,12 +2346,9 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 					&pr_tmpl->registration_list,
 					pr_reg_list) {
 
-				target_ua_allocate_lun(
-					pr_reg_p->pr_reg_nacl,
-					pr_reg_p->pr_res_mapped_lun,
-					0x2A,
+				core_scsi3_pr_ua_allocate(pr_reg_p, 0x2A,
 					ASCQ_2AH_RESERVATIONS_RELEASED,
-					NULL);
+					se_sess);
 			}
 		}
 
@@ -2718,9 +2767,8 @@ core_scsi3_emulate_pro_release(struct se_cmd *cmd, int type, int scope,
 		if (pr_reg_p == pr_reg)
 			continue;
 
-		target_ua_allocate_lun(pr_reg_p->pr_reg_nacl,
-				pr_reg_p->pr_res_mapped_lun,
-				0x2A, ASCQ_2AH_RESERVATIONS_RELEASED, NULL);
+		core_scsi3_pr_ua_allocate(pr_reg_p, 0x2A,
+				ASCQ_2AH_RESERVATIONS_RELEASED, se_sess);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 
@@ -2737,11 +2785,9 @@ static sense_reason_t
 core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
 {
 	struct se_device *dev = cmd->se_dev;
-	struct se_node_acl *pr_reg_nacl;
 	struct se_session *se_sess = cmd->se_sess;
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
 	struct t10_pr_registration *pr_reg, *pr_reg_tmp, *pr_reg_n, *pr_res_holder;
-	u64 pr_res_mapped_lun = 0;
 	int calling_it_nexus = 0;
 	/*
 	 * Locate the existing *pr_reg via struct se_node_acl pointers
@@ -2791,10 +2837,6 @@ core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
 			&pr_tmpl->registration_list, pr_reg_list) {
 
 		calling_it_nexus = (pr_reg_n == pr_reg) ? 1 : 0;
-		pr_reg_nacl = pr_reg->pr_reg_nacl;
-		pr_res_mapped_lun = pr_reg->pr_res_mapped_lun;
-		__core_scsi3_free_registration(dev, pr_reg, NULL,
-					calling_it_nexus);
 		/*
 		 * e) Establish a unit attention condition for the initiator
 		 *    port associated with every registered I_T nexus other
@@ -2803,8 +2845,10 @@ core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
 		 *    additional sense code set to RESERVATIONS PREEMPTED.
 		 */
 		if (!calling_it_nexus)
-			target_ua_allocate_lun(pr_reg_nacl, pr_res_mapped_lun,
-				0x2A, ASCQ_2AH_RESERVATIONS_PREEMPTED, NULL);
+			core_scsi3_pr_ua_allocate(pr_reg, 0x2A,
+				ASCQ_2AH_RESERVATIONS_PREEMPTED, se_sess);
+		__core_scsi3_free_registration(dev, pr_reg, NULL,
+					calling_it_nexus);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 
@@ -3024,7 +3068,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 			if (!calling_it_nexus)
 				target_ua_allocate_lun(pr_reg_nacl,
 					pr_res_mapped_lun, 0x2A,
-					ASCQ_2AH_REGISTRATIONS_PREEMPTED, NULL);
+					ASCQ_2AH_REGISTRATIONS_PREEMPTED, se_sess);
 		}
 		spin_unlock(&pr_tmpl->registration_lock);
 		/*
@@ -3144,7 +3188,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 		 *    additional sense code set to REGISTRATIONS PREEMPTED;
 		 */
 		target_ua_allocate_lun(pr_reg_nacl, pr_res_mapped_lun, 0x2A,
-				ASCQ_2AH_REGISTRATIONS_PREEMPTED, NULL);
+				ASCQ_2AH_REGISTRATIONS_PREEMPTED, se_sess);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 	/*
@@ -3178,7 +3222,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 
 			target_ua_allocate_lun(pr_reg->pr_reg_nacl,
 					pr_reg->pr_res_mapped_lun, 0x2A,
-					ASCQ_2AH_RESERVATIONS_RELEASED, NULL);
+					ASCQ_2AH_RESERVATIONS_RELEASED, se_sess);
 		}
 		spin_unlock(&pr_tmpl->registration_lock);
 	}
