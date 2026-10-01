@@ -722,6 +722,7 @@ void iscsi_post_login_handler(
 
 	iscsit_determine_maxcmdsn(sess);
 
+	transport_setup_session_ua(se_sess);
 	spin_lock_bh(&se_tpg->session_lock);
 	__transport_register_session(&sess->tpg->tpg_se_tpg,
 			se_sess->se_node_acl, se_sess, sess);
