@@ -1403,10 +1403,13 @@ EXPORT_SYMBOL(skb_dump);
  *
  *	Report xmit error if a device callback is tracking this skb.
  *	skb must be freed afterwards.
+ *
+ *	Does nothing for a cloned skb: the zerocopy state lives in
+ *	skb_shinfo(), which the clones share.
  */
 void skb_tx_error(struct sk_buff *skb)
 {
-	if (skb) {
+	if (skb && !skb_cloned(skb)) {
 		skb_zcopy_downgrade_managed(skb);
 		skb_zcopy_clear(skb, true);
 	}
@@ -1964,11 +1967,11 @@ int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
 	int i, order, psize, new_frags;
 	u32 d_off;
 
-	if (skb_shared(skb) || skb_unclone(skb, gfp_mask))
-		return -EINVAL;
-
 	if (!skb_frags_readable(skb))
 		return -EFAULT;
+
+	if (skb_shared(skb) || skb_unclone(skb, gfp_mask))
+		return -EINVAL;
 
 	if (!num_frags)
 		goto release;
@@ -3844,10 +3847,9 @@ skb_zerocopy(struct sk_buff *to, struct sk_buff *from, int len, int hlen)
 
 	skb_len_add(to, len + plen);
 
-	if (unlikely(skb_orphan_frags(from, GFP_ATOMIC))) {
-		skb_tx_error(from);
+	if (unlikely(skb_orphan_frags(from, GFP_ATOMIC)))
 		return -ENOMEM;
-	}
+
 	skb_zerocopy_clone(to, from, GFP_ATOMIC);
 
 	for (i = 0; i < skb_shinfo(from)->nr_frags; i++) {
@@ -5839,7 +5841,8 @@ static int skb_checksum_setup_ipv6(struct sk_buff *skb, bool recalculate)
 			err = skb_maybe_pull_tail(skb,
 						  off +
 						  sizeof(struct ipv6_opt_hdr),
-						  MAX_IPV6_HDR_LEN);
+						  off +
+						  sizeof(struct ipv6_opt_hdr));
 			if (err < 0)
 				goto out;
 
@@ -5854,7 +5857,8 @@ static int skb_checksum_setup_ipv6(struct sk_buff *skb, bool recalculate)
 			err = skb_maybe_pull_tail(skb,
 						  off +
 						  sizeof(struct ip_auth_hdr),
-						  MAX_IPV6_HDR_LEN);
+						  off +
+						  sizeof(struct ip_auth_hdr));
 			if (err < 0)
 				goto out;
 
@@ -5869,7 +5873,8 @@ static int skb_checksum_setup_ipv6(struct sk_buff *skb, bool recalculate)
 			err = skb_maybe_pull_tail(skb,
 						  off +
 						  sizeof(struct frag_hdr),
-						  MAX_IPV6_HDR_LEN);
+						  off +
+						  sizeof(struct frag_hdr));
 			if (err < 0)
 				goto out;
 
@@ -6552,6 +6557,13 @@ int skb_mpls_pop(struct sk_buff *skb, __be16 next_proto, int mac_len,
 	}
 	skb->protocol = next_proto;
 
+	/* The last label is gone, so the inner header recorded by
+	 * skb_mpls_push() no longer describes this packet. Drop it, or a
+	 * later push keeps the stale offset.
+	 */
+	if (!eth_p_mpls(next_proto))
+		skb->inner_protocol = 0;
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(skb_mpls_pop);
@@ -6687,6 +6699,34 @@ failure:
 }
 EXPORT_SYMBOL(alloc_skb_with_frags);
 
+/* pskb_carve_inside_header() and pskb_carve_inside_nonlinear()
+ * remove the first bytes of a packet and reallocate skb->head.
+ *
+ * Whatever headers were present before the operation are gone,
+ * we must not leave stale offsets, otherwise users of this skb
+ * (skb_dump(), drop_monitor, taps, ...) would read or pull garbage.
+ */
+static void skb_carve_reset_headers(struct sk_buff *skb)
+{
+	skb_unset_mac_header(skb);
+	skb_unset_transport_header(skb);
+	skb_reset_network_header(skb);
+	skb->mac_len = 0;
+
+	/* Inner offsets have no "unset" marker, zero them so that
+	 * skb_inner_network_header_was_set() becomes false and no
+	 * consumer mistakes them for a real (and long gone) header.
+	 */
+	skb->inner_mac_header = 0;
+	skb->inner_network_header = 0;
+	skb->inner_transport_header = 0;
+	skb->inner_protocol = 0;
+	skb->encapsulation = 0;
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL)
+		skb->ip_summed = CHECKSUM_NONE;
+}
+
 /* carve out the first off bytes from skb when off < headlen */
 static int pskb_carve_inside_header(struct sk_buff *skb, const u32 off,
 				    const int headlen, gfp_t gfp_mask)
@@ -6742,7 +6782,7 @@ static int pskb_carve_inside_header(struct sk_buff *skb, const u32 off,
 	skb->head_frag = 0;
 	skb_set_end_offset(skb, size);
 	skb_set_tail_pointer(skb, skb_headlen(skb));
-	skb_headers_offset_update(skb, 0);
+	skb_carve_reset_headers(skb);
 	skb->cloned = 0;
 	skb->hdr_len = 0;
 	skb->nohdr = 0;
@@ -6883,7 +6923,7 @@ static int pskb_carve_inside_nonlinear(struct sk_buff *skb, const u32 off,
 	skb->data = data;
 	skb_set_end_offset(skb, size);
 	skb_reset_tail_pointer(skb);
-	skb_headers_offset_update(skb, 0);
+	skb_carve_reset_headers(skb);
 	skb->cloned   = 0;
 	skb->hdr_len  = 0;
 	skb->nohdr    = 0;

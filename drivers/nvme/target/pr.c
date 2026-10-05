@@ -201,7 +201,7 @@ static void nvmet_pr_resv_preempted(struct nvmet_pr *pr, uuid_t *hostid)
 		return;
 
 	nvmet_pr_send_event_to_host(pr, hostid,
-		NVME_PR_LOG_RESERVATOIN_PREEMPTED);
+		NVME_PR_LOG_RESERVATOPM_PREEMPTED);
 }
 
 static void nvmet_pr_registration_preempted(struct nvmet_pr *pr,
