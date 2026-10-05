@@ -729,7 +729,10 @@ static void ha_fwd_pers_action_handler(const void *buf, size_t len)
 	const struct lio_ha_msg_pers_action *msg = buf;
 	char dev_name[LIO_HA_DEV_NAME_LEN];
 	char initiator_name[LIO_HA_INITIATOR_NAME_LEN];
+	char initiator_sid[LIO_HA_ISID_LEN];
 	char fabric_name[LIO_HA_FABRIC_NAME_LEN];
+	char target_name[LIO_HA_INITIATOR_NAME_LEN];
+	struct lio_ha_pr_nexus nx;
 	u8   action;
 	u64  res_key, sa_res_key;
 	u8   res_type;
@@ -744,12 +747,20 @@ static void ha_fwd_pers_action_handler(const void *buf, size_t len)
 	res_type   = msg->res_type;
 	strscpy(dev_name, msg->dev_name, LIO_HA_DEV_NAME_LEN);
 	strscpy(initiator_name, msg->initiator_name, LIO_HA_INITIATOR_NAME_LEN);
+	strscpy(initiator_sid, msg->initiator_sid, LIO_HA_ISID_LEN);
 	strscpy(fabric_name, msg->fabric_name, LIO_HA_FABRIC_NAME_LEN);
+	strscpy(target_name, msg->target_name, LIO_HA_INITIATOR_NAME_LEN);
+
+	nx.initiator_name = initiator_name;
+	nx.initiator_sid  = initiator_sid;
+	nx.fabric_name    = fabric_name;
+	nx.target_name    = target_name;
+	nx.tpg_tag        = lio_ha_peer_tpg_tag(be16_to_cpu(msg->tpg_tag));
+	nx.all_tg_pt      = msg->all_tg_pt;
 
 	lio_ha_dbg(2, "PERS_ACTION: dev=%s initiator=%s action=%u\n",
 		   dev_name, initiator_name, action);
-	lio_ha_pr_apply(action, dev_name, initiator_name, fabric_name,
-			res_key, sa_res_key, res_type);
+	lio_ha_pr_apply(action, dev_name, &nx, res_key, sa_res_key, res_type);
 }
 
 /* ------------------------------------------------------------------ */
@@ -781,9 +792,17 @@ static void ha_fwd_lun_sync_handler(const void *buf, size_t len)
 	const char *aptpl_end;
 	const char *line;
 	u32 aptpl_len;
+	static const struct lio_ha_pr_nexus none = {
+		.initiator_name = "", .initiator_sid = "",
+		.fabric_name = "", .target_name = "",
+	};
 	/* Holder info: collected across all lines, applied last. */
 	char holder_name[LIO_HA_INITIATOR_NAME_LEN] = {};
+	char holder_sid[LIO_HA_ISID_LEN] = {};
 	char holder_fabric[LIO_HA_FABRIC_NAME_LEN] = {};
+	char holder_target[LIO_HA_INITIATOR_NAME_LEN] = {};
+	u16  holder_tag = 0;
+	bool holder_all_tg_pt = false;
 	u8   holder_type = 0;
 	bool have_holder = false;
 
@@ -799,7 +818,7 @@ static void ha_fwd_lun_sync_handler(const void *buf, size_t len)
 	strscpy(dev_name, msg->dev_name, LIO_HA_DEV_NAME_LEN);
 
 	/* Clear all existing PR entries for this device. */
-	lio_ha_pr_apply(LIO_HA_PR_CLEAR, dev_name, "", "", 0, 0, 0);
+	lio_ha_pr_apply(LIO_HA_PR_CLEAR, dev_name, &none, 0, 0, 0);
 
 	if (!aptpl_len)
 		return;
@@ -812,12 +831,17 @@ static void ha_fwd_lun_sync_handler(const void *buf, size_t len)
 	while (line < aptpl_end) {
 		char linebuf[512];
 		char initiator_name[LIO_HA_INITIATOR_NAME_LEN] = {};
+		char initiator_sid[LIO_HA_ISID_LEN] = {};
 		char fabric_name[LIO_HA_FABRIC_NAME_LEN] = {};
+		char target_name[LIO_HA_INITIATOR_NAME_LEN] = {};
+		struct lio_ha_pr_nexus nx;
 		const char *end;
 		char *tok, *rest;
 		size_t line_len;
 		u64 res_key = 0;
+		u16 tpg_tag = 0;
 		u8  res_holder = 0, res_type = 0;
+		bool all_tg_pt = false;
 		bool have_init = false;
 
 		end = memchr(line, '\n', aptpl_end - line);
@@ -848,6 +872,17 @@ static void ha_fwd_lun_sync_handler(const void *buf, size_t len)
 				strscpy(initiator_name, tok + 15,
 					LIO_HA_INITIATOR_NAME_LEN);
 				have_init = true;
+			} else if (!strncmp(tok, "initiator_sid=", 14)) {
+				strscpy(initiator_sid, tok + 14, LIO_HA_ISID_LEN);
+			} else if (!strncmp(tok, "target_node=", 12)) {
+				strscpy(target_name, tok + 12,
+					LIO_HA_INITIATOR_NAME_LEN);
+			} else if (!strncmp(tok, "tpgt=", 5)) {
+				if (!kstrtoul(tok + 5, 10, &v))
+					tpg_tag = lio_ha_peer_tpg_tag((u16)v);
+			} else if (!strncmp(tok, "res_all_tg_pt=", 14)) {
+				if (!kstrtoul(tok + 14, 10, &v))
+					all_tg_pt = !!v;
 			} else if (!strncmp(tok, "sa_res_key=", 11)) {
 				if (!kstrtoull(tok + 11, 10, &u))
 					res_key = u;
@@ -861,16 +896,27 @@ static void ha_fwd_lun_sync_handler(const void *buf, size_t len)
 		}
 
 		if (have_init && initiator_name[0] && res_key != 0) {
-			lio_ha_pr_apply(LIO_HA_PR_REGISTER, dev_name,
-					initiator_name, fabric_name,
+			nx.initiator_name = initiator_name;
+			nx.initiator_sid  = initiator_sid;
+			nx.fabric_name    = fabric_name;
+			nx.target_name    = target_name;
+			nx.tpg_tag        = tpg_tag;
+			nx.all_tg_pt      = all_tg_pt;
+			lio_ha_pr_apply(LIO_HA_PR_REGISTER, dev_name, &nx,
 					0, res_key, 0);
 			if (res_holder) {
 				strscpy(holder_name, initiator_name,
 					LIO_HA_INITIATOR_NAME_LEN);
+				strscpy(holder_sid, initiator_sid,
+					LIO_HA_ISID_LEN);
 				strscpy(holder_fabric, fabric_name,
 					LIO_HA_FABRIC_NAME_LEN);
-				holder_type  = res_type;
-				have_holder  = true;
+				strscpy(holder_target, target_name,
+					LIO_HA_INITIATOR_NAME_LEN);
+				holder_tag       = tpg_tag;
+				holder_all_tg_pt = all_tg_pt;
+				holder_type      = res_type;
+				have_holder      = true;
 			}
 		}
 
@@ -880,16 +926,26 @@ static void ha_fwd_lun_sync_handler(const void *buf, size_t len)
 	/*
 	 * RESERVE for the holder after all registrations are in.
 	 *
-	 * We track a single holder_name/holder_fabric pair.  LIO only sets
-	 * pr_res_holder=1 on the one registration that actually holds the
-	 * reservation; ALL_TG_PT replication creates additional registrations
-	 * for other ports but does not set pr_res_holder on them.  So
-	 * target_ha_pr_export() will emit at most one res_holder=1 line per
-	 * device, and the scalar holder_* variables are sufficient.
+	 * We track the holder's nexus.  LIO only sets pr_res_holder=1 on the
+	 * one registration that actually holds the reservation; ALL_TG_PT
+	 * replication creates additional registrations for other ports but
+	 * does not set pr_res_holder on them.  So target_ha_pr_export() will
+	 * emit at most one res_holder=1 line per device, and the scalar
+	 * holder_* variables are sufficient.
 	 */
-	if (have_holder)
-		lio_ha_pr_apply(LIO_HA_PR_RESERVE, dev_name, holder_name,
-				holder_fabric, 0, 0, holder_type);
+	if (have_holder) {
+		struct lio_ha_pr_nexus nx = {
+			.initiator_name = holder_name,
+			.initiator_sid  = holder_sid,
+			.fabric_name    = holder_fabric,
+			.target_name    = holder_target,
+			.tpg_tag        = holder_tag,
+			.all_tg_pt      = holder_all_tg_pt,
+		};
+
+		lio_ha_pr_apply(LIO_HA_PR_RESERVE, dev_name, &nx,
+				0, 0, holder_type);
+	}
 }
 
 /*

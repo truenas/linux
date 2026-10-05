@@ -34,12 +34,20 @@ extern int lio_ha_debug;
  * TPG tag offset between Node A and Node B (must match
  * REL_TGT_ID_NODEB_OFFSET in middlewared/utils/iscsi/constants.py).
  * Node A tags are always < this value; Node B tags are always >= it.
- * Used by ha_main_session_create() to translate STANDBY's local TPG tag
- * to the corresponding real TPG tag on ACTIVE before sending
- * SESSION_CONNECT, so ACTIVE's target_ha_lookup_tpg() finds the right
- * TPG and node_acl rather than the portal-less phantom TPG.
+ *
+ * Messages carry the sender's own tag.  A receiver translates it with
+ * lio_ha_peer_tpg_tag() to the tag of the same TPG on its own node, so
+ * that target_ha_lookup_tpg() finds the real TPG and node_acl rather than
+ * the portal-less phantom TPG.
  */
 #define LIO_HA_NODE_B_TPG_OFFSET  32000
+
+static inline u16 lio_ha_peer_tpg_tag(u16 tag)
+{
+	return tag >= LIO_HA_NODE_B_TPG_OFFSET ?
+		tag - LIO_HA_NODE_B_TPG_OFFSET :
+		tag + LIO_HA_NODE_B_TPG_OFFSET;
+}
 
 enum lio_ha_state {
 	LIO_HA_DISCONNECTED = 0,
@@ -75,8 +83,8 @@ extern struct lio_ha_cfg lio_ha_cfg;
  * lio_ha_pr_apply - update the replicated PR table on STANDBY
  * @action:         enum lio_ha_pr_action value
  * @dev_name:       storage object name (e.g. "iblock_0/disk0")
- * @initiator_name: IQN or WWPN of the initiator whose key changed
- * @fabric_name:    fabric driver name (e.g. "iscsi", "qla2xxx")
+ * @nx:             the I_T nexus the change applies to; @nx->tpg_tag must
+ *                  already be in this node's numbering
  * @res_key:        RESERVATION KEY from the PR OUT parameter list
  * @sa_res_key:     SERVICE ACTION RESERVATION KEY
  * @res_type:       reservation type (0 if not applicable)
@@ -86,8 +94,9 @@ extern struct lio_ha_cfg lio_ha_cfg;
  * state arrives.  Updates the in-memory replicated PR table (defined in
  * lio_ha_main.c) according to @action.
  */
+struct lio_ha_pr_nexus;
 void lio_ha_pr_apply(u8 action, const char *dev_name,
-		     const char *initiator_name, const char *fabric_name,
+		     const struct lio_ha_pr_nexus *nx,
 		     u64 res_key, u64 sa_res_key, u8 res_type);
 
 #endif /* _LIO_HA_H */

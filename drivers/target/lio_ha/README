@@ -161,7 +161,9 @@ MESSAGE TYPES
 
 SESSION_CONNECT (S->A)
   Sent when an initiator connects to a STANDBY target.  Carries
-  the initiator IQN/WWPN, target IQN/WWPN, fabric name, and TPG tag.
+  the initiator IQN/WWPN, the initiator's nexus discriminator (the
+  iSCSI/iSER ISID; empty for fabrics without one), target IQN/WWPN,
+  fabric name, and TPG tag.
   ACTIVE calls target_ha_lookup_tpg() to find the matching TPG,
   looks up the node_acl for initiator_name, and creates a synthetic
   se_session keyed by STANDBY's se_session pointer (session_id).
@@ -173,12 +175,13 @@ SESSION_CONNECT (S->A)
 
   TPG tag translation: each target has a real TPG and a portal-less
   phantom TPG on each node.  Node A real tags are < LIO_HA_NODE_B_TPG_OFFSET
-  (32000); Node B real tags are >= it.  STANDBY translates its local
-  real TPG tag to the peer (ACTIVE) tag before sending SESSION_CONNECT:
-  if local_tag >= 32000, peer_tag = local_tag - 32000; otherwise
-  peer_tag = local_tag + 32000.  This ensures ACTIVE's lookup finds
-  the real TPG (which holds the initiator's node_acl) rather than the
-  phantom TPG (which has no real ACLs and no portals).
+  (32000); Node B real tags are >= it.  Every TPG tag on the wire is
+  the sender's own.  The receiver translates it with
+  lio_ha_peer_tpg_tag(): if tag >= 32000, translated = tag - 32000;
+  otherwise translated = tag + 32000.  This ensures ACTIVE's lookup
+  finds the real TPG (which holds the initiator's node_acl) rather than
+  the phantom TPG (which has no real ACLs and no portals).  The same
+  rule applies to PERS_ACTION and to the tpgt= field of LUN_SYNC.
 
   SESSION_CONNECT replay on link recovery: STANDBY maintains a
   shadow session list (ha_main_sess_list, protected by
@@ -227,9 +230,12 @@ TMR_RESPONSE (A->S)
 PERS_ACTION (A->S)
   Sent after each successful PR OUT executed on ACTIVE.
   Fire-and-forget -- no ACK.  Carries the PR action code, RESERVATION
-  KEY, SERVICE ACTION RESERVATION KEY, reservation type, initiator
-  name, device name, and fabric name.  STANDBY calls
-  lio_ha_pr_apply() to update its replicated in-memory PR table.
+  KEY, SERVICE ACTION RESERVATION KEY, reservation type, and the I_T
+  nexus the change applies to: initiator name, nexus discriminator
+  (ISID, empty if the fabric has none), fabric name, target name, TPG
+  tag and the ALL_TG_PT flag; plus the device name.  STANDBY translates
+  the tag and calls lio_ha_pr_apply() to update its replicated in-memory
+  PR table, which is keyed on the full nexus.
 
 LUN_SYNC (A->S)
   Sent by ACTIVE when the TCP link comes up, once per storage object.
@@ -374,12 +380,16 @@ sequence is:
             device and copied into a local snapshot (to avoid
             holding lio_ha_pr_lock across LIO core calls).
 
-        ii. For each registrant, target_ha_foreach_nacl_dev() finds
-            the (nacl, lun, mapped_lun) tuple in the LIO TPG
-            configuration, and target_ha_pr_add_reg() installs the
-            PR registration directly into LIO core.  Non-holders
-            are restored first; the holder last so the reservation
-            is set after all registrants exist.
+        ii. For each registrant, the TPG it was made on is resolved
+            with target_ha_lookup_tpg(); target_ha_foreach_tpg_nacl_dev()
+            finds the (nacl, lun, mapped_lun) tuple there, and
+            target_ha_pr_add_reg() installs the PR registration, with
+            its ISID, directly into LIO core.  For ALL_TG_PT
+            registrations target_ha_foreach_nacl_dev() also recreates
+            the sibling registrations on the initiator's other ports.
+            If the TPG cannot be resolved the registration is skipped
+            with a warning.  Non-holders are restored first; the holder
+            last so the reservation is set after all registrants exist.
 
         iii.target_ha_reopen_backend() calls configure_device() on
             the iblock or fileio backend to open the block device

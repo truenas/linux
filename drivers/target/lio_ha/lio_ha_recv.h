@@ -53,7 +53,10 @@ void lio_ha_recv_exit(void);
  * @initiator_name: IQN or WWPN string from SESSION_CONNECT
  * @session_id:     opaque u64 (STANDBY's se_sess pointer) for routing
  * @target_name:    IQN or WWPN of the target TPG from SESSION_CONNECT
- * @tpg_tag:        portal group tag from SESSION_CONNECT
+ * @tpg_tag:        portal group tag of the real TPG on this node, i.e.
+ *                  the tag from SESSION_CONNECT already translated
+ * @initiator_sid:  fabric-provided nexus discriminator from SESSION_CONNECT
+ *                  (iSCSI/iSER ISID); empty if the fabric has none
  * @fabric_name:    fabric driver name (e.g. "iscsi", "qla2xxx")
  *
  * Looks up the real target TPG and node_acl so the synthetic session gets
@@ -66,6 +69,7 @@ void lio_ha_recv_exit(void);
  */
 int  lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 				const char *target_name, u16 tpg_tag,
+				const char *initiator_sid,
 				const char *fabric_name);
 
 /**

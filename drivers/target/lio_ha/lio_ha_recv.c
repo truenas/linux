@@ -87,6 +87,7 @@ static DEFINE_SPINLOCK(ha_recv_sess_lock);
 struct ha_recv_sess_entry {
 	u64			session_id;
 	struct se_session      *se_sess;
+	char			initiator_sid[LIO_HA_ISID_LEN];
 	struct hlist_node	node;
 };
 
@@ -139,6 +140,22 @@ static int ha_recv_tpg_check_demo_mode(struct se_portal_group *tpg)
 static int ha_recv_tpg_check_demo_mode_cache(struct se_portal_group *tpg)
 {
 	return 0;
+}
+
+/*
+ * Report the nexus discriminator STANDBY sent in SESSION_CONNECT, so the
+ * generic PR code records and looks up forwarded sessions' registrations
+ * exactly as it does for a real session.  fabric_sess_ptr is cleared when
+ * the session is deregistered.
+ */
+static u32 ha_recv_sess_get_initiator_sid(struct se_session *se_sess,
+					  unsigned char *buf, u32 size)
+{
+	struct ha_recv_sess_entry *e = se_sess->fabric_sess_ptr;
+
+	if (!e)
+		return 0;
+	return snprintf(buf, size, "%s", e->initiator_sid);
 }
 
 /*
@@ -367,6 +384,7 @@ static const struct target_core_fabric_ops ha_recv_ops = {
 	.tpg_get_tag			= ha_recv_tpg_get_tag,
 	.tpg_check_demo_mode		= ha_recv_tpg_check_demo_mode,
 	.tpg_check_demo_mode_cache	= ha_recv_tpg_check_demo_mode_cache,
+	.sess_get_initiator_sid		= ha_recv_sess_get_initiator_sid,
 	.check_stop_free		= ha_recv_check_stop_free,
 	.release_cmd			= ha_recv_release_cmd,
 	/*
@@ -494,6 +512,7 @@ static void ha_recv_tmr_forward_handler(const void *buf, size_t len)
 
 int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 			       const char *target_name, u16 tpg_tag,
+			       const char *initiator_sid,
 			       const char *fabric_name)
 {
 	struct ha_recv_sess_entry *e, *existing;
@@ -521,6 +540,8 @@ int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
 	if (!e)
 		return -ENOMEM;
+	/* Must be set before registration, which reads it. */
+	strscpy(e->initiator_sid, initiator_sid, LIO_HA_ISID_LEN);
 
 	/*
 	 * Look up the real target TPG by fabric identity so the synthetic
@@ -610,6 +631,7 @@ static void ha_recv_session_connect_handler(const void *buf, size_t len)
 	const struct lio_ha_msg_session_connect *msg = buf;
 	char initiator_name[LIO_HA_INITIATOR_NAME_LEN];
 	char target_name[LIO_HA_INITIATOR_NAME_LEN];
+	char initiator_sid[LIO_HA_ISID_LEN];
 	char fabric_name[LIO_HA_FABRIC_NAME_LEN];
 	u64 session_id;
 	u16 tpg_tag;
@@ -621,7 +643,7 @@ static void ha_recv_session_connect_handler(const void *buf, size_t len)
 	}
 
 	session_id = be64_to_cpu(msg->session_id);
-	tpg_tag    = be16_to_cpu(msg->tpg_tag);
+	tpg_tag    = lio_ha_peer_tpg_tag(be16_to_cpu(msg->tpg_tag));
 
 	/* Copy with defensive NUL-termination. */
 	memcpy(initiator_name, msg->initiator_name, LIO_HA_INITIATOR_NAME_LEN);
@@ -630,11 +652,15 @@ static void ha_recv_session_connect_handler(const void *buf, size_t len)
 	memcpy(target_name, msg->target_name, LIO_HA_INITIATOR_NAME_LEN);
 	target_name[LIO_HA_INITIATOR_NAME_LEN - 1] = '\0';
 
+	memcpy(initiator_sid, msg->initiator_sid, LIO_HA_ISID_LEN);
+	initiator_sid[LIO_HA_ISID_LEN - 1] = '\0';
+
 	memcpy(fabric_name, msg->fabric_name, LIO_HA_FABRIC_NAME_LEN);
 	fabric_name[LIO_HA_FABRIC_NAME_LEN - 1] = '\0';
 
 	lio_ha_recv_session_create(initiator_name, session_id,
-				   target_name, tpg_tag, fabric_name);
+				   target_name, tpg_tag, initiator_sid,
+				   fabric_name);
 }
 
 /*

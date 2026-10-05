@@ -26,6 +26,11 @@
 
 #include <linux/types.h>
 
+/*
+ * Every TPG tag carried in a message is the sender's own tag; the receiver
+ * translates it to its own numbering (lio_ha_peer_tpg_tag()).
+ */
+
 /* ------------------------------------------------------------------ */
 /* Wire header (8 bytes, present on every message)                    */
 /* ------------------------------------------------------------------ */
@@ -108,6 +113,9 @@ struct lio_ha_msg_hdr {
  */
 #define LIO_HA_FABRIC_NAME_LEN  32
 
+/* Matches PR_REG_ISID_LEN in target_core_base.h. */
+#define LIO_HA_ISID_LEN  16
+
 /* Maximum CDB length (SPC-4 table 1: 32 bytes for variable-length CDBs) */
 #define LIO_HA_CDB_LEN  32
 
@@ -137,10 +145,12 @@ struct lio_ha_data_hdr {
 struct lio_ha_msg_session_connect {
 	struct lio_ha_msg_hdr hdr;          /* type = LIO_HA_MSG_SESSION_CONNECT */
 	__be64                session_id;   /* STANDBY's se_sess pointer; opaque */
-	__be16                tpg_tag;      /* portal group tag from tpg_get_tag() */
+	__be16                tpg_tag;      /* sender's portal group tag, tpg_get_tag() */
 	u8                    pad[6];       /* reserved, must be zero */
 	char initiator_name[LIO_HA_INITIATOR_NAME_LEN]; /* IQN or WWPN, NUL-terminated */
 	char target_name[LIO_HA_INITIATOR_NAME_LEN];    /* IQN or WWPN of target */
+	/* Fabric-provided nexus discriminator (iSCSI/iSER ISID); empty if none */
+	char initiator_sid[LIO_HA_ISID_LEN];
 	char fabric_name[LIO_HA_FABRIC_NAME_LEN];       /* e.g. "iscsi", "qla2xxx" */
 };
 
@@ -251,10 +261,14 @@ struct lio_ha_msg_pers_action {
 	struct lio_ha_msg_hdr hdr;    /* type = LIO_HA_MSG_PERS_ACTION */
 	__be32 action;                /* enum lio_ha_pr_action; values match SPC PR OUT sa codes */
 	u8     res_type;              /* reservation type field from CDB */
-	u8     pad[3];
+	u8     all_tg_pt;             /* registration made with ALL_TG_PT set */
+	__be16 tpg_tag;               /* sender's tag of the registration's TPG */
 	__be64 res_key;               /* RESERVATION KEY */
 	__be64 sa_res_key;            /* SERVICE ACTION RESERVATION KEY */
 	char   initiator_name[LIO_HA_INITIATOR_NAME_LEN];  /* whose key changed */
+	/* Nexus discriminator (iSCSI/iSER ISID); empty if the fabric has none */
+	char   initiator_sid[LIO_HA_ISID_LEN];
+	char   target_name[LIO_HA_INITIATOR_NAME_LEN];     /* target of the reg */
 	char   dev_name[LIO_HA_DEV_NAME_LEN];              /* storage object */
 	char   fabric_name[LIO_HA_FABRIC_NAME_LEN];        /* fabric driver name */
 };

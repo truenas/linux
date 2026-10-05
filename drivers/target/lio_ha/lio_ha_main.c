@@ -81,7 +81,11 @@ static const char * const ha_state_names[] = {
 struct lio_ha_pr_entry {
 	char             dev_name[LIO_HA_DEV_NAME_LEN];
 	char             initiator_name[LIO_HA_INITIATOR_NAME_LEN];
+	char             initiator_sid[LIO_HA_ISID_LEN];
 	char             fabric_name[LIO_HA_FABRIC_NAME_LEN];
+	char             target_name[LIO_HA_INITIATOR_NAME_LEN];
+	u16              tpg_tag;     /* this node's numbering */
+	bool             all_tg_pt;
 	u64              res_key;
 	u8               res_holder;  /* 1 if this entry holds the reservation */
 	u8               res_type;    /* reservation type (valid when res_holder) */
@@ -96,7 +100,11 @@ struct lio_ha_pr_work {
 	struct work_struct work;
 	char               dev_name[LIO_HA_DEV_NAME_LEN];
 	char               initiator_name[LIO_HA_INITIATOR_NAME_LEN];
+	char               initiator_sid[LIO_HA_ISID_LEN];
 	char               fabric_name[LIO_HA_FABRIC_NAME_LEN];
+	char               target_name[LIO_HA_INITIATOR_NAME_LEN];
+	u16                tpg_tag;     /* this (the sending) node's numbering */
+	bool               all_tg_pt;
 	u64                res_key;
 	u64                sa_res_key;
 	u8                 action;
@@ -119,6 +127,7 @@ struct ha_main_sess_entry {
 	u16  tpg_tag;
 	char initiator_name[LIO_HA_INITIATOR_NAME_LEN];
 	char target_name[LIO_HA_INITIATOR_NAME_LEN];
+	char initiator_sid[LIO_HA_ISID_LEN];
 	char fabric_name[LIO_HA_FABRIC_NAME_LEN];
 	struct list_head list;
 };
@@ -158,6 +167,73 @@ static void ha_main_pr_table_flush(void)
 }
 
 /*
+ * A table entry is for the same I_T nexus when initiator, discriminator and
+ * target port all match.  An ALL_TG_PT entry also stands for the sibling
+ * registrations LIO creates on the initiator's other ports (no
+ * discriminator, so any session of that initiator matches them), so it
+ * covers any nexus of the same initiator.
+ */
+static bool ha_pr_entry_exact(const struct lio_ha_pr_entry *e,
+			      const struct lio_ha_pr_nexus *nx)
+{
+	return !strncmp(e->initiator_name, nx->initiator_name,
+			LIO_HA_INITIATOR_NAME_LEN) &&
+	       !strncmp(e->initiator_sid, nx->initiator_sid ?: "",
+			LIO_HA_ISID_LEN) &&
+	       !strncmp(e->target_name, nx->target_name,
+			LIO_HA_INITIATOR_NAME_LEN) &&
+	       e->tpg_tag == nx->tpg_tag;
+}
+
+static bool ha_pr_entry_covers(const struct lio_ha_pr_entry *e,
+			       const struct lio_ha_pr_nexus *nx)
+{
+	return ha_pr_entry_exact(e, nx) ||
+	       (e->all_tg_pt &&
+		!strncmp(e->initiator_name, nx->initiator_name,
+			 LIO_HA_INITIATOR_NAME_LEN));
+}
+
+/* Caller holds lio_ha_pr_lock. */
+static struct lio_ha_pr_entry *ha_pr_find(const char *dev_name,
+					  const struct lio_ha_pr_nexus *nx)
+{
+	struct lio_ha_pr_entry *e, *covering = NULL;
+
+	list_for_each_entry(e, &lio_ha_pr_table, list) {
+		if (strncmp(e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN) != 0)
+			continue;
+		if (ha_pr_entry_exact(e, nx))
+			return e;
+		if (!covering && ha_pr_entry_covers(e, nx))
+			covering = e;
+	}
+	return covering;
+}
+
+/*
+ * Make @holder (which may be NULL) the reservation holder of @dev_name
+ * and clear the flag on every other entry of the device.
+ * Caller holds lio_ha_pr_lock.
+ */
+static void ha_pr_set_holder(const char *dev_name,
+			     const struct lio_ha_pr_entry *holder, u8 res_type)
+{
+	struct lio_ha_pr_entry *e;
+
+	list_for_each_entry(e, &lio_ha_pr_table, list) {
+		if (strncmp(e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN) != 0)
+			continue;
+		if (e == holder) {
+			e->res_holder = 1;
+			e->res_type   = res_type;
+		} else {
+			e->res_holder = 0;
+		}
+	}
+}
+
+/*
  * lio_ha_pr_apply - update the replicated PR table
  *
  * Called on STANDBY from ha_fwd_pers_action_handler() when a
@@ -166,7 +242,7 @@ static void ha_main_pr_table_flush(void)
  * GFP_KERNEL is fine.
  */
 void lio_ha_pr_apply(u8 action, const char *dev_name,
-		     const char *initiator_name, const char *fabric_name,
+		     const struct lio_ha_pr_nexus *nx,
 		     u64 res_key, u64 sa_res_key, u8 res_type)
 {
 	struct lio_ha_pr_entry *e, *tmp, *new_e = NULL;
@@ -201,59 +277,56 @@ void lio_ha_pr_apply(u8 action, const char *dev_name,
 	case LIO_HA_PR_REGISTER_AND_IGNORE:
 		/* REGISTER_AND_IGNORE: same table update as REGISTER. */
 		fallthrough;
-	case LIO_HA_PR_REGISTER: {
-		bool found = false;
+	case LIO_HA_PR_REGISTER:
+		e = ha_pr_find(dev_name, nx);
+		if (e && sa_res_key != 0) {
+			e->res_key = sa_res_key;
+		} else if (e) {
+			bool all_tg_pt = e->all_tg_pt;
+			char initiator_name[LIO_HA_INITIATOR_NAME_LEN];
 
-		list_for_each_entry(e, &lio_ha_pr_table, list) {
-			if (strncmp(e->dev_name, dev_name,
-				    LIO_HA_DEV_NAME_LEN) == 0 &&
-			    strncmp(e->initiator_name, initiator_name,
-				    LIO_HA_INITIATOR_NAME_LEN) == 0) {
-				found = true;
-				if (sa_res_key == 0)
-					list_move(&e->list, &free_list);
-				else
-					e->res_key = sa_res_key;
-				break;
-			}
-		}
-		if (!found && sa_res_key != 0 && new_e) {
-			strscpy(new_e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN);
-			strscpy(new_e->initiator_name, initiator_name,
+			strscpy(initiator_name, e->initiator_name,
 				LIO_HA_INITIATOR_NAME_LEN);
-			strscpy(new_e->fabric_name, fabric_name,
+			list_move(&e->list, &free_list);
+			/* Unregistering an ALL_TG_PT registrant drops its siblings. */
+			if (all_tg_pt) {
+				list_for_each_entry_safe(e, tmp, &lio_ha_pr_table, list) {
+					if (e->all_tg_pt &&
+					    !strncmp(e->dev_name, dev_name,
+						     LIO_HA_DEV_NAME_LEN) &&
+					    !strncmp(e->initiator_name,
+						     initiator_name,
+						     LIO_HA_INITIATOR_NAME_LEN))
+						list_move(&e->list, &free_list);
+				}
+			}
+		} else if (sa_res_key != 0 && new_e) {
+			strscpy(new_e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN);
+			strscpy(new_e->initiator_name, nx->initiator_name,
+				LIO_HA_INITIATOR_NAME_LEN);
+			strscpy(new_e->initiator_sid, nx->initiator_sid ?: "",
+				LIO_HA_ISID_LEN);
+			strscpy(new_e->fabric_name, nx->fabric_name,
 				LIO_HA_FABRIC_NAME_LEN);
-			new_e->res_key = sa_res_key;
+			strscpy(new_e->target_name, nx->target_name,
+				LIO_HA_INITIATOR_NAME_LEN);
+			new_e->tpg_tag   = nx->tpg_tag;
+			new_e->all_tg_pt = nx->all_tg_pt;
+			new_e->res_key   = sa_res_key;
 			list_add_tail(&new_e->list, &lio_ha_pr_table);
 			new_e = NULL;
 		}
 		break;
-	}
+
 	case LIO_HA_PR_RESERVE:
-		list_for_each_entry(e, &lio_ha_pr_table, list) {
-			if (strncmp(e->dev_name, dev_name,
-				    LIO_HA_DEV_NAME_LEN) != 0)
-				continue;
-			if (strncmp(e->initiator_name, initiator_name,
-				    LIO_HA_INITIATOR_NAME_LEN) == 0) {
-				e->res_holder = 1;
-				e->res_type   = res_type;
-			} else {
-				e->res_holder = 0;
-			}
-		}
+		ha_pr_set_holder(dev_name, ha_pr_find(dev_name, nx), res_type);
 		break;
 
 	case LIO_HA_PR_RELEASE:
-		list_for_each_entry(e, &lio_ha_pr_table, list) {
-			if (strncmp(e->dev_name, dev_name,
-				    LIO_HA_DEV_NAME_LEN) == 0 &&
-			    strncmp(e->initiator_name, initiator_name,
-				    LIO_HA_INITIATOR_NAME_LEN) == 0) {
-				e->res_holder = 0;
-				e->res_type   = 0;
-				break;
-			}
+		e = ha_pr_find(dev_name, nx);
+		if (e) {
+			e->res_holder = 0;
+			e->res_type   = 0;
 		}
 		break;
 
@@ -277,18 +350,7 @@ void lio_ha_pr_apply(u8 action, const char *dev_name,
 			    e->res_key == sa_res_key)
 				list_move(&e->list, &free_list);
 		}
-		list_for_each_entry(e, &lio_ha_pr_table, list) {
-			if (strncmp(e->dev_name, dev_name,
-				    LIO_HA_DEV_NAME_LEN) != 0)
-				continue;
-			if (strncmp(e->initiator_name, initiator_name,
-				    LIO_HA_INITIATOR_NAME_LEN) == 0) {
-				e->res_holder = 1;
-				e->res_type   = res_type;
-			} else {
-				e->res_holder = 0;
-			}
-		}
+		ha_pr_set_holder(dev_name, ha_pr_find(dev_name, nx), res_type);
 		break;
 	}
 
@@ -313,7 +375,11 @@ static void ha_main_pr_work_fn(struct work_struct *work)
 	msg.res_type   = pw->res_type;
 	msg.res_key    = cpu_to_be64(pw->res_key);
 	msg.sa_res_key = cpu_to_be64(pw->sa_res_key);
+	msg.all_tg_pt  = pw->all_tg_pt;
+	msg.tpg_tag    = cpu_to_be16(pw->tpg_tag);
 	strscpy(msg.initiator_name, pw->initiator_name, LIO_HA_INITIATOR_NAME_LEN);
+	strscpy(msg.initiator_sid, pw->initiator_sid, LIO_HA_ISID_LEN);
+	strscpy(msg.target_name, pw->target_name, LIO_HA_INITIATOR_NAME_LEN);
 	strscpy(msg.dev_name, pw->dev_name, LIO_HA_DEV_NAME_LEN);
 	strscpy(msg.fabric_name, pw->fabric_name, LIO_HA_FABRIC_NAME_LEN);
 
@@ -332,11 +398,10 @@ static void ha_main_pr_work_fn(struct work_struct *work)
 /* ACTIVE so ACTIVE creates / destroys the matching synthetic        */
 /* se_session with correct LUN mappings.                              */
 /*                                                                     */
-/* SESSION_CONNECT carries ACTIVE's real TPG tag, not STANDBY's.     */
-/* Node A tags are < LIO_HA_NODE_B_TPG_OFFSET; Node B tags are >=.  */
-/* STANDBY translates: peer_tag = local_tag +/- LIO_HA_NODE_B_TPG_OFFSET. */
-/* This lets ACTIVE's target_ha_lookup_tpg() find the real TPG       */
-/* (with the initiator's node_acl) rather than the phantom TPG.      */
+/* SESSION_CONNECT carries STANDBY's own TPG tag; ACTIVE translates  */
+/* it with lio_ha_peer_tpg_tag() so that target_ha_lookup_tpg() finds */
+/* the real TPG (with the initiator's node_acl) rather than the       */
+/* phantom TPG.                                                        */
 /*                                                                     */
 /* Skips internal TPGs (se_tpg_wwn=NULL, e.g. ha_recv itself) and    */
 /* skips when forward_active=0 (ACTIVE mode or idle).                */
@@ -347,8 +412,8 @@ static void ha_main_session_create(struct se_session *sess)
 	struct se_portal_group *tpg = sess->se_tpg;
 	struct ha_main_sess_entry *se;
 	struct lio_ha_msg_session_connect msg = {};
+	char isid_buf[LIO_HA_ISID_LEN] = "";
 	const char *wwn;
-	u16 local_tag, peer_tag;
 
 	if (!atomic_read(&lio_ha_forward_active))
 		return;
@@ -362,18 +427,9 @@ static void ha_main_session_create(struct se_session *sess)
 	if (!wwn)
 		return;
 
-	/*
-	 * Translate STANDBY's local TPG tag to ACTIVE's real TPG tag.
-	 * Node A tags are < LIO_HA_NODE_B_TPG_OFFSET; Node B tags are >=.
-	 * Sending ACTIVE's tag lets target_ha_lookup_tpg() on ACTIVE find
-	 * the real TPG (with the initiator's node_acl) instead of the
-	 * portal-less phantom TPG which carries no real ACLs.
-	 */
-	local_tag = tpg->se_tpg_tfo->tpg_get_tag(tpg);
-	if (local_tag >= LIO_HA_NODE_B_TPG_OFFSET)
-		peer_tag = local_tag - LIO_HA_NODE_B_TPG_OFFSET;
-	else
-		peer_tag = local_tag + LIO_HA_NODE_B_TPG_OFFSET;
+	if (tpg->se_tpg_tfo->sess_get_initiator_sid)
+		tpg->se_tpg_tfo->sess_get_initiator_sid(sess, isid_buf,
+							LIO_HA_ISID_LEN);
 
 	/*
 	 * Track this session so SESSION_CONNECT can be replayed on TCP link
@@ -385,9 +441,10 @@ static void ha_main_session_create(struct se_session *sess)
 	se = kzalloc(sizeof(*se), GFP_ATOMIC);
 	if (se) {
 		se->session_id = (u64)(uintptr_t)sess;
-		se->tpg_tag    = peer_tag;
+		se->tpg_tag    = tpg->se_tpg_tfo->tpg_get_tag(tpg);
 		strscpy(se->initiator_name, sess->se_node_acl->initiatorname,
 			LIO_HA_INITIATOR_NAME_LEN);
+		strscpy(se->initiator_sid, isid_buf, LIO_HA_ISID_LEN);
 		strscpy(se->target_name, wwn, LIO_HA_INITIATOR_NAME_LEN);
 		strscpy(se->fabric_name, tpg->se_tpg_tfo->fabric_name,
 			LIO_HA_FABRIC_NAME_LEN);
@@ -401,11 +458,12 @@ static void ha_main_session_create(struct se_session *sess)
 
 	msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_CONNECT);
 	msg.session_id = cpu_to_be64((u64)(uintptr_t)sess);
-	msg.tpg_tag    = cpu_to_be16(peer_tag);
+	msg.tpg_tag    = cpu_to_be16(tpg->se_tpg_tfo->tpg_get_tag(tpg));
 	/* pad[6] is zero from the initialiser */
 	strscpy(msg.initiator_name, sess->se_node_acl->initiatorname,
 		LIO_HA_INITIATOR_NAME_LEN);
 	strscpy(msg.target_name, wwn, LIO_HA_INITIATOR_NAME_LEN);
+	strscpy(msg.initiator_sid, isid_buf, LIO_HA_ISID_LEN);
 	strscpy(msg.fabric_name, tpg->se_tpg_tfo->fabric_name,
 		LIO_HA_FABRIC_NAME_LEN);
 
@@ -467,8 +525,7 @@ static const struct lio_ha_ops ha_ops = {
 
 static void ha_main_pr_change(struct se_device *dev, u8 action,
 			      u64 res_key, u64 sa_res_key, u8 type,
-			      const char *initiator_name,
-			      const char *fabric_name)
+			      const struct lio_ha_pr_nexus *nx)
 {
 	struct lio_ha_pr_work *pw;
 
@@ -488,8 +545,12 @@ static void ha_main_pr_change(struct se_device *dev, u8 action,
 	snprintf(pw->dev_name, LIO_HA_DEV_NAME_LEN, "%s/%s",
 		 config_item_name(&dev->se_hba->hba_group.cg_item),
 		 config_item_name(&dev->dev_group.cg_item));
-	strscpy(pw->initiator_name, initiator_name, LIO_HA_INITIATOR_NAME_LEN);
-	strscpy(pw->fabric_name, fabric_name, LIO_HA_FABRIC_NAME_LEN);
+	strscpy(pw->initiator_name, nx->initiator_name, LIO_HA_INITIATOR_NAME_LEN);
+	strscpy(pw->initiator_sid, nx->initiator_sid ?: "", LIO_HA_ISID_LEN);
+	strscpy(pw->fabric_name, nx->fabric_name, LIO_HA_FABRIC_NAME_LEN);
+	strscpy(pw->target_name, nx->target_name, LIO_HA_INITIATOR_NAME_LEN);
+	pw->tpg_tag    = nx->tpg_tag;
+	pw->all_tg_pt  = nx->all_tg_pt;
 	pw->res_key    = res_key;
 	pw->sa_res_key = sa_res_key;
 	pw->action     = action;
@@ -671,6 +732,8 @@ static void ha_main_on_connect(void)
 				LIO_HA_INITIATOR_NAME_LEN);
 			strscpy(snap[filled].target_name, se->target_name,
 				LIO_HA_INITIATOR_NAME_LEN);
+			strscpy(snap[filled].initiator_sid, se->initiator_sid,
+				LIO_HA_ISID_LEN);
 			strscpy(snap[filled].fabric_name, se->fabric_name,
 				LIO_HA_FABRIC_NAME_LEN);
 			filled++;
@@ -700,19 +763,24 @@ static void ha_main_on_connect(void)
 /*                                                                     */
 /* Sequence per device:                                                */
 /*   1. Iterate lio_ha_pr_table for entries matching this device.     */
-/*   2. For each entry, use target_ha_foreach_nacl_dev() to find the */
-/*      live nacl+lun context on this node's TPGs.                    */
+/*   2. For each entry, use target_ha_foreach_tpg_nacl_dev() (and, for */
+/*      ALL_TG_PT, target_ha_foreach_nacl_dev()) to find the live      */
+/*      nacl+lun context on this node's TPGs.                         */
 /*   3. Call target_ha_pr_add_reg() to inject the registration.       */
 /*   4. Clear lio_ha_forward_active (done by the caller once).        */
 /*   5. Call target_ha_reopen_backend() to open the backing store.    */
 /* ------------------------------------------------------------------ */
 
 /*
- * Context passed to the target_ha_foreach_nacl_dev() callback.
+ * Context passed to the target_ha_foreach_*_nacl_dev() callback.
  * One callback invocation per (nacl, lun, mapped_lun) found.
  */
 struct failover_reg_ctx {
 	struct se_device *dev;
+	const char       *isid;
+	bool              all_tg_pt;
+	/* If set, mappings on this TPG are skipped (already restored). */
+	struct se_portal_group *skip_tpg;
 	u64               sa_res_key;
 	int               res_holder;
 	u8                res_type;
@@ -727,7 +795,11 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 	struct failover_reg_ctx *ctx = data;
 	int ret;
 
+	if (ctx->skip_tpg && nacl->se_tpg == ctx->skip_tpg)
+		return;
+
 	ret = target_ha_pr_add_reg(ctx->dev, nacl, lun, mapped_lun,
+				   ctx->isid, ctx->all_tg_pt,
 				   ctx->sa_res_key,
 				   ctx->res_holder,
 				   ctx->res_type);
@@ -744,11 +816,56 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 /* Snapshot of a single PR table entry, used for lock-free processing. */
 struct pr_snap_entry {
 	char initiator_name[LIO_HA_INITIATOR_NAME_LEN];
+	char initiator_sid[LIO_HA_ISID_LEN];
 	char fabric_name[LIO_HA_FABRIC_NAME_LEN];
+	char target_name[LIO_HA_INITIATOR_NAME_LEN];
+	u16  tpg_tag;
+	bool all_tg_pt;
 	u64  sa_res_key;
 	u8   res_holder;
 	u8   res_type;
 };
+
+/*
+ * Restore one snapshot entry: the registration on the port it was made
+ * on, and for ALL_TG_PT the sibling registrations on the initiator's other
+ * ports.  The reservation, if the entry holds it, goes on the entry's own
+ * registration only.
+ */
+static void ha_main_failover_restore_entry(struct se_device *dev,
+					   const struct pr_snap_entry *pe)
+{
+	struct failover_reg_ctx ctx = {
+		.dev        = dev,
+		.isid       = pe->initiator_sid,
+		.all_tg_pt  = pe->all_tg_pt,
+		.sa_res_key = pe->sa_res_key,
+		.res_holder = pe->res_holder,
+		.res_type   = pe->res_type,
+	};
+	struct se_portal_group *tpg;
+
+	tpg = target_ha_lookup_tpg(pe->fabric_name, pe->target_name,
+				   pe->tpg_tag);
+	if (!tpg) {
+		pr_warn_ratelimited("lio_ha: failover: no TPG %s/%s tpg%u for PR reg of %s; not restored\n",
+				    pe->fabric_name, pe->target_name,
+				    pe->tpg_tag, pe->initiator_name);
+		return;
+	}
+
+	target_ha_foreach_tpg_nacl_dev(tpg, pe->initiator_name, dev,
+				       ha_main_failover_add_reg_cb, &ctx);
+
+	if (pe->all_tg_pt) {
+		ctx.isid       = "";
+		ctx.skip_tpg   = tpg;
+		ctx.res_holder = 0;
+		target_ha_foreach_nacl_dev(pe->fabric_name, pe->initiator_name,
+					   dev, ha_main_failover_add_reg_cb,
+					   &ctx);
+	}
+}
 
 #define FAILOVER_PR_SNAP_MAX  128
 
@@ -788,8 +905,14 @@ static int ha_main_failover_device(struct se_device *dev, void *data)
 		}
 		strscpy(snap[nsnap].initiator_name, e->initiator_name,
 			LIO_HA_INITIATOR_NAME_LEN);
+		strscpy(snap[nsnap].initiator_sid, e->initiator_sid,
+			LIO_HA_ISID_LEN);
 		strscpy(snap[nsnap].fabric_name, e->fabric_name,
 			LIO_HA_FABRIC_NAME_LEN);
+		strscpy(snap[nsnap].target_name, e->target_name,
+			LIO_HA_INITIATOR_NAME_LEN);
+		snap[nsnap].tpg_tag    = e->tpg_tag;
+		snap[nsnap].all_tg_pt  = e->all_tg_pt;
 		snap[nsnap].sa_res_key = e->res_key;
 		snap[nsnap].res_holder = e->res_holder;
 		snap[nsnap].res_type   = e->res_type;
@@ -809,42 +932,16 @@ static int ha_main_failover_device(struct se_device *dev, void *data)
 	 * live, so no legitimate initiator is incorrectly rejected.
 	 */
 	for (i = 0; i < nsnap; i++) {
-		struct failover_reg_ctx ctx;
-
 		if (snap[i].res_holder)
 			continue;
-
-		ctx.dev        = dev;
-		ctx.sa_res_key = snap[i].sa_res_key;
-		ctx.res_holder = 0;
-		ctx.res_type   = snap[i].res_type;
-		ctx.errors     = 0;
-
-		target_ha_foreach_nacl_dev(snap[i].fabric_name,
-					   snap[i].initiator_name,
-					   dev,
-					   ha_main_failover_add_reg_cb,
-					   &ctx);
+		ha_main_failover_restore_entry(dev, &snap[i]);
 	}
 
 	/* Phase 2b: inject the reservation holder (if any). */
 	for (i = 0; i < nsnap; i++) {
-		struct failover_reg_ctx ctx;
-
 		if (!snap[i].res_holder)
 			continue;
-
-		ctx.dev        = dev;
-		ctx.sa_res_key = snap[i].sa_res_key;
-		ctx.res_holder = 1;
-		ctx.res_type   = snap[i].res_type;
-		ctx.errors     = 0;
-
-		target_ha_foreach_nacl_dev(snap[i].fabric_name,
-					   snap[i].initiator_name,
-					   dev,
-					   ha_main_failover_add_reg_cb,
-					   &ctx);
+		ha_main_failover_restore_entry(dev, &snap[i]);
 	}
 
 	kfree(snap);
@@ -1010,8 +1107,9 @@ static ssize_t lio_ha_forward_active_store(struct config_item *item,
 		 * target_for_each_device() calls ha_main_failover_device() for
 		 * every configured se_device.  That function:
 		 *   1. Snapshots PR entries for the device from lio_ha_pr_table.
-		 *   2. Calls target_ha_foreach_nacl_dev() + target_ha_pr_add_reg()
-		 *      for each registrant (non-holders first, holder last).
+		 *   2. Calls target_ha_foreach_tpg_nacl_dev() (plus
+		 *      target_ha_foreach_nacl_dev() for ALL_TG_PT) and
+		 *      target_ha_pr_add_reg() for each registrant (non-holders first, holder last).
 		 *   3. Calls target_ha_reopen_backend() to open the backing store.
 		 *
 		 * The flag is cleared BEFORE ha_main_failover_device() calls
