@@ -93,14 +93,53 @@ struct se_portal_group *target_ha_lookup_tpg(const char *fabric_name,
 EXPORT_SYMBOL(target_ha_lookup_tpg);
 
 /*
- * target_ha_foreach_nacl_dev - find all nacl+lun mappings for an initiator/device
+ * target_ha_foreach_tpg_nacl_dev - find the nacl+lun mappings for an
+ * initiator/device on one TPG
+ *
+ * Finds the nacl for @initiator_name on @tpg and walks its lun_entry_hlist
+ * to locate entries whose se_lun is mapped to @dev.  Calls @fn for each
+ * match.  Used by lio_ha.ko at failover to restore a registration on the
+ * port it was made on.
+ */
+void target_ha_foreach_tpg_nacl_dev(struct se_portal_group *tpg,
+				    const char *initiator_name,
+				    struct se_device *dev,
+				    target_ha_nacl_fn_t fn, void *data)
+{
+	struct se_node_acl *nacl;
+	struct se_dev_entry *deve;
+
+	nacl = core_tpg_get_initiator_node_acl(tpg, (unsigned char *)initiator_name);
+	if (!nacl)
+		return;
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
+		struct se_device *mapped_dev;
+
+		if (!deve->se_lun)
+			continue;
+		mapped_dev = rcu_dereference(deve->se_lun->lun_se_dev);
+		if (mapped_dev != dev)
+			continue;
+		fn(nacl, deve->se_lun, deve->mapped_lun, data);
+	}
+	rcu_read_unlock();
+
+	target_put_nacl(nacl);
+}
+EXPORT_SYMBOL(target_ha_foreach_tpg_nacl_dev);
+
+/*
+ * target_ha_foreach_nacl_dev - find the ALL_TG_PT nacl+lun mappings for an
+ * initiator/device across all TPGs
  *
  * Iterates all registered TPGs for @fabric_name, finds the nacl for
  * @initiator_name in each, and walks the nacl's lun_entry_hlist to locate
- * entries whose se_lun is mapped to @dev.  Calls @fn for each match.
- *
- * Used by lio_ha.ko at failover to resolve the nacl+lun context needed by
- * target_ha_pr_add_reg() when restoring replicated PR state.
+ * entries whose se_lun is mapped to @dev through an explicit se_lun_acl.
+ * Calls @fn for each match.  These are the same mappings for which
+ * __core_scsi3_alloc_registration() creates registrations when a
+ * REGISTER has ALL_TG_PT set.
  *
  * TPG lifetime: at failover time the LIO config is fully up and no TPG
  * teardown is occurring, so we snapshot the TPG list under ha_tpg_reg_lock
@@ -137,7 +176,7 @@ void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_n
 		hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
 			struct se_device *mapped_dev;
 
-			if (!deve->se_lun)
+			if (!deve->se_lun || !deve->se_lun_acl)
 				continue;
 			mapped_dev = rcu_dereference(deve->se_lun->lun_se_dev);
 			if (mapped_dev != dev)

@@ -95,15 +95,19 @@
  *   se_session is given that real node_acl so that LUN lookups and
  *   PR per-I_T nexus tracking are correct.
  *
- * target_ha_foreach_nacl_dev() -- used during failover
+ * target_ha_foreach_tpg_nacl_dev() / target_ha_foreach_nacl_dev() --
+ * used during failover
  *
  *   To restore a PR registration onto a device, the caller needs the
  *   concrete (nacl, se_lun, mapped_lun) objects — not just names.
- *   target_ha_foreach_nacl_dev() walks every TPG for a given fabric,
- *   finds the nacl for the initiator in each, and invokes a callback
- *   for every LUN mapping that points at the target device.  This
- *   bridges the replicated PR table (which stores names) and the
- *   target_ha_pr_add_reg() call (which requires live kernel pointers).
+ *   target_ha_foreach_tpg_nacl_dev() finds the nacl for the initiator on
+ *   the one TPG the registration was made on and invokes a callback for
+ *   every LUN mapping that points at the target device.
+ *   target_ha_foreach_nacl_dev() does the same across every TPG for a
+ *   given fabric, for the sibling registrations of an ALL_TG_PT=1
+ *   REGISTER.  Together they bridge the replicated PR table (which stores
+ *   names) and the target_ha_pr_add_reg() call (which requires live
+ *   kernel pointers).
  *
  *
  * FAILOVER SEQUENCE
@@ -128,7 +132,8 @@
  *
  *         i.  The replicated PR table is scanned for entries matching
  *             this device and collected into a snapshot.
- *         ii. For each registrant, target_ha_foreach_nacl_dev()
+ *         ii. For each registrant, target_ha_foreach_tpg_nacl_dev()
+ *             (plus target_ha_foreach_nacl_dev() for ALL_TG_PT=1)
  *             resolves the (nacl, lun, mapped_lun) tuple and
  *             target_ha_pr_add_reg() installs the PR registration in
  *             LIO core (non-holders first, holder last so the
@@ -187,6 +192,27 @@ struct lio_ha_ops {
 };
 
 /**
+ * struct lio_ha_pr_nexus - the I_T nexus a PR change applies to
+ * @initiator_name: IQN or WWPN of the initiator
+ * @initiator_sid:  fabric-provided nexus discriminator (iSCSI/iSER ISID) as
+ *                  a NUL-terminated string; empty if the fabric has none
+ *                  (e.g. FC, where the WWPN alone is unambiguous)
+ * @fabric_name:    fabric driver name (e.g. "iscsi", "qla2xxx")
+ * @target_name:    IQN or WWPN of the target the registration is on
+ * @tpg_tag:        portal group tag of that target's TPG, in the numbering
+ *                  of the node that fills in the structure
+ * @all_tg_pt:      the registration was made with ALL_TG_PT set
+ */
+struct lio_ha_pr_nexus {
+	const char *initiator_name;
+	const char *initiator_sid;
+	const char *fabric_name;
+	const char *target_name;
+	u16         tpg_tag;
+	bool        all_tg_pt;
+};
+
+/**
  * struct lio_ha_pr_notifier - PR change notification hook registered by lio_ha.ko
  * @pr_change: called after each successful PR OUT on ACTIVE
  *             @dev:            the se_device whose PR state changed
@@ -194,8 +220,7 @@ struct lio_ha_ops {
  *             @res_key:        RESERVATION KEY field from the PR OUT parameter list
  *             @sa_res_key:     SERVICE ACTION RESERVATION KEY (new key for REGISTER)
  *             @type:           reservation type from the CDB (0 if not applicable)
- *             @initiator_name: IQN or WWPN of the initiator that issued PR OUT
- *             @fabric_name:    fabric driver name (e.g. "iscsi", "qla2xxx")
+ *             @nx:             the I_T nexus the change applies to
  *
  * lio_ha.ko registers this hook to receive incremental PR mutations and
  * push PERS_ACTION messages to STANDBY.  The hook is fired under RCU read
@@ -204,8 +229,7 @@ struct lio_ha_ops {
 struct lio_ha_pr_notifier {
 	void (*pr_change)(struct se_device *dev, u8 action,
 			  u64 res_key, u64 sa_res_key, u8 type,
-			  const char *initiator_name,
-			  const char *fabric_name);
+			  const struct lio_ha_pr_nexus *nx);
 };
 
 /* Defined in target_core_transport.c */
@@ -224,11 +248,16 @@ int target_ha_pr_export(struct se_device *dev, char *buf, size_t buf_len);
  * @nacl:       the initiator's se_node_acl (obtained from target_ha_foreach_nacl_dev)
  * @lun:        the target se_lun the nacl is mapped through
  * @mapped_lun: the initiator-side LUN number
+ * @isid:       fabric-provided nexus discriminator the registration had;
+ *              NULL or empty if it had none
+ * @all_tg_pt:  the registration was made with ALL_TG_PT set
  * @sa_res_key: the registration key
  * @res_holder: 1 if this registration also holds the reservation
  * @res_type:   reservation type (valid when res_holder == 1)
  *
  * Called by lio_ha.ko at failover to restore replicated PR state.
+ * Idempotent: if the device already has a registration for @nacl with the
+ * same @isid, none is added and @res_holder is applied to the existing one.
  * Must not be called concurrently for the same device.
  * Returns 0 on success, -ENOMEM on allocation failure.
  */
@@ -236,6 +265,8 @@ int target_ha_pr_add_reg(struct se_device *dev,
 			 struct se_node_acl *nacl,
 			 struct se_lun *lun,
 			 u64 mapped_lun,
+			 const char *isid,
+			 bool all_tg_pt,
 			 u64 sa_res_key,
 			 int res_holder,
 			 u8 res_type);
@@ -270,7 +301,25 @@ typedef void (*target_ha_nacl_fn_t)(struct se_node_acl *nacl, struct se_lun *lun
 				    u64 mapped_lun, void *data);
 
 /**
- * target_ha_foreach_nacl_dev - find all nacl+lun mappings for an initiator/device
+ * target_ha_foreach_tpg_nacl_dev - find the nacl+lun mappings for an
+ *                                  initiator/device on one TPG
+ * @tpg:             the TPG, from target_ha_lookup_tpg()
+ * @initiator_name:  IQN or WWPN of the initiator
+ * @dev:             the se_device to match LUN mappings against
+ * @fn:              callback invoked for each (nacl, lun, mapped_lun) match
+ * @data:            opaque pointer passed to @fn
+ *
+ * Called by lio_ha.ko at failover to restore a registration on the port it
+ * was made on.  Same calling rules as target_ha_foreach_nacl_dev().
+ */
+void target_ha_foreach_tpg_nacl_dev(struct se_portal_group *tpg,
+				    const char *initiator_name,
+				    struct se_device *dev,
+				    target_ha_nacl_fn_t fn, void *data);
+
+/**
+ * target_ha_foreach_nacl_dev - find the ALL_TG_PT nacl+lun mappings for an
+ *                              initiator/device across all TPGs
  * @fabric_name:     fabric driver name (e.g. "iscsi", "qla2xxx")
  * @initiator_name:  IQN or WWPN of the initiator
  * @dev:             the se_device to match LUN mappings against
@@ -279,11 +328,13 @@ typedef void (*target_ha_nacl_fn_t)(struct se_node_acl *nacl, struct se_lun *lun
  *
  * Iterates all registered TPGs for @fabric_name, locates the nacl for
  * @initiator_name in each, and walks the nacl's lun_entry_hlist to find
- * entries mapped to @dev.  Calls @fn for each match.
+ * entries mapped to @dev through an explicit se_lun_acl.  Calls @fn for
+ * each match.
  *
- * Called by lio_ha.ko at failover to resolve nacl+lun context needed by
- * target_ha_pr_add_reg().  Called from process context; @fn must not sleep
- * for long and must not call target_ha_foreach_nacl_dev() recursively.
+ * Called by lio_ha.ko at failover to recreate the registrations that an
+ * ALL_TG_PT=1 REGISTER creates on the other ports.  Called from process
+ * context; @fn must not sleep for long and must not call
+ * target_ha_foreach_nacl_dev() recursively.
  */
 void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_name,
 				struct se_device *dev, target_ha_nacl_fn_t fn, void *data);
