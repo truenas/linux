@@ -958,22 +958,17 @@ nfsd4_acl_to_attr_fail(enum nfs_ftype4 type, struct nfs4_acl *acl,
 	return nfserr_attrnotsupp;
 }
 
+/*
+ * Called with the inode locked. A conflicting delegation is recalled and
+ * -EAGAIN returned, which the client sees as NFS4ERR_DELAY.
+ */
 int
 nfsv4_set_zfacl_from_attr(struct dentry *dentry, struct nfsd_attrs *attr)
 {
-	struct inode *delegated_inode = NULL;
-	int error;
-
-retry:
-	error = __vfs_setxattr_locked(&nop_mnt_idmap, dentry, NA41_NAME,
-				      attr->na_fsacl.zfsacl.aclbuf,
-				      attr->na_fsacl.zfsacl.sz,
-				      XATTR_REPLACE, &delegated_inode);
-
-	if (delegated_inode)
-		goto retry;
-
-	return error;
+	return __vfs_setxattr_locked(&nop_mnt_idmap, dentry, NA41_NAME,
+				     attr->na_fsacl.zfsacl.aclbuf,
+				     attr->na_fsacl.zfsacl.sz,
+				     XATTR_REPLACE, NULL);
 }
 
 static short
