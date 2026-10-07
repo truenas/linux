@@ -59,6 +59,23 @@ static void __target_ua_drain_queue(struct se_session_deve *sess_deve,
 }
 
 /*
+ * Remove and free the head (highest-priority) UA on sess_deve, returning its
+ * ASC/ASCQ in *asc and *ascq. Caller must hold sess_deve->ua_lock and must
+ * have checked that the list is not empty.
+ */
+static void __target_ua_pop_head(struct se_session_deve *sess_deve,
+				 u8 *asc, u8 *ascq)
+{
+	struct se_ua *ua;
+
+	ua = list_first_entry(&sess_deve->ua_list, struct se_ua, ua_nacl_list);
+	*asc = ua->ua_asc;
+	*ascq = ua->ua_ascq;
+	list_del(&ua->ua_nacl_list);
+	kmem_cache_free(se_ua_cache, ua);
+}
+
+/*
  * Assumes sess->se_node_acl is already assigned and that no fabric
  * command can yet arrive on this session (the session isn't registered
  * with its fabric until after this returns). Allocates one struct
@@ -531,11 +548,12 @@ bool core_scsi3_ua_for_check_condition(struct se_cmd *cmd, u8 *key, u8 *asc,
 		spin_unlock(&sess_deve->ua_lock);
 	} else {
 		/*
-		 * Otherwise for the default 00b, release the UNIT ATTENTION
-		 * condition.  Return the ASC/ASCQ of the highest priority UA
-		 * (head of the list) in the outgoing CHECK_CONDITION + sense.
+		 * Otherwise for the default 00b, report the highest priority
+		 * UA (head of the list) in the outgoing CHECK_CONDITION + sense
+		 * and clear only that one; any others stay queued for the
+		 * following commands (SAM-5, Unit attention conditions).
 		 */
-		__target_ua_drain_queue(sess_deve, asc, ascq);
+		__target_ua_pop_head(sess_deve, asc, ascq);
 		spin_unlock(&sess_deve->ua_lock);
 	}
 
@@ -568,10 +586,10 @@ int core_scsi3_ua_clear_for_request_sense(
 	 * The highest priority Unit Attention is at the head of the
 	 * queue and will be returned in REQUEST_SENSE payload data for
 	 * the matching struct se_lun. Once the returning ASC/ASCQ
-	 * values are set, we go ahead and release all of the Unit
-	 * Attention conditions for the associated struct se_lun.
+	 * values are set, only that Unit Attention condition is
+	 * released; the others remain pending.
 	 */
-	__target_ua_drain_queue(sess_deve, asc, ascq);
+	__target_ua_pop_head(sess_deve, asc, ascq);
 	spin_unlock(&sess_deve->ua_lock);
 
 	pr_debug("[%s]: Released UNIT ATTENTION condition, mapped"
