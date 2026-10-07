@@ -189,8 +189,11 @@ struct statx {
 	/* Expose change cookie for durable / persistent handles in samba */
 	__u64	stx_change_cookie;
 
+	/* Inode generation, which tells a reused inode number from the old file */
+	__u64	stx_gen;
+
 	/* 0xc0 */
-	__u64	__spare3[7];	/* Spare space for future expansion */
+	__u64	__spare3[6];	/* Spare space for future expansion */
 
 	/* 0x100 */
 };
@@ -223,6 +226,7 @@ struct statx {
 #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
 #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
 
+#define STATX_GEN		0x20000000U	/* Want/got stx_gen */
 #define STATX_CHANGE_COOKIE	0x40000000U	/* Want/got stx_change_attr */
 
 #define STATX__RESERVED		0x80000000U	/* Reserved for future struct statx expansion */
