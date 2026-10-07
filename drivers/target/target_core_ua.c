@@ -74,6 +74,19 @@ static void __target_ua_drain_queue(struct se_session_deve *sess_deve)
 	}
 }
 
+/*
+ * Remove and free the head (highest-priority) UA on sess_deve. Caller must
+ * hold sess_deve->ua_lock and must have checked that the list is not empty.
+ */
+static void __target_ua_pop_head(struct se_session_deve *sess_deve)
+{
+	struct se_ua *ua;
+
+	ua = list_first_entry(&sess_deve->ua_list, struct se_ua, ua_nacl_list);
+	list_del(&ua->ua_nacl_list);
+	kmem_cache_free(se_ua_cache, ua);
+}
+
 static struct se_session_deve *
 target_alloc_sess_deve(struct se_session *sess, struct se_dev_entry *deve)
 {
@@ -605,11 +618,12 @@ bool core_scsi3_ua_for_check_condition(struct se_cmd *cmd, u8 *key, u8 *asc,
 	*asc = ua->ua_asc;
 	*ascq = ua->ua_ascq;
 	/*
-	 * For the default ua_intlck_ctrl code 00b, release the UNIT ATTENTION
-	 * condition. For other codes, only report it without clearing it.
+	 * For the default ua_intlck_ctrl code 00b, clear only that one; any
+	 * others stay queued for the following commands (SAM-5, Unit attention
+	 * conditions). For other codes, only report it without clearing it.
 	 */
 	if (dev_ua_intlck_clear)
-		__target_ua_drain_queue(sess_deve);
+		__target_ua_pop_head(sess_deve);
 	spin_unlock(&sess_deve->ua_lock);
 	rcu_read_unlock();
 
@@ -657,13 +671,13 @@ int core_scsi3_ua_clear_for_request_sense(
 	 * The highest priority Unit Attention is at the head of the
 	 * queue and will be returned in REQUEST_SENSE payload data for
 	 * the matching struct se_lun. Once the returning ASC/ASCQ
-	 * values are set, we go ahead and release all of the Unit
-	 * Attention conditions for the associated struct se_lun.
+	 * values are set, only that Unit Attention condition is
+	 * released; the others remain pending.
 	 */
 	ua = list_first_entry(&sess_deve->ua_list, struct se_ua, ua_nacl_list);
 	*asc = ua->ua_asc;
 	*ascq = ua->ua_ascq;
-	__target_ua_drain_queue(sess_deve);
+	__target_ua_pop_head(sess_deve);
 	rc = 0;
 out_unlock:
 	spin_unlock(&sess_deve->ua_lock);
