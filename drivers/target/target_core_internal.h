@@ -106,6 +106,7 @@ int	target_get_pr_transport_id(struct se_node_acl *nacl,
 bool target_parse_pr_out_transport_id(struct se_portal_group *tpg,
 		char *buf, u32 buf_len, u32 *out_tid_len,
 		char **port_nexus_ptr, char *i_str);
+u64	target_isid_to_bin(const unsigned char *isid);
 
 /* target_core_hba.c */
 struct se_hba *core_alloc_hba(const char *, u32, u32);
