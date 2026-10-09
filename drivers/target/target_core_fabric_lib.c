@@ -499,3 +499,24 @@ bool target_parse_pr_out_transport_id(struct se_portal_group *tpg,
 	*out_tid_len = 24;
 	return true;
 }
+
+/*
+ * target_isid_to_bin - binary value of a fabric ISID string
+ *
+ * sess_get_initiator_sid() returns the ISID as the ASCII hexadecimal digits
+ * of the whole binary value, the form SPC-5 7.6.4.5 uses for the ISCSI
+ * INITIATOR SESSION ID of an iSCSI initiator port TransportID.  The result
+ * is that whole value: an initiator port is the initiator name plus the
+ * complete ISID, including its trailing qualifier bytes (RFC 7143 4.4.2 c,
+ * 4.4.3 and 11.12.5).
+ *
+ * A string that is not a hexadecimal number is converted as raw bytes.
+ */
+u64 target_isid_to_bin(const unsigned char *isid)
+{
+	u64 val;
+
+	if (kstrtou64((const char *)isid, 16, &val))
+		return get_unaligned_be64(isid);
+	return val;
+}
