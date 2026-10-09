@@ -2324,9 +2324,15 @@ core_scsi3_pro_reserve(struct se_cmd *cmd, int type, int scope, u64 res_key)
 	pr_reg = core_scsi3_locate_pr_reg(cmd->se_dev, se_sess->se_node_acl,
 				se_sess);
 	if (!pr_reg) {
-		pr_err("SPC-3 PR: Unable to locate"
-			" PR_REGISTERED *pr_reg for RESERVE\n");
-		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+		/*
+		 * SPC-5 5.14.7: a service action other than REGISTER or
+		 * REGISTER AND IGNORE EXISTING KEY from an unregistered I_T
+		 * nexus is completed with RESERVATION CONFLICT. That is a
+		 * normal state, which any initiator can cause, so do not log
+		 * it as an error.
+		 */
+		pr_debug("SPC-3 PR: RESERVE from an unregistered I_T nexus\n");
+		return TCM_RESERVATION_CONFLICT;
 	}
 	/*
 	 * From spc4r17 Section 5.7.9: Reserving:
@@ -2563,9 +2569,15 @@ core_scsi3_emulate_pro_release(struct se_cmd *cmd, int type, int scope,
 	 */
 	pr_reg = core_scsi3_locate_pr_reg(dev, se_sess->se_node_acl, se_sess);
 	if (!pr_reg) {
-		pr_err("SPC-3 PR: Unable to locate"
-			" PR_REGISTERED *pr_reg for RELEASE\n");
-		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+		/*
+		 * SPC-5 5.14.7: a service action other than REGISTER or
+		 * REGISTER AND IGNORE EXISTING KEY from an unregistered I_T
+		 * nexus is completed with RESERVATION CONFLICT. That is a
+		 * normal state, which any initiator can cause, so do not log
+		 * it as an error.
+		 */
+		pr_debug("SPC-3 PR: RELEASE from an unregistered I_T nexus\n");
+		return TCM_RESERVATION_CONFLICT;
 	}
 	/*
 	 * From spc4r17 Section 5.7.11.2 Releasing:
@@ -2713,9 +2725,15 @@ core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
 	pr_reg_n = core_scsi3_locate_pr_reg(cmd->se_dev,
 			se_sess->se_node_acl, se_sess);
 	if (!pr_reg_n) {
-		pr_err("SPC-3 PR: Unable to locate"
-			" PR_REGISTERED *pr_reg for CLEAR\n");
-		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+		/*
+		 * SPC-5 5.14.7: a service action other than REGISTER or
+		 * REGISTER AND IGNORE EXISTING KEY from an unregistered I_T
+		 * nexus is completed with RESERVATION CONFLICT. That is a
+		 * normal state, which any initiator can cause, so do not log
+		 * it as an error.
+		 */
+		pr_debug("SPC-3 PR: CLEAR from an unregistered I_T nexus\n");
+		return TCM_RESERVATION_CONFLICT;
 	}
 	/*
 	 * From spc4r17 section 5.7.11.6, Clearing:
@@ -3211,9 +3229,14 @@ core_scsi3_emulate_pro_register_and_move(struct se_cmd *cmd, u64 res_key,
 	pr_reg = core_scsi3_locate_pr_reg(cmd->se_dev, se_sess->se_node_acl,
 				se_sess);
 	if (!pr_reg) {
-		pr_err("SPC-3 PR: Unable to locate PR_REGISTERED"
-			" *pr_reg for REGISTER_AND_MOVE\n");
-		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+		/*
+		 * SPC-5 5.14.7 and table 71: REGISTER AND MOVE from an
+		 * unregistered I_T nexus is completed with RESERVATION
+		 * CONFLICT. That is a normal state, which any initiator can
+		 * cause, so do not log it as an error.
+		 */
+		pr_debug("SPC-3 PR: REGISTER_AND_MOVE from an unregistered I_T nexus\n");
+		return TCM_RESERVATION_CONFLICT;
 	}
 	/*
 	 * The provided reservation key much match the existing reservation key
