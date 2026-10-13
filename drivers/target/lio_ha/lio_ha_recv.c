@@ -22,7 +22,10 @@
  *      resolves correctly and PR registrations are attributed to the right
  *      initiator.  Sessions are registered on ha_recv_tpg (so se_cmd->se_tfo
  *      routes callbacks through ha_recv_ops), but se_sess->se_node_acl
- *      points to the real nacl.  See lio_ha_recv_session_create().
+ *      points to the real nacl.  The session also records the physical port
+ *      the initiator is logged in to (the peer's), which makes it a separate
+ *      nexus from a direct session of the same initiator port.  See
+ *      lio_ha_recv_session_create().
  *
  * A single system-wide TPG is created at lio_ha_recv_init() following the
  * same pattern as the iSCSI discovery TPG (iscsit_load_discovery_tpg):
@@ -512,11 +515,11 @@ static void ha_recv_tmr_forward_handler(const void *buf, size_t len)
 
 int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 			       const char *target_name, u16 tpg_tag,
-			       const char *initiator_sid,
+			       u16 port_tag, const char *initiator_sid,
 			       const char *fabric_name)
 {
 	struct ha_recv_sess_entry *e, *existing;
-	struct se_portal_group *real_tpg;
+	struct se_portal_group *real_tpg, *port_tpg;
 	struct se_node_acl *real_nacl;
 	struct target_cmd_counter *cmd_cnt;
 	struct se_session *se_sess;
@@ -583,6 +586,20 @@ int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 		 * transport_free_session() will drop it via target_put_nacl().
 		 */
 		se_sess->se_node_acl = real_nacl;
+		/*
+		 * The initiator is logged in to the peer node's port, which
+		 * this node carries as a portal-less TPG under the peer's tag.
+		 * Record it so the session is a separate I_T nexus from a
+		 * direct session of the same initiator port, and reports that
+		 * port's relative target port identifier.  TrueNAS gives every
+		 * TPG an rtpi equal to its tag, which is the fallback.
+		 */
+		port_tpg = target_ha_lookup_tpg(fabric_name, target_name,
+						port_tag);
+		se_sess->sess_port_tag  = port_tag;
+		se_sess->sess_port_rtpi = port_tpg ? port_tpg->tpg_rtpi :
+						     port_tag;
+		se_sess->sess_port_set  = true;
 		transport_register_session(&ha_recv_tpg.se_tpg, real_nacl,
 					   se_sess, e);
 	} else {
@@ -634,7 +651,7 @@ static void ha_recv_session_connect_handler(const void *buf, size_t len)
 	char initiator_sid[LIO_HA_ISID_LEN];
 	char fabric_name[LIO_HA_FABRIC_NAME_LEN];
 	u64 session_id;
-	u16 tpg_tag;
+	u16 tpg_tag, port_tag;
 
 	if (len < sizeof(*msg)) {
 		pr_warn("ha_recv: SESSION_CONNECT too short (%zu bytes)\n",
@@ -643,7 +660,8 @@ static void ha_recv_session_connect_handler(const void *buf, size_t len)
 	}
 
 	session_id = be64_to_cpu(msg->session_id);
-	tpg_tag    = lio_ha_peer_tpg_tag(be16_to_cpu(msg->tpg_tag));
+	port_tag   = be16_to_cpu(msg->tpg_tag);
+	tpg_tag    = lio_ha_peer_tpg_tag(port_tag);
 
 	/* Copy with defensive NUL-termination. */
 	memcpy(initiator_name, msg->initiator_name, LIO_HA_INITIATOR_NAME_LEN);
@@ -659,8 +677,8 @@ static void ha_recv_session_connect_handler(const void *buf, size_t len)
 	fabric_name[LIO_HA_FABRIC_NAME_LEN - 1] = '\0';
 
 	lio_ha_recv_session_create(initiator_name, session_id,
-				   target_name, tpg_tag, initiator_sid,
-				   fabric_name);
+				   target_name, tpg_tag, port_tag,
+				   initiator_sid, fabric_name);
 }
 
 /*

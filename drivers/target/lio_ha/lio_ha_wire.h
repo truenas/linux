@@ -27,8 +27,8 @@
 #include <linux/types.h>
 
 /*
- * Every TPG tag carried in a message is the sender's own tag; the receiver
- * translates it to its own numbering (lio_ha_peer_tpg_tag()).
+ * Every TPG tag carried in a message is the global tag of a physical target
+ * port.  The receiver stores it as sent.
  */
 
 /* ------------------------------------------------------------------ */
@@ -145,7 +145,7 @@ struct lio_ha_data_hdr {
 struct lio_ha_msg_session_connect {
 	struct lio_ha_msg_hdr hdr;          /* type = LIO_HA_MSG_SESSION_CONNECT */
 	__be64                session_id;   /* STANDBY's se_sess pointer; opaque */
-	__be16                tpg_tag;      /* sender's portal group tag, tpg_get_tag() */
+	__be16                tpg_tag;      /* sender's tpg_get_tag(): the physical port */
 	u8                    pad[6];       /* reserved, must be zero */
 	char initiator_name[LIO_HA_INITIATOR_NAME_LEN]; /* IQN or WWPN, NUL-terminated */
 	char target_name[LIO_HA_INITIATOR_NAME_LEN];    /* IQN or WWPN of target */
@@ -262,7 +262,7 @@ struct lio_ha_msg_pers_action {
 	__be32 action;                /* enum lio_ha_pr_action; values match SPC PR OUT sa codes */
 	u8     res_type;              /* reservation type field from CDB */
 	u8     all_tg_pt;             /* registration made with ALL_TG_PT set */
-	__be16 tpg_tag;               /* sender's tag of the registration's TPG */
+	__be16 tpg_tag;               /* physical port the registration was made through */
 	__be64 res_key;               /* RESERVATION KEY */
 	__be64 sa_res_key;            /* SERVICE ACTION RESERVATION KEY */
 	char   initiator_name[LIO_HA_INITIATOR_NAME_LEN];  /* whose key changed */

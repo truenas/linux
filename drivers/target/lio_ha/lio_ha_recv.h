@@ -55,6 +55,8 @@ void lio_ha_recv_exit(void);
  * @target_name:    IQN or WWPN of the target TPG from SESSION_CONNECT
  * @tpg_tag:        portal group tag of the real TPG on this node, i.e.
  *                  the tag from SESSION_CONNECT already translated
+ * @port_tag:       the tag from SESSION_CONNECT as sent: the global tag of
+ *                  the physical port the initiator is logged in to
  * @initiator_sid:  fabric-provided nexus discriminator from SESSION_CONNECT
  *                  (iSCSI/iSER ISID); empty if the fabric has none
  * @fabric_name:    fabric driver name (e.g. "iscsi", "qla2xxx")
@@ -69,7 +71,7 @@ void lio_ha_recv_exit(void);
  */
 int  lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 				const char *target_name, u16 tpg_tag,
-				const char *initiator_sid,
+				u16 port_tag, const char *initiator_sid,
 				const char *fabric_name);
 
 /**

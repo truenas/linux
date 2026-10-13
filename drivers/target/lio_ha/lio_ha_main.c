@@ -84,7 +84,7 @@ struct lio_ha_pr_entry {
 	char             initiator_sid[LIO_HA_ISID_LEN];
 	char             fabric_name[LIO_HA_FABRIC_NAME_LEN];
 	char             target_name[LIO_HA_INITIATOR_NAME_LEN];
-	u16              tpg_tag;     /* this node's numbering */
+	u16              tpg_tag;     /* physical port, global tag */
 	bool             all_tg_pt;
 	u64              res_key;
 	u8               res_holder;  /* 1 if this entry holds the reservation */
@@ -103,7 +103,7 @@ struct lio_ha_pr_work {
 	char               initiator_sid[LIO_HA_ISID_LEN];
 	char               fabric_name[LIO_HA_FABRIC_NAME_LEN];
 	char               target_name[LIO_HA_INITIATOR_NAME_LEN];
-	u16                tpg_tag;     /* this (the sending) node's numbering */
+	u16                tpg_tag;     /* physical port, global tag */
 	bool               all_tg_pt;
 	u64                res_key;
 	u64                sa_res_key;
@@ -432,10 +432,10 @@ static void ha_main_pr_work_fn(struct work_struct *work)
 /* ACTIVE so ACTIVE creates / destroys the matching synthetic        */
 /* se_session with correct LUN mappings.                              */
 /*                                                                     */
-/* SESSION_CONNECT carries STANDBY's own TPG tag; ACTIVE translates  */
-/* it with lio_ha_peer_tpg_tag() so that target_ha_lookup_tpg() finds */
-/* the real TPG (with the initiator's node_acl) rather than the       */
-/* phantom TPG.                                                        */
+/* SESSION_CONNECT carries STANDBY's own TPG tag, the physical port   */
+/* the initiator is logged in to.  ACTIVE records it on the session,  */
+/* and maps it with lio_ha_peer_tpg_tag() to find its own real TPG    */
+/* (with the initiator's node_acl) rather than the phantom TPG.       */
 /*                                                                     */
 /* Skips internal TPGs (se_tpg_wwn=NULL, e.g. ha_recv itself) and    */
 /* skips when forward_active=0 (ACTIVE mode or idle).                */
@@ -598,7 +598,8 @@ static void ha_main_pr_change(struct se_device *dev, u8 action,
 }
 
 static const struct lio_ha_pr_notifier pr_notifier = {
-	.pr_change = ha_main_pr_change,
+	.pr_change	= ha_main_pr_change,
+	.peer_port_tag	= lio_ha_peer_tpg_tag,
 };
 
 /* ------------------------------------------------------------------ */
@@ -813,6 +814,16 @@ struct failover_reg_ctx {
 	struct se_device *dev;
 	const char       *isid;
 	bool              all_tg_pt;
+	/*
+	 * The physical port the registration was made through.  Used for
+	 * the registration on the entry's own port; the ALL_TG_PT siblings
+	 * (@sibling) are on the ports of their own TPGs.
+	 */
+	u16               port_tag;
+	u16               port_rtpi;
+	bool              sibling;
+	/* Number of nacl+lun mappings found, i.e. callbacks made. */
+	int               found;
 	/* If set, mappings on this TPG are skipped (already restored). */
 	struct se_portal_group *skip_tpg;
 	u64               sa_res_key;
@@ -827,16 +838,44 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 					void *data)
 {
 	struct failover_reg_ctx *ctx = data;
+	u16 port_tag = ctx->port_tag;
+	u16 port_rtpi = ctx->port_rtpi;
 	int ret;
 
 	if (ctx->skip_tpg && nacl->se_tpg == ctx->skip_tpg)
 		return;
 
+	ctx->found++;
+	if (ctx->sibling) {
+		port_tag  = nacl->se_tpg->se_tpg_tfo->tpg_get_tag(nacl->se_tpg);
+		port_rtpi = lun->lun_tpg->tpg_rtpi;
+	}
+
 	ret = target_ha_pr_add_reg(ctx->dev, nacl, lun, mapped_lun,
-				   ctx->isid, ctx->all_tg_pt,
+				   ctx->isid, port_tag, port_rtpi,
+				   ctx->all_tg_pt,
 				   ctx->sa_res_key,
 				   ctx->res_holder,
 				   ctx->res_type);
+	if (!ret && ctx->all_tg_pt) {
+		/*
+		 * An ALL_TG_PT initiator port is registered on the paired
+		 * port of the other node as well, if this node has that port.
+		 */
+		const struct target_core_fabric_ops *tfo =
+						nacl->se_tpg->se_tpg_tfo;
+		u16 mate_tag = lio_ha_peer_tpg_tag(port_tag);
+		struct se_portal_group *mate_tpg =
+			target_ha_lookup_tpg(tfo->fabric_name,
+					     tfo->tpg_get_wwn(nacl->se_tpg),
+					     mate_tag);
+
+		if (mate_tpg)
+			ret = target_ha_pr_add_reg(ctx->dev, nacl, lun,
+						   mapped_lun, ctx->isid,
+						   mate_tag, mate_tpg->tpg_rtpi,
+						   true, ctx->sa_res_key, 0, 0);
+	}
 	lio_ha_dbg(3, "failover PR reg: initiator=%s key=%016llx holder=%d type=%u ret=%d\n",
 		   nacl->initiatorname, (unsigned long long)ctx->sa_res_key,
 		   ctx->res_holder, ctx->res_type, ret);
@@ -861,10 +900,17 @@ struct pr_snap_entry {
 };
 
 /*
- * Restore one snapshot entry: the registration on the port it was made
- * on, and for ALL_TG_PT the same initiator port's registrations on the
- * initiator's other ports.  The reservation, if the entry holds it, goes
+ * Restore one snapshot entry: the registration for the physical port it was
+ * made through, and for ALL_TG_PT the same initiator port's registrations on
+ * the initiator's other ports.  The reservation, if the entry holds it, goes
  * on the entry's own registration only.
+ *
+ * The entry's tag names a physical port.  That port is either one of this
+ * node's real TPGs, which carries the initiator's static node_acl, or the
+ * portal-less TPG that stands for the peer's port, which has none.  In the
+ * second case the registration is attached to this node's real TPG for the
+ * same target, as the node_acl and the LUN mappings come from there, but it
+ * keeps the peer's tag, so it still belongs to the peer's port.
  */
 static void ha_main_failover_restore_entry(struct se_device *dev,
 					   const struct pr_snap_entry *pe)
@@ -873,25 +919,44 @@ static void ha_main_failover_restore_entry(struct se_device *dev,
 		.dev        = dev,
 		.isid       = pe->initiator_sid,
 		.all_tg_pt  = pe->all_tg_pt,
+		.port_tag   = pe->tpg_tag,
 		.sa_res_key = pe->sa_res_key,
 		.res_holder = pe->res_holder,
 		.res_type   = pe->res_type,
 	};
-	struct se_portal_group *tpg;
+	struct se_portal_group *port_tpg, *tpg;
 
-	tpg = target_ha_lookup_tpg(pe->fabric_name, pe->target_name,
-				   pe->tpg_tag);
-	if (!tpg) {
-		pr_warn_ratelimited("lio_ha: failover: no TPG %s/%s tpg%u for PR reg of %s; not restored\n",
-				    pe->fabric_name, pe->target_name,
-				    pe->tpg_tag, pe->initiator_name);
+	/*
+	 * TrueNAS gives every TPG an rtpi equal to its tag, which is the
+	 * fallback if the port's TPG is not found.
+	 */
+	port_tpg = target_ha_lookup_tpg(pe->fabric_name, pe->target_name,
+					pe->tpg_tag);
+	ctx.port_rtpi = port_tpg ? port_tpg->tpg_rtpi : pe->tpg_tag;
+
+	tpg = port_tpg;
+	if (tpg)
+		target_ha_foreach_tpg_nacl_dev(tpg, pe->initiator_name, dev,
+					       ha_main_failover_add_reg_cb,
+					       &ctx);
+	if (!ctx.found) {
+		tpg = target_ha_lookup_tpg(pe->fabric_name, pe->target_name,
+					   lio_ha_peer_tpg_tag(pe->tpg_tag));
+		if (tpg)
+			target_ha_foreach_tpg_nacl_dev(tpg, pe->initiator_name,
+						       dev,
+						       ha_main_failover_add_reg_cb,
+						       &ctx);
+	}
+	if (!ctx.found) {
+		pr_warn_ratelimited("lio_ha: failover: no node ACL for %s on %s/%s tpg%u or its peer; PR reg not restored\n",
+				    pe->initiator_name, pe->fabric_name,
+				    pe->target_name, pe->tpg_tag);
 		return;
 	}
 
-	target_ha_foreach_tpg_nacl_dev(tpg, pe->initiator_name, dev,
-				       ha_main_failover_add_reg_cb, &ctx);
-
 	if (pe->all_tg_pt) {
+		ctx.sibling    = true;
 		ctx.skip_tpg   = tpg;
 		ctx.res_holder = 0;
 		target_ha_foreach_nacl_dev(pe->fabric_name, pe->initiator_name,

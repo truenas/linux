@@ -35,10 +35,12 @@ extern int lio_ha_debug;
  * REL_TGT_ID_NODEB_OFFSET in middlewared/utils/iscsi/constants.py).
  * Node A tags are always < this value; Node B tags are always >= it.
  *
- * Messages carry the sender's own tag.  A receiver translates it with
- * lio_ha_peer_tpg_tag() to the tag of the same TPG on its own node, so
- * that target_ha_lookup_tpg() finds the real TPG and node_acl rather than
- * the portal-less phantom TPG.
+ * A tag names one physical target port and is unique across the pair, so a
+ * message carries it as the sender holds it and the receiver stores it
+ * unchanged.  lio_ha_peer_tpg_tag() maps a port's tag to the tag of the same
+ * target's TPG on the other node.  It is used only to find this node's own
+ * real TPG, the one with the static node_acl and the LUN mappings, rather than
+ * the portal-less phantom TPG that carries the peer's port.
  */
 #define LIO_HA_NODE_B_TPG_OFFSET  32000
 
@@ -83,8 +85,8 @@ extern struct lio_ha_cfg lio_ha_cfg;
  * lio_ha_pr_apply - update the replicated PR table on STANDBY
  * @action:         enum lio_ha_pr_action value
  * @dev_name:       storage object name (e.g. "iblock_0/disk0")
- * @nx:             the I_T nexus the change applies to; @nx->tpg_tag must
- *                  already be in this node's numbering
+ * @nx:             the I_T nexus the change applies to; @nx->tpg_tag is the
+ *                  global tag of the physical port, stored as given
  * @res_key:        RESERVATION KEY from the PR OUT parameter list
  * @sa_res_key:     SERVICE ACTION RESERVATION KEY
  * @res_type:       reservation type (0 if not applicable)

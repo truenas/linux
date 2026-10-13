@@ -755,7 +755,7 @@ static void ha_fwd_pers_action_handler(const void *buf, size_t len)
 	nx.initiator_sid  = initiator_sid;
 	nx.fabric_name    = fabric_name;
 	nx.target_name    = target_name;
-	nx.tpg_tag        = lio_ha_peer_tpg_tag(be16_to_cpu(msg->tpg_tag));
+	nx.tpg_tag        = be16_to_cpu(msg->tpg_tag);
 	nx.all_tg_pt      = msg->all_tg_pt;
 
 	lio_ha_dbg(2, "PERS_ACTION: dev=%s initiator=%s action=%u\n",
@@ -879,7 +879,7 @@ static void ha_fwd_lun_sync_handler(const void *buf, size_t len)
 					LIO_HA_INITIATOR_NAME_LEN);
 			} else if (!strncmp(tok, "tpgt=", 5)) {
 				if (!kstrtoul(tok + 5, 10, &v))
-					tpg_tag = lio_ha_peer_tpg_tag((u16)v);
+					tpg_tag = (u16)v;
 			} else if (!strncmp(tok, "res_all_tg_pt=", 14)) {
 				if (!kstrtoul(tok + 14, 10, &v))
 					all_tg_pt = !!v;
