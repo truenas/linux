@@ -56,12 +56,14 @@ static LIST_HEAD(ha_tpg_reg_list);
 static DEFINE_SPINLOCK(ha_tpg_reg_lock);
 
 /**
- * target_ha_lookup_tpg - find a real fabric TPG by identity
+ * target_ha_lookup_tpg - find a fabric TPG by identity, real or phantom
  * @fabric_name: target_core_fabric_ops.fabric_name (e.g. "iscsi", "qla2xxx")
  * @target_name: IQN or WWPN string from tpg_get_wwn()
  * @tpg_tag:     portal group tag from tpg_get_tag()
  *
- * Returns the matching se_portal_group pointer, or NULL if not found.
+ * Returns the matching se_portal_group pointer, or NULL if not found.  The
+ * TPG of the peer node's port, which this node carries without portals, is
+ * found by the peer's tag.
  * The caller must not sleep; called from TCP RX context on ACTIVE.
  */
 struct se_portal_group *target_ha_lookup_tpg(const char *fabric_name,

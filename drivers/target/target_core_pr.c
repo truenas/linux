@@ -91,9 +91,61 @@ enum preempt_type {
 static void __core_scsi3_complete_pro_release(struct se_device *, struct se_node_acl *,
 					      struct t10_pr_registration *, int, int);
 
+#ifdef CONFIG_TRUENAS
 /*
- * A registration's durable identity is (pr_reg_nacl, ISID); matching on
- * that identity is what makes a session eligible to bind to it.
+ * The global tag of the physical target port behind a node ACL or a session.
+ * A session that lio_ha creates for an initiator logged in through the peer
+ * node's port records that port; every other session is on its ACL's TPG.
+ */
+static u16 core_scsi3_nacl_port_tag(struct se_node_acl *nacl)
+{
+	return nacl->se_tpg->se_tpg_tfo->tpg_get_tag(nacl->se_tpg);
+}
+
+static u16 core_scsi3_sess_port_tag(struct se_session *sess)
+{
+	if (sess->sess_port_set)
+		return sess->sess_port_tag;
+
+	return core_scsi3_nacl_port_tag(sess->se_node_acl);
+}
+
+/*
+ * The target port that pairs with the port tagged @tag, on the other node of
+ * an HA pair, if this node has a TPG for it.  An ALL_TG_PT initiator port is
+ * registered on that port as well.
+ */
+static bool core_scsi3_mate_port(struct se_node_acl *nacl, u16 tag,
+				 u16 *mate_tag, u16 *mate_rtpi)
+{
+	const struct target_core_fabric_ops *tfo = nacl->se_tpg->se_tpg_tfo;
+	const struct lio_ha_pr_notifier *n;
+	struct se_portal_group *mate_tpg;
+
+	rcu_read_lock();
+	n = rcu_dereference(pr_notifier);
+	if (!n || !n->peer_port_tag) {
+		rcu_read_unlock();
+		return false;
+	}
+	*mate_tag = n->peer_port_tag(tag);
+	rcu_read_unlock();
+
+	mate_tpg = target_ha_lookup_tpg(tfo->fabric_name,
+					tfo->tpg_get_wwn(nacl->se_tpg),
+					*mate_tag);
+	if (!mate_tpg)
+		return false;
+
+	*mate_rtpi = mate_tpg->tpg_rtpi;
+	return true;
+}
+#endif /* CONFIG_TRUENAS */
+
+/*
+ * A registration's durable identity is (pr_reg_nacl, ISID) and, with
+ * CONFIG_TRUENAS, the physical target port; matching on that identity is what
+ * makes a session eligible to bind to it.
  */
 static bool core_scsi3_pr_match_nexus(struct t10_pr_registration *pr_reg,
 				      struct se_session *sess)
@@ -104,6 +156,11 @@ static bool core_scsi3_pr_match_nexus(struct t10_pr_registration *pr_reg,
 	if (pr_reg->isid_present_at_reg &&
 	    pr_reg->pr_reg_bin_isid != sess->sess_bin_isid)
 		return false;
+
+#ifdef CONFIG_TRUENAS
+	if (pr_reg->pr_reg_port_tag != core_scsi3_sess_port_tag(sess))
+		return false;
+#endif
 
 	return true;
 }
@@ -748,6 +805,11 @@ target_scsi3_pr_reservation_check(struct se_cmd *cmd)
 			goto check_nonholder;
 	}
 
+#ifdef CONFIG_TRUENAS
+	if (pr_reg->pr_reg_port_tag != core_scsi3_sess_port_tag(sess))
+		goto check_nonholder;
+#endif
+
 	return 0;
 
 check_nonholder:
@@ -837,6 +899,14 @@ static struct t10_pr_registration *__core_scsi3_do_alloc_registration(
 	pr_reg->pr_res_mapped_lun = mapped_lun;
 	pr_reg->pr_aptpl_target_lun = lun->unpacked_lun;
 	pr_reg->tg_pt_sep_rtpi = lun->lun_tpg->tpg_rtpi;
+#ifdef CONFIG_TRUENAS
+	if (sess && sess->sess_port_set) {
+		pr_reg->pr_reg_port_tag = sess->sess_port_tag;
+		pr_reg->tg_pt_sep_rtpi = sess->sess_port_rtpi;
+	} else {
+		pr_reg->pr_reg_port_tag = core_scsi3_nacl_port_tag(nacl);
+	}
+#endif
 	pr_reg->pr_res_key = sa_res_key;
 	pr_reg->pr_reg_all_tg_pt = all_tg_pt;
 	pr_reg->pr_reg_aptpl = aptpl;
@@ -855,6 +925,54 @@ static struct t10_pr_registration *__core_scsi3_do_alloc_registration(
 
 static int core_scsi3_lunacl_depend_item(struct se_dev_entry *);
 static void core_scsi3_lunacl_undepend_item(struct se_dev_entry *);
+
+#ifdef CONFIG_TRUENAS
+/*
+ * Allocate the registration of @pr_reg's initiator port on the port that
+ * pairs with @pr_reg's port on the other node, and queue it on @mates.  It is
+ * for the same node ACL and ISID, and carries that port's tag and rtpi, so a
+ * session logged in through the peer's port finds itself registered
+ * (SPC-5 6.17.3: ALL_TG_PT registers the initiator port on every target
+ * port).  Nothing is queued if there is no such port.
+ *
+ * Takes the same deve references as the ALL_TG_PT siblings, released by
+ * __core_scsi3_add_registration() or on the error path below.
+ */
+static int core_scsi3_alloc_mate_registration(struct se_device *dev,
+					      struct t10_pr_registration *pr_reg,
+					      struct list_head *mates)
+{
+	struct se_dev_entry *deve = pr_reg->pr_reg_deve;
+	struct t10_pr_registration *mate;
+	u16 mate_tag, mate_rtpi;
+
+	if (!core_scsi3_mate_port(pr_reg->pr_reg_nacl, pr_reg->pr_reg_port_tag,
+				  &mate_tag, &mate_rtpi))
+		return 0;
+
+	kref_get(&deve->pr_kref);
+	if (core_scsi3_lunacl_depend_item(deve) < 0) {
+		kref_put(&deve->pr_kref, target_pr_kref_release);
+		return -EPERM;
+	}
+
+	mate = __core_scsi3_do_alloc_registration(dev, pr_reg->pr_reg_nacl,
+						  deve->se_lun, NULL, deve,
+						  pr_reg->pr_res_mapped_lun,
+						  pr_reg->isid_present_at_reg ?
+						  (unsigned char *)pr_reg->pr_reg_isid : NULL,
+						  pr_reg->pr_res_key, 1, pr_reg->pr_reg_aptpl);
+	if (!mate) {
+		core_scsi3_lunacl_undepend_item(deve);
+		return -ENOMEM;
+	}
+	mate->pr_reg_port_tag = mate_tag;
+	mate->tg_pt_sep_rtpi = mate_rtpi;
+
+	list_add_tail(&mate->pr_reg_atp_mem_list, mates);
+	return 0;
+}
+#endif /* CONFIG_TRUENAS */
 
 /*
  * Function used for handling PR registrations for ALL_TG_PT=1 and ALL_TG_PT=0
@@ -988,6 +1106,31 @@ static struct t10_pr_registration *__core_scsi3_alloc_registration(
 		percpu_ref_put(&lun_tmp->lun_ref);
 	}
 	spin_unlock(&dev->se_port_lock);
+
+#ifdef CONFIG_TRUENAS
+	{
+		LIST_HEAD(mates);
+		struct t10_pr_registration *pr_reg_src;
+
+		/*
+		 * Also register the initiator port on the paired port of the
+		 * other node, for the registration itself and for each of its
+		 * siblings.  The mates go on the list after the loop, so they
+		 * are not themselves given mates.
+		 */
+		ret = core_scsi3_alloc_mate_registration(dev, pr_reg, &mates);
+		list_for_each_entry(pr_reg_src, &pr_reg->pr_reg_atp_list,
+				    pr_reg_atp_mem_list) {
+			if (ret)
+				break;
+			ret = core_scsi3_alloc_mate_registration(dev, pr_reg_src,
+								 &mates);
+		}
+		list_splice_tail(&mates, &pr_reg->pr_reg_atp_list);
+		if (ret)
+			goto out;
+	}
+#endif
 
 	return pr_reg;
 out:
@@ -1153,6 +1296,9 @@ static int __core_scsi3_check_aptpl_registration(
 			pr_reg->pr_reg_dev = dev;
 			INIT_LIST_HEAD(&pr_reg->pr_sess_link);
 			pr_reg->tg_pt_sep_rtpi = lun->lun_tpg->tpg_rtpi;
+#ifdef CONFIG_TRUENAS
+			pr_reg->pr_reg_port_tag = core_scsi3_nacl_port_tag(nacl);
+#endif
 			list_del(&pr_reg->pr_reg_aptpl_list);
 			spin_unlock(&pr_tmpl->aptpl_reg_lock);
 			/*
@@ -1339,6 +1485,9 @@ static int core_scsi3_alloc_registration(
 static struct t10_pr_registration *__core_scsi3_locate_pr_reg(
 	struct se_device *dev,
 	struct se_node_acl *nacl,
+#ifdef CONFIG_TRUENAS
+	u16 port_tag,
+#endif
 	unsigned char *isid)
 {
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
@@ -1352,6 +1501,11 @@ static struct t10_pr_registration *__core_scsi3_locate_pr_reg(
 		 */
 		if (pr_reg->pr_reg_nacl != nacl)
 			continue;
+
+#ifdef CONFIG_TRUENAS
+		if (pr_reg->pr_reg_port_tag != port_tag)
+			continue;
+#endif
 
 		/*
 		 * If this registration does NOT contain a fabric provided
@@ -1405,7 +1559,13 @@ static struct t10_pr_registration *core_scsi3_locate_pr_reg(
 #endif
 	}
 
+#ifdef CONFIG_TRUENAS
+	return __core_scsi3_locate_pr_reg(dev, nacl,
+					  core_scsi3_sess_port_tag(sess),
+					  isid_ptr);
+#else
 	return __core_scsi3_locate_pr_reg(dev, nacl, isid_ptr);
+#endif
 }
 
 static void core_scsi3_put_pr_reg(struct t10_pr_registration *pr_reg)
@@ -1895,8 +2055,14 @@ core_scsi3_decode_spec_i_port(
 		 * Skip any TransportIDs that already have a registration for
 		 * this target port.
 		 */
+#ifdef CONFIG_TRUENAS
+		pr_reg_e = __core_scsi3_locate_pr_reg(dev, dest_node_acl,
+						      core_scsi3_nacl_port_tag(dest_node_acl),
+						      iport_ptr);
+#else
 		pr_reg_e = __core_scsi3_locate_pr_reg(dev, dest_node_acl,
 					iport_ptr);
+#endif
 		if (pr_reg_e) {
 			core_scsi3_put_pr_reg(pr_reg_e);
 			core_scsi3_lunacl_undepend_item(dest_se_deve);
@@ -3698,8 +3864,14 @@ after_iport_check:
 	 * register an I_T nexus that is already registered with the same
 	 * reservation key or a different reservation key.
 	 */
+#ifdef CONFIG_TRUENAS
+	dest_pr_reg = __core_scsi3_locate_pr_reg(dev, dest_node_acl,
+						 core_scsi3_nacl_port_tag(dest_node_acl),
+						 iport_ptr);
+#else
 	dest_pr_reg = __core_scsi3_locate_pr_reg(dev, dest_node_acl,
 					iport_ptr);
+#endif
 	if (!dest_pr_reg) {
 		struct se_lun *dest_lun = dest_se_deve->se_lun;
 
@@ -3711,8 +3883,14 @@ after_iport_check:
 			goto out;
 		}
 		spin_lock(&dev->dev_reservation_lock);
+#ifdef CONFIG_TRUENAS
+		dest_pr_reg = __core_scsi3_locate_pr_reg(dev, dest_node_acl,
+							 core_scsi3_nacl_port_tag(dest_node_acl),
+							 iport_ptr);
+#else
 		dest_pr_reg = __core_scsi3_locate_pr_reg(dev, dest_node_acl,
 						iport_ptr);
+#endif
 		new_reg = 1;
 	} else {
 		/*
@@ -3777,7 +3955,7 @@ after_iport_check:
 	strscpy(ha_src_tname,
 		pr_reg_nacl->se_tpg->se_tpg_tfo->tpg_get_wwn(pr_reg_nacl->se_tpg),
 		sizeof(ha_src_tname));
-	ha_src_tag = pr_reg_nacl->se_tpg->se_tpg_tfo->tpg_get_tag(pr_reg_nacl->se_tpg);
+	ha_src_tag = pr_reg->pr_reg_port_tag;
 	if (tf_ops->sess_get_initiator_sid)
 		tf_ops->sess_get_initiator_sid(se_sess, ha_src_sid,
 					       sizeof(ha_src_sid));
@@ -4108,7 +4286,7 @@ done:
 					nx.initiator_sid  = isid_buf;
 					nx.fabric_name    = tfo->fabric_name;
 					nx.target_name    = tfo->tpg_get_wwn(tpg);
-					nx.tpg_tag        = tfo->tpg_get_tag(tpg);
+					nx.tpg_tag        = core_scsi3_sess_port_tag(cmd->se_sess);
 					nx.all_tg_pt      = !!all_tg_pt;
 
 					n->pr_change(dev, (u8)sa, res_key,
@@ -4600,7 +4778,9 @@ target_check_reservation(struct se_cmd *cmd)
  *   res_all_tg_pt, mapped_lun, target_fabric, target_node, tpgt,
  *   port_rtpi, target_lun
  *
- * tpgt is the TPG tag in this node's own numbering.
+ * tpgt is the global tag of the physical target port the registration was
+ * made through (pr_reg_port_tag), which is the peer node's tag for a
+ * registration made through a forwarded session.
  *
  * Called on the ACTIVE node from lio_ha_on_connect() when the HA TCP link
  * comes up, to bulk-sync existing PR state to the newly connected STANDBY.
@@ -4655,7 +4835,7 @@ int target_ha_pr_export(struct se_device *dev, char *buf, size_t buf_len)
 			     (int)pr_reg->pr_reg_all_tg_pt,
 			     (unsigned long long)pr_reg->pr_res_mapped_lun,
 			     tfo->fabric_name, tfo->tpg_get_wwn(tpg),
-			     tfo->tpg_get_tag(tpg),
+			     pr_reg->pr_reg_port_tag,
 			     pr_reg->tg_pt_sep_rtpi,
 			     (unsigned long long)pr_reg->pr_aptpl_target_lun);
 		if ((size_t)n >= buf_len - off) {
@@ -4694,9 +4874,11 @@ EXPORT_SYMBOL(target_ha_pr_export);
  * target_ha_foreach_tpg_nacl_dev() or target_ha_foreach_nacl_dev().
  *
  * @isid is the fabric-provided nexus discriminator the registration had
- * (NULL or empty if it had none).  If the device already has a registration
- * for @nacl with the same discriminator, nothing is added; @res_holder is
- * still applied to that registration.
+ * (NULL or empty if it had none).  @port_tag and @port_rtpi are the global tag
+ * and relative target port identifier of the physical target port it was made
+ * through, which need not be the port of @nacl's TPG.  If the device already
+ * has a registration for @nacl with the same discriminator and port, nothing
+ * is added; @res_holder is still applied to that registration.
  *
  * Must not be called concurrently for the same device.
  * Returns 0 on success, -ENOMEM if allocation fails (registration skipped).
@@ -4706,6 +4888,8 @@ int target_ha_pr_add_reg(struct se_device *dev,
 			 struct se_lun *lun,
 			 u64 mapped_lun,
 			 const char *isid,
+			 u16 port_tag,
+			 u16 port_rtpi,
 			 bool all_tg_pt,
 			 u64 sa_res_key,
 			 int res_holder,
@@ -4726,6 +4910,8 @@ int target_ha_pr_add_reg(struct se_device *dev,
 	spin_lock(&pr_tmpl->registration_lock);
 	list_for_each_entry(pr_reg, &pr_tmpl->registration_list, pr_reg_list) {
 		if (pr_reg->pr_reg_nacl != nacl)
+			continue;
+		if (pr_reg->pr_reg_port_tag != port_tag)
 			continue;
 		if (!!isid != !!pr_reg->isid_present_at_reg)
 			continue;
@@ -4752,6 +4938,8 @@ int target_ha_pr_add_reg(struct se_device *dev,
 						    sa_res_key, all_tg_pt, 0);
 	if (!pr_reg)
 		return -ENOMEM;
+	pr_reg->pr_reg_port_tag = port_tag;
+	pr_reg->tg_pt_sep_rtpi = port_rtpi;
 
 	__core_scsi3_add_registration(dev, nacl, pr_reg, REGISTER, 0);
 

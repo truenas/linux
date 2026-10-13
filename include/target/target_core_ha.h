@@ -199,8 +199,9 @@ struct lio_ha_ops {
  *                  (e.g. FC, where the WWPN alone is unambiguous)
  * @fabric_name:    fabric driver name (e.g. "iscsi", "qla2xxx")
  * @target_name:    IQN or WWPN of the target the registration is on
- * @tpg_tag:        portal group tag of that target's TPG, in the numbering
- *                  of the node that fills in the structure
+ * @tpg_tag:        global tag of the physical target port the nexus is on:
+ *                  the local TPG's tag for a session on this node, the peer
+ *                  node's own tag for a session lio_ha forwarded
  * @all_tg_pt:      the registration was made with ALL_TG_PT set
  */
 struct lio_ha_pr_nexus {
@@ -225,11 +226,17 @@ struct lio_ha_pr_nexus {
  * lio_ha.ko registers this hook to receive incremental PR mutations and
  * push PERS_ACTION messages to STANDBY.  The hook is fired under RCU read
  * lock; implementations must not sleep.
+ *
+ * @peer_port_tag: return the global tag of the target port that pairs with
+ *             the port tagged @tag on the other node of the pair.  LIO core
+ *             uses it to register an ALL_TG_PT initiator port on that port
+ *             too.  Called under RCU read lock; must not sleep.
  */
 struct lio_ha_pr_notifier {
 	void (*pr_change)(struct se_device *dev, u8 action,
 			  u64 res_key, u64 sa_res_key, u8 type,
 			  const struct lio_ha_pr_nexus *nx);
+	u16 (*peer_port_tag)(u16 tag);
 };
 
 /* Defined in target_core_transport.c */
@@ -250,6 +257,10 @@ int target_ha_pr_export(struct se_device *dev, char *buf, size_t buf_len);
  * @mapped_lun: the initiator-side LUN number
  * @isid:       fabric-provided nexus discriminator the registration had;
  *              NULL or empty if it had none
+ * @port_tag:   global tag of the physical target port the registration was
+ *              made through; the peer node's tag if it was made through a
+ *              forwarded session
+ * @port_rtpi:  relative target port identifier of that port
  * @all_tg_pt:  the registration was made with ALL_TG_PT set
  * @sa_res_key: the registration key
  * @res_holder: 1 if this registration also holds the reservation
@@ -257,7 +268,8 @@ int target_ha_pr_export(struct se_device *dev, char *buf, size_t buf_len);
  *
  * Called by lio_ha.ko at failover to restore replicated PR state.
  * Idempotent: if the device already has a registration for @nacl with the
- * same @isid, none is added and @res_holder is applied to the existing one.
+ * same @isid and @port_tag, none is added and @res_holder is applied to the
+ * existing one.
  * Must not be called concurrently for the same device.
  * Returns 0 on success, -ENOMEM on allocation failure.
  */
@@ -266,6 +278,8 @@ int target_ha_pr_add_reg(struct se_device *dev,
 			 struct se_lun *lun,
 			 u64 mapped_lun,
 			 const char *isid,
+			 u16 port_tag,
+			 u16 port_rtpi,
 			 bool all_tg_pt,
 			 u64 sa_res_key,
 			 int res_holder,
