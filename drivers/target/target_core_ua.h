@@ -40,8 +40,7 @@ extern sense_reason_t target_scsi3_ua_check(struct se_cmd *);
 extern int core_scsi3_ua_allocate_all(struct se_dev_entry *, u8, u8,
 				      struct se_session *);
 extern int target_ua_allocate_sess(struct se_session *, u64, u8, u8);
-extern void target_ua_allocate_lun(struct se_node_acl *, u32, u8, u8,
-				   struct se_session *);
+extern int target_ua_allocate_sess_deve(struct se_session_deve *, u8, u8);
 extern void core_scsi3_ua_release_all(struct se_dev_entry *);
 extern bool core_scsi3_ua_for_check_condition(struct se_cmd *, u8 *, u8 *,
 					      u8 *);

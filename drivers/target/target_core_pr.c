@@ -68,8 +68,9 @@ static void __core_scsi3_complete_pro_release(struct se_device *, struct se_node
 					      struct t10_pr_registration *, int, int);
 
 /*
- * A registration's durable identity is (pr_reg_nacl, ISID); matching on
- * that identity is what makes a session eligible to bind to it.
+ * A registration records its I_T nexus as the node ACL (initiator name and
+ * target port) plus, when the fabric has one, the ISID. Return true if
+ * @sess is that nexus.
  */
 static bool core_scsi3_pr_match_nexus(struct t10_pr_registration *pr_reg,
 				      struct se_session *sess)
@@ -85,128 +86,50 @@ static bool core_scsi3_pr_match_nexus(struct t10_pr_registration *pr_reg,
 }
 
 /*
- * Return true if @sess currently backs an active registration on @dev.
+ * Return true if the I_T nexus of @sess holds a registration on @dev.
  */
 static bool core_scsi3_sess_is_registered(struct se_session *sess,
 					  struct se_device *dev)
 {
+	struct t10_reservation *pr_tmpl = &dev->t10_pr;
 	struct t10_pr_registration *pr_reg;
 	bool found = false;
 
-	spin_lock(&sess->sess_pr_lock);
-	list_for_each_entry(pr_reg, &sess->sess_pr_list, pr_sess_link) {
-		if (pr_reg->pr_reg_dev == dev) {
+	spin_lock(&pr_tmpl->registration_lock);
+	list_for_each_entry(pr_reg, &pr_tmpl->registration_list, pr_reg_list) {
+		if (core_scsi3_pr_match_nexus(pr_reg, sess)) {
 			found = true;
 			break;
 		}
 	}
-	spin_unlock(&sess->sess_pr_lock);
+	spin_unlock(&pr_tmpl->registration_lock);
 
 	return found;
 }
 
 /*
- * Bind every registration matching this session's identity, taking over
- * from whichever session (if any) currently backs it. A registration's
- * registered nexus is defined by identity (nacl + ISID), not by which
- * live struct se_session happens to be bound to it, so a matching
- * session always takes the binding -- iSCSI itself never allows two
- * live sessions with the same identity at once, so whatever session
- * currently holds it is either this one already, or one that is by
- * definition on its way out. Called on login, so a reconnecting session
- * re-attaches to registrations left behind by its predecessor without
- * waiting on that predecessor's own teardown to run first.
+ * Establish a unit attention condition on the logical unit of @pr_reg for
+ * every session that is its I_T nexus, other than @exclude_sess. Caller
+ * holds registration_lock, so @pr_reg cannot be freed under us.
  */
-void core_scsi3_bind_pr_reg_sess(struct se_session *sess)
+static void core_scsi3_pr_ua_allocate(struct t10_pr_registration *pr_reg,
+				      u8 asc, u8 ascq,
+				      struct se_session *exclude_sess)
 {
-	struct se_node_acl *nacl = sess->se_node_acl;
+	struct se_session_deve *sess_deve;
 	struct se_dev_entry *deve;
-	struct se_device *dev;
-	struct t10_pr_registration *pr_reg;
-
-	if (!nacl)
-		return;
 
 	rcu_read_lock();
-	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
-		if (!deve->se_lun)
-			continue;
-
-		dev = rcu_dereference(deve->se_lun->lun_se_dev);
-		if (!dev)
-			continue;
-
-		spin_lock(&dev->t10_pr.registration_lock);
-		list_for_each_entry(pr_reg, &dev->t10_pr.registration_list,
-				    pr_reg_list) {
-			struct se_session *old_sess;
-
-			if (!core_scsi3_pr_match_nexus(pr_reg, sess))
+	deve = target_nacl_find_deve(pr_reg->pr_reg_nacl,
+				     pr_reg->pr_res_mapped_lun);
+	if (deve) {
+		list_for_each_entry_rcu(sess_deve, &deve->sess_list, deve_link) {
+			if (sess_deve->se_sess == exclude_sess ||
+			    !core_scsi3_pr_match_nexus(pr_reg, sess_deve->se_sess))
 				continue;
 
-			old_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
-					lockdep_is_held(&dev->t10_pr.registration_lock));
-			if (old_sess == sess)
-				continue;
-
-			if (old_sess) {
-				spin_lock(&old_sess->sess_pr_lock);
-				list_del_init(&pr_reg->pr_sess_link);
-				spin_unlock(&old_sess->sess_pr_lock);
-			}
-
-			rcu_assign_pointer(pr_reg->pr_reg_sess, sess);
-			spin_lock(&sess->sess_pr_lock);
-			list_add_tail(&pr_reg->pr_sess_link, &sess->sess_pr_list);
-			spin_unlock(&sess->sess_pr_lock);
+			target_ua_allocate_sess_deve(sess_deve, asc, ascq);
 		}
-		spin_unlock(&dev->t10_pr.registration_lock);
-	}
-	rcu_read_unlock();
-}
-
-/*
- * Unbind every registration this session currently backs. Mirrors
- * core_scsi3_bind_pr_reg_sess()'s own traversal -- by the nacl's mapped
- * devices, under each device's registration_lock -- rather than walking
- * sess->sess_pr_list directly, so every pr_reg is only ever touched
- * while holding the same lock that also gates its removal in
- * __core_scsi3_free_registration(). Also only clears a registration
- * that is still actually bound to @sess: a concurrent login from a
- * reconnecting nexus with the same identity may already have taken it
- * over via core_scsi3_bind_pr_reg_sess(), and that binding must win.
- */
-void core_scsi3_unbind_pr_reg_sess(struct se_session *sess)
-{
-	struct se_node_acl *nacl = sess->se_node_acl;
-	struct se_dev_entry *deve;
-	struct se_device *dev;
-	struct t10_pr_registration *pr_reg;
-
-	if (!nacl)
-		return;
-
-	rcu_read_lock();
-	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
-		if (!deve->se_lun)
-			continue;
-
-		dev = rcu_dereference(deve->se_lun->lun_se_dev);
-		if (!dev)
-			continue;
-
-		spin_lock(&dev->t10_pr.registration_lock);
-		list_for_each_entry(pr_reg, &dev->t10_pr.registration_list,
-				    pr_reg_list) {
-			if (rcu_access_pointer(pr_reg->pr_reg_sess) != sess)
-				continue;
-
-			spin_lock(&sess->sess_pr_lock);
-			list_del_init(&pr_reg->pr_sess_link);
-			spin_unlock(&sess->sess_pr_lock);
-			rcu_assign_pointer(pr_reg->pr_reg_sess, NULL);
-		}
-		spin_unlock(&dev->t10_pr.registration_lock);
 	}
 	rcu_read_unlock();
 }
@@ -698,7 +621,6 @@ target_scsi3_pr_reservation_check(struct se_cmd *cmd)
 	struct se_device *dev = cmd->se_dev;
 	struct se_session *sess = cmd->se_sess;
 	struct t10_pr_registration *pr_reg;
-	struct se_session *holder_sess;
 	u32 pr_reg_type;
 
 	if (!dev->dev_pr_res_holder)
@@ -708,21 +630,8 @@ target_scsi3_pr_reservation_check(struct se_cmd *cmd)
 	pr_reg_type = pr_reg->pr_res_type;
 	cmd->pr_res_key = pr_reg->pr_res_key;
 
-	rcu_read_lock();
-	holder_sess = rcu_dereference(pr_reg->pr_reg_sess);
-	if (holder_sess && holder_sess == sess) {
-		rcu_read_unlock();
-		return 0;
-	}
-	rcu_read_unlock();
-
-	if (pr_reg->pr_reg_nacl != sess->se_node_acl)
+	if (!core_scsi3_pr_match_nexus(pr_reg, sess))
 		goto check_nonholder;
-
-	if (pr_reg->isid_present_at_reg) {
-		if (pr_reg->pr_reg_bin_isid != sess->sess_bin_isid)
-			goto check_nonholder;
-	}
 
 	return 0;
 
@@ -756,7 +665,6 @@ static struct t10_pr_registration *__core_scsi3_do_alloc_registration(
 	struct se_device *dev,
 	struct se_node_acl *nacl,
 	struct se_lun *lun,
-	struct se_session *sess,
 	struct se_dev_entry *dest_deve,
 	u64 mapped_lun,
 	unsigned char *isid,
@@ -778,14 +686,6 @@ static struct t10_pr_registration *__core_scsi3_do_alloc_registration(
 	INIT_LIST_HEAD(&pr_reg->pr_reg_atp_list);
 	INIT_LIST_HEAD(&pr_reg->pr_reg_atp_mem_list);
 	atomic_set(&pr_reg->pr_res_holders, 0);
-	pr_reg->pr_reg_dev = dev;
-	INIT_LIST_HEAD(&pr_reg->pr_sess_link);
-	if (sess) {
-		rcu_assign_pointer(pr_reg->pr_reg_sess, sess);
-		spin_lock(&sess->sess_pr_lock);
-		list_add_tail(&pr_reg->pr_sess_link, &sess->sess_pr_list);
-		spin_unlock(&sess->sess_pr_lock);
-	}
 	pr_reg->pr_reg_nacl = nacl;
 	/*
 	 * For destination registrations for ALL_TG_PT=1 and SPEC_I_PT=1,
@@ -845,8 +745,7 @@ static struct t10_pr_registration *__core_scsi3_alloc_registration(
 	unsigned char *isid,
 	u64 sa_res_key,
 	int all_tg_pt,
-	int aptpl,
-	struct se_session *sess)
+	int aptpl)
 {
 	struct se_dev_entry *deve_tmp;
 	struct se_node_acl *nacl_tmp;
@@ -859,9 +758,9 @@ static struct t10_pr_registration *__core_scsi3_alloc_registration(
 	 * Create a registration for the I_T Nexus upon which the
 	 * PROUT REGISTER was received.
 	 */
-	pr_reg = __core_scsi3_do_alloc_registration(dev, nacl, lun, sess, deve,
-						    mapped_lun, isid, sa_res_key,
-						    all_tg_pt, aptpl);
+	pr_reg = __core_scsi3_do_alloc_registration(dev, nacl, lun, deve, mapped_lun,
+						    isid, sa_res_key, all_tg_pt,
+						    aptpl);
 	if (!pr_reg)
 		return NULL;
 	/*
@@ -935,19 +834,10 @@ static struct t10_pr_registration *__core_scsi3_alloc_registration(
 			 */
 			dest_lun = deve_tmp->se_lun;
 
-			/*
-			 * nacl_tmp is a different I_T nexus than the caller's
-			 * own nacl (same initiator identity, a different
-			 * target port) -- pass NULL rather than the caller's
-			 * sess, which belongs to nacl, not nacl_tmp. Left
-			 * unbound until nacl_tmp's own live session, if any,
-			 * next binds it via core_scsi3_bind_pr_reg_sess().
-			 */
 			pr_reg_atp = __core_scsi3_do_alloc_registration(dev,
-						nacl_tmp, dest_lun, NULL,
-						deve_tmp, deve_tmp->mapped_lun,
-						NULL, sa_res_key, all_tg_pt,
-						aptpl);
+						nacl_tmp, dest_lun, deve_tmp,
+						deve_tmp->mapped_lun, NULL,
+						sa_res_key, all_tg_pt, aptpl);
 			if (!pr_reg_atp) {
 				percpu_ref_put(&lun_tmp->lun_ref);
 				core_scsi3_lunacl_undepend_item(deve_tmp);
@@ -1126,8 +1016,6 @@ static int __core_scsi3_check_aptpl_registration(
 			rcu_read_unlock();
 
 			pr_reg->pr_reg_nacl = nacl;
-			pr_reg->pr_reg_dev = dev;
-			INIT_LIST_HEAD(&pr_reg->pr_sess_link);
 			pr_reg->tg_pt_sep_rtpi = lun->lun_tpg->tpg_rtpi;
 			list_del(&pr_reg->pr_reg_aptpl_list);
 			spin_unlock(&pr_tmpl->aptpl_reg_lock);
@@ -1280,11 +1168,6 @@ out:
 	rcu_read_unlock();
 }
 
-/*
- * sess is the live I_T nexus to bind the new registration to, or NULL
- * when the registration belongs to a different nexus than the one
- * that issued this command. See core_scsi3_bind_pr_reg_sess().
- */
 static int core_scsi3_alloc_registration(
 	struct se_device *dev,
 	struct se_node_acl *nacl,
@@ -1296,14 +1179,13 @@ static int core_scsi3_alloc_registration(
 	int all_tg_pt,
 	int aptpl,
 	enum register_type register_type,
-	int register_move,
-	struct se_session *sess)
+	int register_move)
 {
 	struct t10_pr_registration *pr_reg;
 
 	pr_reg = __core_scsi3_alloc_registration(dev, nacl, lun, deve, mapped_lun,
 						 isid, sa_res_key, all_tg_pt,
-						 aptpl, sess);
+						 aptpl);
 	if (!pr_reg)
 		return -EPERM;
 
@@ -1442,20 +1324,9 @@ static void __core_scsi3_free_registration(
 	const struct target_core_fabric_ops *tfo =
 			pr_reg->pr_reg_nacl->se_tpg->se_tpg_tfo;
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
-	struct se_session *pr_sess;
 	char i_buf[PR_REG_ISID_ID_LEN] = { };
 
 	lockdep_assert_held(&pr_tmpl->registration_lock);
-
-	pr_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
-					    lockdep_is_held(&pr_tmpl->registration_lock));
-	if (pr_sess) {
-		spin_lock(&pr_sess->sess_pr_lock);
-		if (!list_empty(&pr_reg->pr_sess_link))
-			list_del_init(&pr_reg->pr_sess_link);
-		rcu_assign_pointer(pr_reg->pr_reg_sess, NULL);
-		spin_unlock(&pr_sess->sess_pr_lock);
-	}
 
 	core_pr_dump_initiator_port(pr_reg, i_buf, PR_REG_ISID_ID_LEN);
 
@@ -1669,7 +1540,7 @@ core_scsi3_decode_spec_i_port(
 	local_pr_reg = __core_scsi3_alloc_registration(cmd->se_dev,
 				se_sess->se_node_acl, cmd->se_lun,
 				NULL, cmd->orig_fe_lun, l_isid,
-				sa_res_key, all_tg_pt, aptpl, se_sess);
+				sa_res_key, all_tg_pt, aptpl);
 	if (!local_pr_reg) {
 		kfree(tidh_new);
 		return TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
@@ -1915,7 +1786,7 @@ core_scsi3_decode_spec_i_port(
 		dest_pr_reg = __core_scsi3_alloc_registration(cmd->se_dev,
 					dest_node_acl, dest_lun, dest_se_deve,
 					dest_se_deve->mapped_lun, iport_ptr,
-					sa_res_key, all_tg_pt, aptpl, NULL);
+					sa_res_key, all_tg_pt, aptpl);
 		if (!dest_pr_reg) {
 			core_scsi3_lunacl_undepend_item(dest_se_deve);
 			core_scsi3_nodeacl_undepend_item(dest_node_acl);
@@ -2254,7 +2125,7 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 					se_sess->se_node_acl, cmd->se_lun,
 					NULL, cmd->orig_fe_lun, isid_ptr,
 					sa_res_key, all_tg_pt, aptpl,
-					register_type, 0, se_sess)) {
+					register_type, 0)) {
 				pr_err("Unable to allocate"
 					" struct t10_pr_registration\n");
 				return TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
@@ -2386,10 +2257,7 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 					&pr_tmpl->registration_list,
 					pr_reg_list) {
 
-				target_ua_allocate_lun(
-					pr_reg_p->pr_reg_nacl,
-					pr_reg_p->pr_res_mapped_lun,
-					0x2A,
+				core_scsi3_pr_ua_allocate(pr_reg_p, 0x2A,
 					ASCQ_2AH_RESERVATIONS_RELEASED,
 					se_sess);
 			}
@@ -2820,9 +2688,8 @@ core_scsi3_emulate_pro_release(struct se_cmd *cmd, int type, int scope,
 		if (pr_reg_p == pr_reg)
 			continue;
 
-		target_ua_allocate_lun(pr_reg_p->pr_reg_nacl,
-				pr_reg_p->pr_res_mapped_lun,
-				0x2A, ASCQ_2AH_RESERVATIONS_RELEASED, se_sess);
+		core_scsi3_pr_ua_allocate(pr_reg_p, 0x2A,
+				ASCQ_2AH_RESERVATIONS_RELEASED, se_sess);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 
@@ -2839,11 +2706,9 @@ static sense_reason_t
 core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
 {
 	struct se_device *dev = cmd->se_dev;
-	struct se_node_acl *pr_reg_nacl;
 	struct se_session *se_sess = cmd->se_sess;
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
 	struct t10_pr_registration *pr_reg, *pr_reg_tmp, *pr_reg_n, *pr_res_holder;
-	u64 pr_res_mapped_lun = 0;
 	int calling_it_nexus = 0;
 	/*
 	 * Locate the existing *pr_reg via struct se_node_acl pointers
@@ -2898,10 +2763,6 @@ core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
 			&pr_tmpl->registration_list, pr_reg_list) {
 
 		calling_it_nexus = (pr_reg_n == pr_reg) ? 1 : 0;
-		pr_reg_nacl = pr_reg->pr_reg_nacl;
-		pr_res_mapped_lun = pr_reg->pr_res_mapped_lun;
-		__core_scsi3_free_registration(dev, pr_reg, NULL,
-					calling_it_nexus);
 		/*
 		 * e) Establish a unit attention condition for the initiator
 		 *    port associated with every registered I_T nexus other
@@ -2910,8 +2771,10 @@ core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
 		 *    additional sense code set to RESERVATIONS PREEMPTED.
 		 */
 		if (!calling_it_nexus)
-			target_ua_allocate_lun(pr_reg_nacl, pr_res_mapped_lun,
-				0x2A, ASCQ_2AH_RESERVATIONS_PREEMPTED, se_sess);
+			core_scsi3_pr_ua_allocate(pr_reg, 0x2A,
+				ASCQ_2AH_RESERVATIONS_PREEMPTED, se_sess);
+		__core_scsi3_free_registration(dev, pr_reg, NULL,
+					calling_it_nexus);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 
@@ -2997,12 +2860,10 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 		u64 sa_res_key, enum preempt_type preempt_type)
 {
 	struct se_device *dev = cmd->se_dev;
-	struct se_session *pr_reg_sess;
 	struct se_session *se_sess = cmd->se_sess;
 	LIST_HEAD(preempt_and_abort_list);
 	struct t10_pr_registration *pr_reg, *pr_reg_tmp, *pr_reg_n, *pr_res_holder;
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
-	u64 pr_res_mapped_lun = 0;
 	int all_reg = 0, calling_it_nexus = 0;
 	bool sa_res_key_unmatched = sa_res_key != 0;
 	int prh_type = 0, prh_scope = 0;
@@ -3082,9 +2943,10 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 				sa_res_key_unmatched = false;
 
 				calling_it_nexus = (pr_reg_n == pr_reg) ? 1 : 0;
-				pr_reg_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
-						lockdep_is_held(&pr_tmpl->registration_lock));
-				pr_res_mapped_lun = pr_reg->pr_res_mapped_lun;
+				if (!calling_it_nexus)
+					core_scsi3_pr_ua_allocate(pr_reg, 0x2A,
+						ASCQ_2AH_REGISTRATIONS_PREEMPTED,
+						se_sess);
 				__core_scsi3_free_registration(dev, pr_reg,
 					(preempt_type == PREEMPT_AND_ABORT) ? &preempt_and_abort_list :
 						NULL, calling_it_nexus);
@@ -3111,17 +2973,13 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 				if (calling_it_nexus)
 					continue;
 
-				pr_reg_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
-						lockdep_is_held(&pr_tmpl->registration_lock));
-				pr_res_mapped_lun = pr_reg->pr_res_mapped_lun;
+				core_scsi3_pr_ua_allocate(pr_reg, 0x2A,
+					ASCQ_2AH_REGISTRATIONS_PREEMPTED,
+					se_sess);
 				__core_scsi3_free_registration(dev, pr_reg,
 					(preempt_type == PREEMPT_AND_ABORT) ? &preempt_and_abort_list :
 						NULL, 0);
 			}
-			if (!calling_it_nexus && pr_reg_sess)
-				target_ua_allocate_sess(pr_reg_sess,
-					pr_res_mapped_lun, 0x2A,
-					ASCQ_2AH_REGISTRATIONS_PREEMPTED);
 		}
 		spin_unlock(&pr_tmpl->registration_lock);
 		/*
@@ -3229,21 +3087,17 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 		if (sa_res_key && pr_reg->pr_res_key != sa_res_key)
 			continue;
 
-		pr_reg_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
-				lockdep_is_held(&pr_tmpl->registration_lock));
-		pr_res_mapped_lun = pr_reg->pr_res_mapped_lun;
-		__core_scsi3_free_registration(dev, pr_reg,
-				(preempt_type == PREEMPT_AND_ABORT) ? &preempt_and_abort_list : NULL,
-				calling_it_nexus);
 		/*
 		 * e) Establish a unit attention condition for the initiator
 		 *    port associated with every I_T nexus that lost its
 		 *    persistent reservation and/or registration, with the
 		 *    additional sense code set to REGISTRATIONS PREEMPTED;
 		 */
-		if (pr_reg_sess)
-			target_ua_allocate_sess(pr_reg_sess, pr_res_mapped_lun, 0x2A,
-					ASCQ_2AH_REGISTRATIONS_PREEMPTED);
+		core_scsi3_pr_ua_allocate(pr_reg, 0x2A,
+				ASCQ_2AH_REGISTRATIONS_PREEMPTED, se_sess);
+		__core_scsi3_free_registration(dev, pr_reg,
+				(preempt_type == PREEMPT_AND_ABORT) ? &preempt_and_abort_list : NULL,
+				calling_it_nexus);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
 	/*
@@ -3275,12 +3129,8 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 			if (calling_it_nexus)
 				continue;
 
-			pr_reg_sess = rcu_dereference_protected(pr_reg->pr_reg_sess,
-					lockdep_is_held(&pr_tmpl->registration_lock));
-			if (pr_reg_sess)
-				target_ua_allocate_sess(pr_reg_sess,
-						pr_reg->pr_res_mapped_lun, 0x2A,
-						ASCQ_2AH_RESERVATIONS_RELEASED);
+			core_scsi3_pr_ua_allocate(pr_reg, 0x2A,
+					ASCQ_2AH_RESERVATIONS_RELEASED, se_sess);
 		}
 		spin_unlock(&pr_tmpl->registration_lock);
 	}
@@ -3650,7 +3500,7 @@ after_iport_check:
 		spin_unlock(&dev->dev_reservation_lock);
 		if (core_scsi3_alloc_registration(cmd->se_dev, dest_node_acl,
 					dest_lun, dest_se_deve, dest_se_deve->mapped_lun,
-					iport_ptr, sa_res_key, 0, aptpl, 2, 1, NULL)) {
+					iport_ptr, sa_res_key, 0, aptpl, 2, 1)) {
 			ret = TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
 			goto out;
 		}
