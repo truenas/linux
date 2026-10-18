@@ -366,11 +366,9 @@ static int nvmet_tcp_build_pdu_iovec(struct nvmet_tcp_cmd *cmd)
 	struct bio_vec *iov = cmd->iov;
 	struct scatterlist *sg;
 	u32 length, offset, sg_offset;
-	unsigned int sg_remaining;
-	int nr_pages;
+	unsigned int sg_remaining, nr_bvec = 0;
 
 	length = cmd->pdu_len;
-	nr_pages = DIV_ROUND_UP(length, PAGE_SIZE);
 	offset = cmd->rbytes_done;
 	cmd->sg_idx = offset / PAGE_SIZE;
 	sg_offset = offset % PAGE_SIZE;
@@ -396,11 +394,12 @@ static int nvmet_tcp_build_pdu_iovec(struct nvmet_tcp_cmd *cmd)
 		sg = sg_next(sg);
 		sg_remaining--;
 		iov++;
+		nr_bvec++;
 		sg_offset = 0;
 	}
 
 	iov_iter_bvec(&cmd->recv_msg.msg_iter, ITER_DEST, cmd->iov,
-		      nr_pages, cmd->pdu_len);
+		      nr_bvec, cmd->pdu_len);
 	return 0;
 }
 
