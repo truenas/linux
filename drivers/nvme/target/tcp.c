@@ -28,6 +28,11 @@
 /* Assume mpsmin == device_page_size == 4KB */
 #define NVMET_TCP_MAX_MDTS		8
 #define NVMET_TCP_MAXH2CDATA		SZ_4M
+/*
+ * Preserve the 4 MiB allocation bound from 4a3f00262a04, originally
+ * borrowed from MAXH2CDATA, to cap memory held by incomplete commands.
+ */
+#define NVMET_TCP_MAX_CMD_DATA		SZ_4M
 #define NVMET_TCP_BACKLOG 128
 
 static int param_store_val(const char *str, int *val, int min, int max)
@@ -438,17 +443,8 @@ static int nvmet_tcp_map_data(struct nvmet_tcp_cmd *cmd)
 	if (!len)
 		return 0;
 
-	/*
-	 * inline_data_size only bounds the in-capsule (type 0x01) SGL
-	 * descriptor below. A non-inline transport SGL data-block
-	 * descriptor skips that check entirely and would otherwise reach
-	 * sgl_alloc() with an attacker-controlled len of up to 4 GiB,
-	 * pinning that much kernel memory for a command that may never
-	 * complete. Bound every descriptor type here, before allocating
-	 * anything, using the same ceiling this file already applies to
-	 * per-PDU H2C data.
-	 */
-	if (len > NVMET_TCP_MAXH2CDATA)
+	/* Bound every SGL type before allocating; inline limits are separate. */
+	if (len > NVMET_TCP_MAX_CMD_DATA)
 		return NVME_SC_SGL_INVALID_DATA | NVME_STATUS_DNR;
 
 	if (sgl->type == ((NVME_SGL_FMT_DATA_DESC << 4) |
