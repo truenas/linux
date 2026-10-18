@@ -476,21 +476,27 @@ err:
 	return NVME_SC_INTERNAL;
 }
 
-static void nvmet_tcp_calc_ddgst(struct nvmet_tcp_cmd *cmd)
+static void nvmet_tcp_calc_ddgst(struct nvmet_tcp_cmd *cmd, size_t offset,
+				 size_t total_len)
 {
-	size_t total_len = cmd->req.transfer_len;
 	struct scatterlist *sg = cmd->req.sg;
 	u32 crc = ~0;
 
+	while (offset >= sg->length) {
+		offset -= sg->length;
+		sg = sg_next(sg);
+	}
+
 	while (total_len) {
-		size_t len = min_t(size_t, total_len, sg->length);
+		size_t len = min_t(size_t, total_len, sg->length - offset);
 
 		/*
 		 * Note that the scatterlist does not contain any highmem pages,
 		 * as it was allocated by sgl_alloc() with GFP_KERNEL.
 		 */
-		crc = crc32c(crc, sg_virt(sg), len);
+		crc = crc32c(crc, sg_virt(sg) + offset, len);
 		total_len -= len;
+		offset = 0;
 		sg = sg_next(sg);
 	}
 	cmd->exp_ddgst = cpu_to_le32(~crc);
@@ -520,7 +526,7 @@ static void nvmet_setup_c2h_data_pdu(struct nvmet_tcp_cmd *cmd)
 
 	if (queue->data_digest) {
 		pdu->hdr.flags |= NVME_TCP_F_DDGST;
-		nvmet_tcp_calc_ddgst(cmd);
+		nvmet_tcp_calc_ddgst(cmd, 0, cmd->req.transfer_len);
 	}
 
 	if (cmd->queue->hdr_digest) {
@@ -1293,7 +1299,8 @@ static void nvmet_tcp_prep_recv_ddgst(struct nvmet_tcp_cmd *cmd)
 {
 	struct nvmet_tcp_queue *queue = cmd->queue;
 
-	nvmet_tcp_calc_ddgst(cmd);
+	nvmet_tcp_calc_ddgst(cmd, cmd->rbytes_done - cmd->pdu_len,
+			     cmd->pdu_len);
 	queue->offset = 0;
 	queue->left = NVME_TCP_DIGEST_LENGTH;
 	queue->rcv_state = NVMET_TCP_RECV_DDGST;
