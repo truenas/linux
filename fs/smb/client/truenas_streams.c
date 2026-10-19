@@ -266,7 +266,7 @@ do_stream_open(struct cifs_tcon *tcon, struct cifs_sb_info *sb,
 	       enum stream_open_type otype, unsigned int xid,
 	       const char *path, const char *stream,
 	       int xattr_flags, struct cifs_fid *fid_out,
-	       struct smb2_file_all_info *info_out)
+	       struct cifs_open_info_data *info_out)
 {
 	int rc;
 	__le16 *utf16_path = NULL;
@@ -347,7 +347,7 @@ delete_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 {
 	int rc;
 	struct cifs_fid fid;
-	struct smb2_file_all_info info;
+	struct cifs_open_info_data info = {};
 
 	rc = do_stream_open(tcon, CIFS_SB(dentry->d_sb), STREAM_OPEN_DELETE, xid, path, stream, 0, &fid, &info);
         if (rc) {
@@ -377,7 +377,7 @@ write_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 	struct cifs_fid fid;
 	struct cifs_io_parms io_parms;
 	struct kvec iov[2]; // header, data
-	struct smb2_file_all_info info;
+	struct cifs_open_info_data info = {};
 	unsigned int written = 0;
 	unsigned int total_written;
 	unsigned int wsize;
@@ -432,7 +432,7 @@ write_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 		}
 	}
 
-	if (total_written < le64_to_cpu(info.EndOfFile)) {
+	if (total_written < le64_to_cpu(info.fi.EndOfFile)) {
 		int err;
 		err = SMB2_set_eof(xid, tcon, fid.persistent_fid,
 		    fid.volatile_fid, current->tgid, total_written);
@@ -454,7 +454,7 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 	int rc, buf_type = CIFS_NO_BUFFER;
 	struct cifs_fid fid;
 	struct cifs_io_parms io_parms;
-	struct smb2_file_all_info info;
+	struct cifs_open_info_data info = {};
 	unsigned int bytes_read = 0;
 	unsigned int total_read;
 	u32 to_read;
@@ -472,11 +472,11 @@ read_stream(struct dentry *dentry, struct cifs_tcon *tcon,
 
 	if (dstsz == 0) {
 		server->ops->close(xid, tcon, &fid);
-		*pused = le64_to_cpu(info.EndOfFile) + streams_samba_compat_enabled;
+		*pused = le64_to_cpu(info.fi.EndOfFile) + streams_samba_compat_enabled;
 		return 0;
 	}
 
-	to_read = le64_to_cpu(info.EndOfFile);
+	to_read = le64_to_cpu(info.fi.EndOfFile);
 	if ((to_read >= XATTR_LARGE_SIZE_MAX) ||
 	    ((to_read + streams_samba_compat_enabled) > dstsz)) {
 		/*
