@@ -1585,6 +1585,7 @@ core_scsi3_decode_spec_i_port(
 		return TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
 	}
 
+	tidh_new->dest_se_deve = local_pr_reg->pr_reg_deve;
 	tidh_new->dest_pr_reg = local_pr_reg;
 	list_add_tail(&tidh_new->dest_list, &tid_dest_list);
 
@@ -1851,10 +1852,13 @@ core_scsi3_decode_spec_i_port(
 	 * was received.
 	 */
 	list_for_each_entry_safe(tidh, tidh_tmp, &tid_dest_list, dest_list) {
+		struct se_lun_acl *dest_lacl;
+
 		dest_tpg = tidh->dest_tpg;
 		dest_node_acl = tidh->dest_node_acl;
 		dest_se_deve = tidh->dest_se_deve;
 		dest_pr_reg = tidh->dest_pr_reg;
+		dest_lacl = dest_se_deve->se_lun_acl;
 
 		list_del(&tidh->dest_list);
 		kfree(tidh);
@@ -1864,12 +1868,20 @@ core_scsi3_decode_spec_i_port(
 
 		__core_scsi3_add_registration(cmd->se_dev, dest_node_acl,
 					dest_pr_reg, 0, 0);
+		/*
+		 * __core_scsi3_add_registration() drops the deve->pr_kref
+		 * reference but not the configfs dependency on the mapped LUN
+		 * taken above, so drop that here. Without this, the initiator's
+		 * lun_N directory can never be removed.
+		 */
+		if (dest_lacl)
+			target_undepend_item(&dest_lacl->se_lun_group.cg_item);
 
 		pr_debug("SPC-3 PR [%s] SPEC_I_PT: Successfully"
 			" registered Transport ID for Node: %s%s Mapped LUN:"
 			" %llu\n", dest_tpg->se_tpg_tfo->fabric_name,
-			dest_node_acl->initiatorname, i_buf, (dest_se_deve) ?
-			dest_se_deve->mapped_lun : 0);
+			dest_node_acl->initiatorname, i_buf,
+			dest_pr_reg->pr_res_mapped_lun);
 
 		if (dest_pr_reg == local_pr_reg)
 			continue;
