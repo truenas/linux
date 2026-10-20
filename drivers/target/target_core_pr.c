@@ -3712,7 +3712,7 @@ after_iport_check:
 	 * b) Ignore the contents of the (received) SCOPE and TYPE fields;
 	 */
 	type = pr_res_holder->pr_res_type;
-	scope = pr_res_holder->pr_res_type;
+	scope = pr_res_holder->pr_res_scope;
 	/*
 	 * c) Associate the reservation key specified in the SERVICE ACTION
 	 *    RESERVATION KEY field with the I_T nexus specified as the
@@ -3788,7 +3788,7 @@ after_iport_check:
 	dev->dev_pr_res_holder = dest_pr_reg;
 	dest_pr_reg->pr_res_holder = 1;
 	dest_pr_reg->pr_res_type = type;
-	pr_reg->pr_res_scope = scope;
+	dest_pr_reg->pr_res_scope = scope;
 	core_pr_dump_initiator_port(pr_reg, i_buf, PR_REG_ISID_ID_LEN);
 	/*
 	 * Increment PRGeneration for existing registrations..
