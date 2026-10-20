@@ -1583,26 +1583,32 @@ void core_scsi3_free_pr_reg_from_nacl(
 {
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
 	struct t10_pr_registration *pr_reg, *pr_reg_tmp, *pr_res_holder;
-	bool free_reg = false;
 	/*
 	 * If the passed se_node_acl matches the reservation holder,
-	 * release the reservation.
+	 * release the reservation. For an all registrants reservation,
+	 * releasing the holder hands the reservation to another
+	 * registration, which may also belong to @nacl (a second I_T
+	 * nexus of the same initiator). Keep releasing until the holder
+	 * belongs to another node ACL or there is none, so that
+	 * dev_pr_res_holder never points at a registration freed below.
 	 */
 	spin_lock(&dev->dev_reservation_lock);
-	pr_res_holder = dev->dev_pr_res_holder;
-	if ((pr_res_holder != NULL) &&
-	    (pr_res_holder->pr_reg_nacl == nacl)) {
+	while ((pr_res_holder = dev->dev_pr_res_holder) &&
+	       pr_res_holder->pr_reg_nacl == nacl) {
 		__core_scsi3_complete_pro_release(dev, nacl, pr_res_holder, 0, 1);
-		free_reg = true;
+		spin_unlock(&dev->dev_reservation_lock);
+
+		spin_lock(&pr_tmpl->registration_lock);
+		__core_scsi3_free_registration(dev, pr_res_holder, NULL, 0);
+		spin_unlock(&pr_tmpl->registration_lock);
+
+		spin_lock(&dev->dev_reservation_lock);
 	}
 	spin_unlock(&dev->dev_reservation_lock);
 	/*
 	 * Release any registration associated with the struct se_node_acl.
 	 */
 	spin_lock(&pr_tmpl->registration_lock);
-	if (pr_res_holder && free_reg)
-		__core_scsi3_free_registration(dev, pr_res_holder, NULL, 0);
-
 	list_for_each_entry_safe(pr_reg, pr_reg_tmp,
 			&pr_tmpl->registration_list, pr_reg_list) {
 
