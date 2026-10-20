@@ -3729,9 +3729,17 @@ after_iport_check:
 		struct se_lun *dest_lun = dest_se_deve->se_lun;
 
 		spin_unlock(&dev->dev_reservation_lock);
+		/*
+		 * The new registration takes its own deve->pr_kref reference,
+		 * which __core_scsi3_add_registration() drops. The reference
+		 * from core_get_se_deve_from_rtpi() is dropped together with
+		 * the configfs dependency below.
+		 */
+		kref_get(&dest_se_deve->pr_kref);
 		if (core_scsi3_alloc_registration(cmd->se_dev, dest_node_acl,
 					dest_lun, dest_se_deve, dest_se_deve->mapped_lun,
 					iport_ptr, sa_res_key, 0, aptpl, 2, 1, NULL)) {
+			kref_put(&dest_se_deve->pr_kref, target_pr_kref_release);
 			ret = TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
 			goto out;
 		}
