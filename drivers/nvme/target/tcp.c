@@ -18,12 +18,21 @@
 #include <net/handshake.h>
 #include <linux/inet.h>
 #include <linux/llist.h>
+#include <linux/sizes.h>
 #include <trace/events/sock.h>
 
 #include "nvmet.h"
 
 #define NVMET_TCP_DEF_INLINE_DATA_SIZE	(4 * PAGE_SIZE)
-#define NVMET_TCP_MAXH2CDATA		0x400000 /* 16M arbitrary limit */
+
+/* Assume mpsmin == device_page_size == 4KB */
+#define NVMET_TCP_MAX_MDTS		8
+#define NVMET_TCP_MAXH2CDATA		SZ_4M
+/*
+ * Preserve the 4 MiB allocation bound from 4a3f00262a04, originally
+ * borrowed from MAXH2CDATA, to cap memory held by incomplete commands.
+ */
+#define NVMET_TCP_MAX_CMD_DATA		SZ_4M
 #define NVMET_TCP_BACKLOG 128
 
 static int param_store_val(const char *str, int *val, int min, int max)
@@ -357,11 +366,9 @@ static int nvmet_tcp_build_pdu_iovec(struct nvmet_tcp_cmd *cmd)
 	struct bio_vec *iov = cmd->iov;
 	struct scatterlist *sg;
 	u32 length, offset, sg_offset;
-	unsigned int sg_remaining;
-	int nr_pages;
+	unsigned int sg_remaining, nr_bvec = 0;
 
 	length = cmd->pdu_len;
-	nr_pages = DIV_ROUND_UP(length, PAGE_SIZE);
 	offset = cmd->rbytes_done;
 	cmd->sg_idx = offset / PAGE_SIZE;
 	sg_offset = offset % PAGE_SIZE;
@@ -387,11 +394,12 @@ static int nvmet_tcp_build_pdu_iovec(struct nvmet_tcp_cmd *cmd)
 		sg = sg_next(sg);
 		sg_remaining--;
 		iov++;
+		nr_bvec++;
 		sg_offset = 0;
 	}
 
 	iov_iter_bvec(&cmd->recv_msg.msg_iter, ITER_DEST, cmd->iov,
-		      nr_pages, cmd->pdu_len);
+		      nr_bvec, cmd->pdu_len);
 	return 0;
 }
 
@@ -434,17 +442,8 @@ static int nvmet_tcp_map_data(struct nvmet_tcp_cmd *cmd)
 	if (!len)
 		return 0;
 
-	/*
-	 * inline_data_size only bounds the in-capsule (type 0x01) SGL
-	 * descriptor below. A non-inline transport SGL data-block
-	 * descriptor skips that check entirely and would otherwise reach
-	 * sgl_alloc() with an attacker-controlled len of up to 4 GiB,
-	 * pinning that much kernel memory for a command that may never
-	 * complete. Bound every descriptor type here, before allocating
-	 * anything, using the same ceiling this file already applies to
-	 * per-PDU H2C data.
-	 */
-	if (len > NVMET_TCP_MAXH2CDATA)
+	/* Bound every SGL type before allocating; inline limits are separate. */
+	if (len > NVMET_TCP_MAX_CMD_DATA)
 		return NVME_SC_SGL_INVALID_DATA | NVME_STATUS_DNR;
 
 	if (sgl->type == ((NVME_SGL_FMT_DATA_DESC << 4) |
@@ -477,21 +476,27 @@ err:
 	return NVME_SC_INTERNAL;
 }
 
-static void nvmet_tcp_calc_ddgst(struct nvmet_tcp_cmd *cmd)
+static void nvmet_tcp_calc_ddgst(struct nvmet_tcp_cmd *cmd, size_t offset,
+				 size_t total_len)
 {
-	size_t total_len = cmd->req.transfer_len;
 	struct scatterlist *sg = cmd->req.sg;
 	u32 crc = ~0;
 
+	while (offset >= sg->length) {
+		offset -= sg->length;
+		sg = sg_next(sg);
+	}
+
 	while (total_len) {
-		size_t len = min_t(size_t, total_len, sg->length);
+		size_t len = min_t(size_t, total_len, sg->length - offset);
 
 		/*
 		 * Note that the scatterlist does not contain any highmem pages,
 		 * as it was allocated by sgl_alloc() with GFP_KERNEL.
 		 */
-		crc = crc32c(crc, sg_virt(sg), len);
+		crc = crc32c(crc, sg_virt(sg) + offset, len);
 		total_len -= len;
+		offset = 0;
 		sg = sg_next(sg);
 	}
 	cmd->exp_ddgst = cpu_to_le32(~crc);
@@ -521,7 +526,7 @@ static void nvmet_setup_c2h_data_pdu(struct nvmet_tcp_cmd *cmd)
 
 	if (queue->data_digest) {
 		pdu->hdr.flags |= NVME_TCP_F_DDGST;
-		nvmet_tcp_calc_ddgst(cmd);
+		nvmet_tcp_calc_ddgst(cmd, 0, cmd->req.transfer_len);
 	}
 
 	if (cmd->queue->hdr_digest) {
@@ -1294,7 +1299,8 @@ static void nvmet_tcp_prep_recv_ddgst(struct nvmet_tcp_cmd *cmd)
 {
 	struct nvmet_tcp_queue *queue = cmd->queue;
 
-	nvmet_tcp_calc_ddgst(cmd);
+	nvmet_tcp_calc_ddgst(cmd, cmd->rbytes_done - cmd->pdu_len,
+			     cmd->pdu_len);
 	queue->offset = 0;
 	queue->left = NVME_TCP_DIGEST_LENGTH;
 	queue->rcv_state = NVMET_TCP_RECV_DDGST;
@@ -2275,6 +2281,11 @@ static ssize_t nvmet_tcp_host_port_addr(struct nvmet_ctrl *ctrl,
 			(struct sockaddr *)&queue->sockaddr_peer);
 }
 
+static u8 nvmet_tcp_get_mdts(const struct nvmet_ctrl *ctrl)
+{
+	return NVMET_TCP_MAX_MDTS;
+}
+
 static const struct nvmet_fabrics_ops nvmet_tcp_ops = {
 	.owner			= THIS_MODULE,
 	.type			= NVMF_TRTYPE_TCP,
@@ -2286,6 +2297,7 @@ static const struct nvmet_fabrics_ops nvmet_tcp_ops = {
 	.install_queue		= nvmet_tcp_install_queue,
 	.disc_traddr		= nvmet_tcp_disc_port_addr,
 	.host_traddr		= nvmet_tcp_host_port_addr,
+	.get_mdts		= nvmet_tcp_get_mdts,
 };
 
 static int __init nvmet_tcp_init(void)

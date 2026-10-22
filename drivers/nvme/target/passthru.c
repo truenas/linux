@@ -115,6 +115,7 @@ static u16 nvmet_passthru_override_id_ctrl(struct nvmet_req *req)
 	page_shift = NVME_CAP_MPSMIN(ctrl->cap) + 12;
 
 	id->mdts = ilog2(max_hw_sectors) + 9 - page_shift;
+	id->mdts = min_not_zero(id->mdts, nvmet_ctrl_mdts(req));
 
 	id->acl = 3;
 	/*
