@@ -192,8 +192,11 @@ struct statx {
 	/* Inode generation, which tells a reused inode number from the old file */
 	__u64	stx_gen;
 
+	/* ZFS flags: DOS attributes and trivial ACL (ZFS_* in sys/zfs_znode.h) */
+	__u64	stx_zfsflags;
+
 	/* 0xc0 */
-	__u64	__spare3[6];	/* Spare space for future expansion */
+	__u64	__spare3[5];	/* Spare space for future expansion */
 
 	/* 0x100 */
 };
@@ -226,6 +229,7 @@ struct statx {
 #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
 #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
 
+#define STATX_ZFSFLAGS	0x10000000U	/* Want/got stx_zfsflags */
 #define STATX_GEN		0x20000000U	/* Want/got stx_gen */
 #define STATX_CHANGE_COOKIE	0x40000000U	/* Want/got stx_change_attr */
 
