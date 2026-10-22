@@ -60,6 +60,7 @@ struct kstat {
 	u32		atomic_write_unit_max_opt;
 	u32		atomic_write_segments_max;
 	u64		gen;
+	u64		zfsflags;
 };
 
 /* These definitions are internal to the kernel for now. Mainly used by nfsd. */
