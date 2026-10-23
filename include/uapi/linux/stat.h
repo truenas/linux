@@ -195,7 +195,7 @@ struct statx {
 	/* ZFS flags: DOS attributes and trivial ACL (ZFS_* in sys/zfs_znode.h) */
 	__u64	stx_zfsflags;
 
-	/* 0xc0 */
+	/* 0xd8 */
 	__u64	__spare3[5];	/* Spare space for future expansion */
 
 	/* 0x100 */

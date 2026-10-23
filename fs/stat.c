@@ -712,7 +712,7 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
 	memset(&tmp, 0, sizeof(tmp));
 
 #ifdef CONFIG_TRUENAS
-	/* Expose STX_CHANGE_COOKIE, STX_GEN and STX_ZFSFLAGS for samba */
+	/* Expose STATX_CHANGE_COOKIE, STATX_GEN and STATX_ZFSFLAGS to userspace */
 	tmp.stx_mask = stat->result_mask;
 	tmp.stx_change_cookie = stat->change_cookie;
 	tmp.stx_gen = stat->gen;
