@@ -261,6 +261,9 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 #define ATTR_TIMES_SET	(1 << 16)
 #define ATTR_TOUCH	(1 << 17)
 #define ATTR_DELEG	(1 << 18) /* Delegated attrs. Don't break write delegations */
+#ifdef CONFIG_TRUENAS
+#define ATTR_BTIME_SET	(1 << 19) /* Explicit birth time in ia_btime */
+#endif
 
 /*
  * Whiteout is represented by a char device.  The following constants define the
@@ -305,6 +308,15 @@ struct iattr {
 	struct timespec64 ia_atime;
 	struct timespec64 ia_mtime;
 	struct timespec64 ia_ctime;
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Valid when ATTR_BTIME_SET is set. A caller that sets it also sets
+	 * ATTR_TIMES_SET, so may_setattr() and setattr_prepare() apply the
+	 * utimensat(2) checks to it. Filesystems that do not know the flag
+	 * ignore it.
+	 */
+	struct timespec64 ia_btime;
+#endif
 
 	/*
 	 * Not an attribute, but an auxiliary info for filesystems wanting to
