@@ -95,11 +95,37 @@ static int ovl_xattr_get(struct dentry *dentry, struct inode *inode, const char 
 	return res;
 }
 
+#ifdef CONFIG_TRUENAS
+#define TRUENAS_XATTR_PREFIX	"system.truenas_"
+#define TRUENAS_XATTR_NFS4ACL	"system.nfs4_acl_xdr"
+
+/*
+ * The VFS leaves the permission checks of a system.* xattr to the
+ * filesystem, but overlayfs calls the real filesystem's handler with the
+ * mounter's credentials. ZFS's system.truenas_* and system.nfs4_acl_xdr
+ * act on the file, setting its owner, mode or ACL, so through an overlay
+ * they would do so as the mounter for any caller. Refuse them. POSIX ACLs
+ * go through the inode operations and are not affected.
+ */
+static bool ovl_is_truenas_xattr(const char *name)
+{
+	return !strncmp(name, TRUENAS_XATTR_PREFIX,
+			sizeof(TRUENAS_XATTR_PREFIX) - 1) ||
+	       !strcmp(name, TRUENAS_XATTR_NFS4ACL);
+}
+#endif
+
 static bool ovl_can_list(struct super_block *sb, const char *s)
 {
 	/* Never list private (.overlay) */
 	if (ovl_is_private_xattr(sb, s))
 		return false;
+
+#ifdef CONFIG_TRUENAS
+	/* Never list what ovl_other_xattr_get() refuses */
+	if (ovl_is_truenas_xattr(s))
+		return false;
+#endif
 
 	/* List all non-trusted xattrs */
 	if (strncmp(s, XATTR_TRUSTED_PREFIX, XATTR_TRUSTED_PREFIX_LEN) != 0)
@@ -221,6 +247,10 @@ static int ovl_other_xattr_get(const struct xattr_handler *handler,
 			       struct dentry *dentry, struct inode *inode,
 			       const char *name, void *buffer, size_t size)
 {
+#ifdef CONFIG_TRUENAS
+	if (ovl_is_truenas_xattr(name))
+		return -EOPNOTSUPP;
+#endif
 	return ovl_xattr_get(dentry, inode, name, buffer, size);
 }
 
@@ -230,6 +260,10 @@ static int ovl_other_xattr_set(const struct xattr_handler *handler,
 			       const char *name, const void *value,
 			       size_t size, int flags)
 {
+#ifdef CONFIG_TRUENAS
+	if (ovl_is_truenas_xattr(name))
+		return -EOPNOTSUPP;
+#endif
 	return ovl_xattr_set(dentry, inode, name, value, size, flags);
 }
 
