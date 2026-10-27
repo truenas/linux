@@ -206,6 +206,21 @@ int vfs_getattr_nosec(const struct path *path, struct kstat *stat,
 	stat->attributes_mask |= (STATX_ATTR_AUTOMOUNT |
 				  STATX_ATTR_DAX);
 
+#ifdef CONFIG_TRUENAS
+	/*
+	 * The ACL type of the file system, which nfsd lists acl and dacl by.
+	 * ZFS keeps the two flags current as acltype changes, with no remount
+	 * (acltype_changed_cb in zfs_vfsops.c), and a snapshot takes its own
+	 * when it mounts.
+	 */
+	if (IS_POSIXACL(inode))
+		stat->attributes |= STATX_ATTR_POSIXACL;
+	if (IS_NFSV4ACL(inode))
+		stat->attributes |= STATX_ATTR_NFSV4ACL;
+	stat->attributes_mask |= (STATX_ATTR_POSIXACL |
+				  STATX_ATTR_NFSV4ACL);
+#endif
+
 	idmap = mnt_idmap(path->mnt);
 	if (inode->i_op->getattr) {
 		int ret;
