@@ -269,5 +269,12 @@ struct statx {
 #define STATX_ATTR_DAX			0x00200000 /* File is currently in DAX state */
 #define STATX_ATTR_WRITE_ATOMIC		0x00400000 /* File supports atomic write operations */
 
+/*
+ * The ACL type of the file system that holds the file, as set on its
+ * superblock. Neither set means it keeps no ACL. Both are in
+ * stx_attributes_mask on a kernel that reports them.
+ */
+#define STATX_ATTR_POSIXACL		0x0100000000000000 /* The file system keeps POSIX ACLs */
+#define STATX_ATTR_NFSV4ACL		0x0200000000000000 /* The file system keeps NFSv4 ACLs */
 
 #endif /* _UAPI_LINUX_STAT_H */
