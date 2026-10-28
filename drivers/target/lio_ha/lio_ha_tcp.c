@@ -41,9 +41,14 @@
  *
  * ha_send_lock (mutex): serialises concurrent callers of
  *     lio_ha_tcp_send() so that header and payload are sent as a unit.
- *     ha_tcp_on_disconnected() acquires ha_send_lock before calling
- *     sock_release(), guaranteeing the socket is not freed while a
- *     send is in progress.
+ *     Taken before ha_tcp_lock.  lio_ha_tcp_send() reads ha_conn_sock
+ *     with it held, and whoever clears ha_conn_sock takes and drops it
+ *     before calling sock_release(), so the socket is not freed while a
+ *     send is using it.
+ *
+ * Every owner of ha_conn_sock, ha_listen_sock and ha_connecting_sock
+ * clears the pointer under ha_tcp_lock before releasing the socket, so
+ * a socket read under ha_tcp_lock may be shut down before it is dropped.
  *
  * ha_rx_done (completion): signalled by ha_rx_task when it exits.
  *     lio_ha_tcp_exit() waits on it after shutting down the socket so
@@ -362,10 +367,13 @@ static void ha_tcp_on_disconnected(struct socket *sock)
 
 	/*
 	 * Wait for any lio_ha_tcp_send() in progress to complete before
-	 * releasing the socket.  lio_ha_tcp_send() reads ha_conn_sock under
-	 * ha_tcp_lock (already cleared above), then acquires ha_send_lock.
-	 * Acquiring ha_send_lock here guarantees no send is using @sock.
+	 * releasing the socket.  lio_ha_tcp_send() reads ha_conn_sock with
+	 * ha_send_lock held, and it is cleared above, so once we hold
+	 * ha_send_lock no send is using @sock.  Shut it down first so that
+	 * a send blocked on a dead peer returns instead of holding
+	 * ha_send_lock.
 	 */
+	kernel_sock_shutdown(sock, SHUT_RDWR);
 	mutex_lock(&ha_send_lock);
 	mutex_unlock(&ha_send_lock);
 
@@ -662,25 +670,25 @@ int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len)
 		.length  = cpu_to_be32(len),
 	};
 	struct socket *sock;
-	int ret;
+	int ret = -ENOTCONN;
 
 	/*
-	 * Read ha_conn_sock under ha_tcp_lock.  After we release it, the
-	 * socket might be disconnected, but sock_release() is deferred
-	 * until ha_send_lock is released (see ha_tcp_on_disconnected).
-	 * So the socket pointer is safe to use while we hold ha_send_lock.
+	 * Read ha_conn_sock with ha_send_lock held.  The socket may be
+	 * disconnected after we drop ha_tcp_lock, but whoever clears
+	 * ha_conn_sock waits for ha_send_lock before sock_release() (see
+	 * ha_tcp_on_disconnected), so the pointer stays valid until we drop
+	 * ha_send_lock.
 	 */
+	mutex_lock(&ha_send_lock);
 	mutex_lock(&ha_tcp_lock);
 	sock = ha_conn_sock;
 	mutex_unlock(&ha_tcp_lock);
 
-	if (!sock)
-		return -ENOTCONN;
-
-	mutex_lock(&ha_send_lock);
-	ret = ha_tcp_send_full(sock, &hdr, sizeof(hdr));
-	if (!ret && len > 0)
-		ret = ha_tcp_send_full(sock, payload, len);
+	if (sock) {
+		ret = ha_tcp_send_full(sock, &hdr, sizeof(hdr));
+		if (!ret && len > 0)
+			ret = ha_tcp_send_full(sock, payload, len);
+	}
 	mutex_unlock(&ha_send_lock);
 
 	return ret;
@@ -768,22 +776,13 @@ void lio_ha_tcp_exit(void)
 	 * in kernel_accept / kernel_recvmsg / kernel_connect.
 	 */
 	mutex_lock(&ha_tcp_lock);
-	sock = ha_conn_sock;
+	if (ha_conn_sock)
+		kernel_sock_shutdown(ha_conn_sock, SHUT_RDWR);
+	if (ha_listen_sock)
+		kernel_sock_shutdown(ha_listen_sock, SHUT_RDWR);
+	if (ha_connecting_sock)
+		kernel_sock_shutdown(ha_connecting_sock, SHUT_RDWR);
 	mutex_unlock(&ha_tcp_lock);
-	if (sock)
-		kernel_sock_shutdown(sock, SHUT_RDWR);
-
-	mutex_lock(&ha_tcp_lock);
-	sock = ha_listen_sock;
-	mutex_unlock(&ha_tcp_lock);
-	if (sock)
-		kernel_sock_shutdown(sock, SHUT_RDWR);
-
-	mutex_lock(&ha_tcp_lock);
-	sock = ha_connecting_sock;
-	mutex_unlock(&ha_tcp_lock);
-	if (sock)
-		kernel_sock_shutdown(sock, SHUT_RDWR);
 
 	/*
 	 * Stop listen and connect threads.  A thread that already returned
@@ -818,8 +817,11 @@ void lio_ha_tcp_exit(void)
 	ha_conn_sock = NULL;
 	ha_rx_task   = NULL;
 	mutex_unlock(&ha_tcp_lock);
-	if (sock)
+	if (sock) {
+		mutex_lock(&ha_send_lock);	/* as ha_tcp_on_disconnected() */
+		mutex_unlock(&ha_send_lock);
 		sock_release(sock);
+	}
 
 	atomic_set(&ha_tcp_stopping, 0);
 	pr_debug("ha_tcp: channel stopped\n");
