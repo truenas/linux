@@ -174,11 +174,13 @@ struct se_session;
  *                  registered.  On STANDBY, sends SESSION_CONNECT to ACTIVE
  *                  so ACTIVE creates a synthetic se_session with the correct
  *                  LUN mappings.  Skips ha_recv's own sessions (tpg_wwn=NULL)
- *                  and sessions created when forward_active=0.  Must not sleep.
+ *                  and sessions created when forward_active=0.  Called in process
+ *                  context; may sleep (sends on the HA link).
  * @session_destroy: called from target_remove_session() before the session is
  *                   deregistered.  On STANDBY, sends SESSION_DISCONNECT so
  *                   ACTIVE tears down the synthetic se_session.  Same filters
- *                   as @session_create.  Must not sleep.
+ *                   as @session_create.  Called in process context;
+ *                   may sleep.
  *
  * @forward_cmd and @forward_tmr are guaranteed non-NULL whenever
  * lio_ha_forward_active == 1.  @session_create and @session_destroy are
