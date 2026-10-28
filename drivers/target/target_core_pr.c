@@ -3169,7 +3169,19 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
 		 *
 		 * PROUT SA PREEMPT with All Registrant type reservations are
 		 * allowed to be processed without a matching SA Reservation Key
+		 *
+		 * With a zero SA Reservation Key the loop below frees every
+		 * other registration, including the reservation holder unless
+		 * that is the calling I_T nexus.  Release the reservation first
+		 * so that dev_pr_res_holder does not point at a freed
+		 * registration; __core_scsi3_complete_pro_preempt() then
+		 * establishes the new one.
 		 */
+		if (all_reg && !sa_res_key && pr_res_holder != pr_reg_n)
+			__core_scsi3_complete_pro_release(dev,
+							  pr_reg_n->pr_reg_nacl,
+							  pr_res_holder, 0, 0);
+
 		spin_lock(&pr_tmpl->registration_lock);
 		list_for_each_entry_safe(pr_reg, pr_reg_tmp,
 				&pr_tmpl->registration_list, pr_reg_list) {
