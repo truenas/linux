@@ -423,6 +423,12 @@ static void lio_ha_replace_port_info(struct se_cmd *cmd, u8 *buf, size_t len)
 		u8 association     = (p[1] & 0x30) >> 4;
 		u8 designator_type = p[1] & 0x0f;
 
+		/*
+		 * The data ends at the initiator's allocation length, which
+		 * can cut the last designator short.  Patch only whole ones.
+		 */
+		if (p + 4 + p[3] > end)
+			break;
 		if (association != 1)
 			continue;
 
@@ -446,8 +452,6 @@ static void lio_ha_replace_port_info(struct se_cmd *cmd, u8 *buf, size_t len)
 			char *pos;
 			char hex[5];
 
-			if (p + 4 + p[3] > end)
-				continue;
 			pos = strnstr((char *)(p + 4), marker, p[3]);
 			if (!pos)
 				continue;
