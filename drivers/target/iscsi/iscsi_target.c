@@ -682,6 +682,11 @@ static int __init iscsi_target_init_module(void)
 	mutex_init(&auth_id_lock);
 	idr_init(&tiqn_idr);
 
+	iscsit_global->time2retain_wq = alloc_workqueue("iscsit_t2r",
+							WQ_UNBOUND, 0);
+	if (!iscsit_global->time2retain_wq)
+		goto out;
+
 	ret = target_register_template(&iscsi_ops);
 	if (ret)
 		goto out;
@@ -758,6 +763,8 @@ configfs_out:
 		iscsit_tpg_disable_portal_group(iscsit_global->discovery_tpg, 1);
 	target_unregister_template(&iscsi_ops);
 out:
+	if (iscsit_global->time2retain_wq)
+		destroy_workqueue(iscsit_global->time2retain_wq);
 	kfree(iscsit_global);
 	return -ENOMEM;
 }
@@ -779,6 +786,7 @@ static void __exit iscsi_target_cleanup_module(void)
 
 	target_unregister_template(&iscsi_ops);
 
+	destroy_workqueue(iscsit_global->time2retain_wq);
 	free_cpumask_var(iscsit_global->allowed_cpumask);
 	vfree(iscsit_global->ts_bitmap);
 	kfree(iscsit_global);
@@ -4759,6 +4767,11 @@ int iscsit_release_sessions_for_tpg(struct iscsi_portal_group *tpg, int force)
 		iscsit_dec_session_usage_count(sess);
 		session_count++;
 	}
+	/*
+	 * The loop skips sessions whose Time2Retain timer expired; their
+	 * close is queued.  Wait for it so the TPG outlives them.
+	 */
+	flush_workqueue(iscsit_global->time2retain_wq);
 
 	pr_debug("Released %d iSCSI Session(s) from Target Portal"
 			" Group: %hu\n", session_count, tpg->tpgt);
