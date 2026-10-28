@@ -1030,6 +1030,12 @@ out:
 		core_scsi3_lunacl_undepend_item(pr_reg_tmp->pr_reg_deve);
 		kmem_cache_free(t10_pr_reg_cache, pr_reg_tmp);
 	}
+	/*
+	 * The caller owns the reference on a passed in deve.  Otherwise it was
+	 * taken by __core_scsi3_do_alloc_registration() above.
+	 */
+	if (!deve)
+		kref_put(&pr_reg->pr_reg_deve->pr_kref, target_pr_kref_release);
 	kmem_cache_free(t10_pr_reg_cache, pr_reg);
 	return NULL;
 }
