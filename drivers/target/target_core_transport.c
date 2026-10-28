@@ -1722,6 +1722,17 @@ target_cmd_parse_cdb(struct se_cmd *cmd)
 		atomic_long_inc(&cmd->se_lun->lun_stats.cmd_pdus);
 		return 0;
 	}
+	/*
+	 * After failover, until target_ha_reopen_backend() has opened this
+	 * device, and for good if it fails.  parse_cdb's LBA range check calls
+	 * get_blocks(), which has no device to ask: it would fail every READ
+	 * and WRITE with LBA OUT OF RANGE, which initiators do not retry.
+	 * Fail every command with the NOT READY that __target_execute_cmd()
+	 * would give it instead.
+	 */
+	if (dev->transport->backend_is_ready &&
+	    !dev->transport->backend_is_ready(dev))
+		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 #endif /* CONFIG_TRUENAS */
 
 	ret = dev->transport->parse_cdb(cmd);

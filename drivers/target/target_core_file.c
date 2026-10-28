@@ -858,8 +858,14 @@ static sector_t fd_get_blocks(struct se_device *dev)
 {
 	struct fd_dev *fd_dev = FD_DEV(dev);
 	struct file *f = fd_dev->fd_file;
-	struct inode *i = f->f_mapping->host;
+	struct inode *i;
 	unsigned long long dev_size;
+
+#ifdef CONFIG_TRUENAS
+	if (!f)
+		return 0;	/* open deferred by lio_ha, as iblock_get_blocks() */
+#endif
+	i = f->f_mapping->host;
 	/*
 	 * When using a file that references an underlying struct block_device,
 	 * ensure dev_size is always based on the current inode size in order
