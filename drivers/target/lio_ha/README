@@ -192,17 +192,28 @@ SESSION_CONNECT (S->A)
 
   SESSION_CONNECT replay on link recovery: STANDBY maintains a
   shadow session list (ha_main_sess_list, protected by
-  ha_main_sess_lock) that tracks every live initiator session.
+  ha_main_sess_mutex) that tracks every live initiator session.
   An entry is added in ha_main_session_create() before the TCP send,
-  and removed in ha_main_session_destroy().  This handles the window
-  where an initiator logs in while the TCP link is down: the send
-  fails, but when the link recovers ha_main_on_connect() snapshots
-  the list and replays SESSION_CONNECT for every tracked session.
-  ACTIVE's lio_ha_recv_session_create() is idempotent -- a duplicate
-  session_id is silently ignored -- so replaying a SESSION_CONNECT
-  that already succeeded is harmless.  The shadow list is flushed
-  when forward_active transitions 1->0 (failover), since STANDBY is
-  becoming ACTIVE and replay is no longer needed.
+  and removed in ha_main_session_destroy().  The mutex is held across
+  the SESSION_CONNECT and SESSION_DISCONNECT sends and across the
+  replay, so ACTIVE receives them in the order sessions come and go.
+  This handles the window where an initiator logs in while the TCP
+  link is down: the send fails, but when the link recovers
+  ha_main_on_connect() replays SESSION_CONNECT for every tracked
+  session.  ACTIVE's lio_ha_recv_session_create() is idempotent -- a
+  duplicate session_id is silently ignored -- so replaying a
+  SESSION_CONNECT that already succeeded is harmless.  The shadow
+  list is flushed when forward_active transitions 1->0 (failover),
+  since STANDBY is becoming ACTIVE and replay is no longer needed.
+
+  Link loss: ACTIVE removes every synthetic session when the link
+  drops, after waiting for their commands, and discards buffered WRITE
+  data; STANDBY completes its in-flight commands with BUSY.  lio_ha_tcp
+  accepts no new connection until both have finished.  Session ids and
+  command cookies are pointers on STANDBY and are reused once freed;
+  this ordering is what keeps a SESSION_DISCONNECT lost with the link,
+  or a response to a command from the old connection, from being
+  applied to a new session or command that reuses the pointer.
 
 SESSION_DISCONNECT (S->A)
   Sent when the initiator session tears down on STANDBY.  ACTIVE
@@ -460,7 +471,7 @@ FILE MAP
                    lio_ha_pr_apply() which handles both PERS_ACTION
                    (incremental) and LUN_SYNC (bulk) updates.
                    Shadow session list (ha_main_sess_list, protected by
-                   ha_main_sess_lock) for SESSION_CONNECT replay on TCP
+                   ha_main_sess_mutex) for SESSION_CONNECT replay on TCP
                    link recovery (see SESSION_CONNECT above).
                    ha_main_failover_device() and the forward_active
                    write handler that drives the failover sequence.

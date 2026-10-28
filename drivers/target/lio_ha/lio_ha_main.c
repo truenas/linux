@@ -118,8 +118,11 @@ static struct workqueue_struct *lio_ha_pr_wq;
 /*                                                                     */
 /* Tracks every live initiator session so SESSION_CONNECT can be       */
 /* replayed on TCP link recovery.  Only entries with forward_active=1  */
-/* are added.  The spinlock protects the list; lio_ha_tcp_send() must  */
-/* NOT be called while it is held (lio_ha_tcp_send acquires mutexes).  */
+/* are added.  The mutex protects the list and is held across the     */
+/* SESSION_CONNECT and SESSION_DISCONNECT sends, so the peer receives  */
+/* them in the order sessions come and go: a replayed SESSION_CONNECT  */
+/* can never follow the SESSION_DISCONNECT of the same session, whose  */
+/* id (a pointer) may then belong to a new session.                    */
 /* ------------------------------------------------------------------ */
 
 struct ha_main_sess_entry {
@@ -133,16 +136,16 @@ struct ha_main_sess_entry {
 };
 
 static LIST_HEAD(ha_main_sess_list);
-static DEFINE_SPINLOCK(ha_main_sess_lock);
+static DEFINE_MUTEX(ha_main_sess_mutex);
 
 static void ha_main_sess_list_flush(void)
 {
 	struct ha_main_sess_entry *se, *tmp;
 	LIST_HEAD(free_list);
 
-	spin_lock(&ha_main_sess_lock);
+	mutex_lock(&ha_main_sess_mutex);
 	list_splice_init(&ha_main_sess_list, &free_list);
-	spin_unlock(&ha_main_sess_lock);
+	mutex_unlock(&ha_main_sess_mutex);
 
 	list_for_each_entry_safe(se, tmp, &free_list, list) {
 		list_del(&se->list);
@@ -469,10 +472,9 @@ static void ha_main_session_create(struct se_session *sess)
 	 * Track this session so SESSION_CONNECT can be replayed on TCP link
 	 * recovery.  Added before the send so that if the send fails (TCP
 	 * not yet connected), ha_main_on_connect() will replay it when the
-	 * link comes up.  GFP_ATOMIC: called from session setup which may
-	 * not sleep.
+	 * link comes up.
 	 */
-	se = kzalloc(sizeof(*se), GFP_ATOMIC);
+	se = kzalloc(sizeof(*se), GFP_KERNEL);
 	if (se) {
 		se->session_id = (u64)(uintptr_t)sess;
 		se->tpg_tag    = tpg->se_tpg_tfo->tpg_get_tag(tpg);
@@ -482,9 +484,6 @@ static void ha_main_session_create(struct se_session *sess)
 		strscpy(se->target_name, wwn, LIO_HA_INITIATOR_NAME_LEN);
 		strscpy(se->fabric_name, tpg->se_tpg_tfo->fabric_name,
 			LIO_HA_FABRIC_NAME_LEN);
-		spin_lock(&ha_main_sess_lock);
-		list_add_tail(&se->list, &ha_main_sess_list);
-		spin_unlock(&ha_main_sess_lock);
 	} else {
 		pr_warn_ratelimited("lio_ha: session shadow alloc failed for %s; won't replay on link recovery\n",
 				    sess->se_node_acl->initiatorname);
@@ -504,9 +503,13 @@ static void ha_main_session_create(struct se_session *sess)
 	lio_ha_dbg(1, "session create: initiator=%s target=%s fabric=%s\n",
 		   sess->se_node_acl->initiatorname, wwn,
 		   tpg->se_tpg_tfo->fabric_name);
+	mutex_lock(&ha_main_sess_mutex);
+	if (se)
+		list_add_tail(&se->list, &ha_main_sess_list);
 	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
 		pr_debug("lio_ha: SESSION_CONNECT send failed for %s\n",
 			 sess->se_node_acl->initiatorname);
+	mutex_unlock(&ha_main_sess_mutex);
 }
 
 static void ha_main_session_destroy(struct se_session *sess)
@@ -518,8 +521,11 @@ static void ha_main_session_destroy(struct se_session *sess)
 	if (!atomic_read(&lio_ha_forward_active))
 		return;
 
+	msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_DISCONNECT);
+	msg.session_id = cpu_to_be64(session_id);
+
 	/* Remove from replay list regardless of TCP or TPG state. */
-	spin_lock(&ha_main_sess_lock);
+	mutex_lock(&ha_main_sess_mutex);
 	list_for_each_entry_safe(se, tmp, &ha_main_sess_list, list) {
 		if (se->session_id == session_id) {
 			list_del(&se->list);
@@ -527,19 +533,16 @@ static void ha_main_session_destroy(struct se_session *sess)
 			break;
 		}
 	}
-	spin_unlock(&ha_main_sess_lock);
 
 	/* se_tpg may already be NULL if called after partial teardown. */
-	if (!sess->se_tpg || !sess->se_tpg->se_tpg_wwn)
-		return;
-
-	msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_DISCONNECT);
-	msg.session_id = cpu_to_be64(session_id);
-
-	lio_ha_dbg(1, "session destroy: initiator=%s\n",
-		   sess->se_node_acl ? sess->se_node_acl->initiatorname : "(null)");
-	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
-		pr_debug("lio_ha: SESSION_DISCONNECT send failed\n");
+	if (sess->se_tpg && sess->se_tpg->se_tpg_wwn) {
+		lio_ha_dbg(1, "session destroy: initiator=%s\n",
+			   sess->se_node_acl ?
+			   sess->se_node_acl->initiatorname : "(null)");
+		if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
+			pr_debug("lio_ha: SESSION_DISCONNECT send failed\n");
+	}
+	mutex_unlock(&ha_main_sess_mutex);
 }
 
 static const struct lio_ha_ops ha_ops = {
@@ -724,65 +727,47 @@ static void ha_main_send_lun_sync_all(void)
  * SYNCED; STANDBY advances to SYNCED on receipt of LUN_SYNC_DONE.
  *
  * STANDBY (forward_active == 1): replays SESSION_CONNECT for every live
- * initiator session tracked in ha_main_sess_list.  Sessions added after
- * the snapshot miss this round but will be handled by the next call (or
- * will have already succeeded if the link was up when they were created).
- * ACTIVE's lio_ha_recv_session_create() is idempotent: duplicate session
- * IDs on reconnect are silently ignored.
+ * initiator session tracked in ha_main_sess_list.  ACTIVE dropped all of
+ * this node's sessions when the previous connection went away.  A session
+ * created once the link is up sends its own SESSION_CONNECT and may be
+ * replayed as well; ACTIVE's lio_ha_recv_session_create() ignores the
+ * duplicate.
  */
 static void ha_main_on_connect(void)
 {
 	if (atomic_read(&lio_ha_forward_active)) {
 		struct ha_main_sess_entry *se;
-		struct lio_ha_msg_session_connect *snap;
-		int count = 0, filled, j;
+		struct lio_ha_msg_session_connect msg = {};
+		int count = 0;
 
 		/*
-		 * Count entries first so we can allocate the right-sized
-		 * snapshot array.  Snapshot under the spinlock, then send
-		 * outside it: lio_ha_tcp_send acquires ha_send_lock (mutex,
-		 * may sleep) which must not be called with a spinlock held.
+		 * Send under ha_main_sess_mutex, which session_create and
+		 * session_destroy hold across their own sends, so that no
+		 * session's SESSION_DISCONNECT can be sent between reading it
+		 * here and replaying its SESSION_CONNECT.
 		 */
-		spin_lock(&ha_main_sess_lock);
-		list_for_each_entry(se, &ha_main_sess_list, list)
-			count++;
-		spin_unlock(&ha_main_sess_lock);
-
-		if (!count)
-			return;
-
-		snap = kcalloc(count, sizeof(*snap), GFP_KERNEL);
-		if (!snap)
-			return;
-
-		spin_lock(&ha_main_sess_lock);
-		filled = 0;
+		mutex_lock(&ha_main_sess_mutex);
 		list_for_each_entry(se, &ha_main_sess_list, list) {
-			if (filled >= count)
-				break;
-			snap[filled].hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_CONNECT);
-			snap[filled].session_id = cpu_to_be64(se->session_id);
-			snap[filled].tpg_tag    = cpu_to_be16(se->tpg_tag);
-			strscpy(snap[filled].initiator_name, se->initiator_name,
+			msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_CONNECT);
+			msg.session_id = cpu_to_be64(se->session_id);
+			msg.tpg_tag    = cpu_to_be16(se->tpg_tag);
+			strscpy(msg.initiator_name, se->initiator_name,
 				LIO_HA_INITIATOR_NAME_LEN);
-			strscpy(snap[filled].target_name, se->target_name,
+			strscpy(msg.target_name, se->target_name,
 				LIO_HA_INITIATOR_NAME_LEN);
-			strscpy(snap[filled].initiator_sid, se->initiator_sid,
+			strscpy(msg.initiator_sid, se->initiator_sid,
 				LIO_HA_ISID_LEN);
-			strscpy(snap[filled].fabric_name, se->fabric_name,
+			strscpy(msg.fabric_name, se->fabric_name,
 				LIO_HA_FABRIC_NAME_LEN);
-			filled++;
-		}
-		spin_unlock(&ha_main_sess_lock);
-
-		lio_ha_dbg(1, "TCP connected (STANDBY): replaying %d SESSION_CONNECT(s)\n", filled);
-		for (j = 0; j < filled; j++) {
-			if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &snap[j],
-					    sizeof(snap[j])))
+			if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
 				pr_warn_ratelimited("lio_ha: SESSION_CONNECT replay failed for %s\n",
-						    snap[j].initiator_name);
+						    se->initiator_name);
+			count++;
 		}
-		kfree(snap);
+		mutex_unlock(&ha_main_sess_mutex);
+
+		lio_ha_dbg(1, "TCP connected (STANDBY): replayed %d SESSION_CONNECT(s)\n",
+			   count);
 		return;
 	}
 

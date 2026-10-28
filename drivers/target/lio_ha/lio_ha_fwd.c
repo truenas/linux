@@ -674,60 +674,73 @@ static void ha_fwd_disconnect_handler(void)
 	struct ha_fwd_entry *e;
 	struct ha_fwd_data_entry *de;
 	struct ha_fwd_tmr_entry *te;
-	struct hlist_node *tmp, *tmp_tmr;
 	int bkt;
 
 	lio_ha_dbg(1, "link dropped: draining in-flight command tables\n");
 
 	/*
-	 * Drain the in-flight table.  We drop the hash ref here; the caller
-	 * ref (ref 2) is still held by forward_cmd() if it is concurrently
-	 * in the send path.  kfree happens when both refs reach 0.
+	 * Drain the in-flight table one entry at a time, taking each out
+	 * under the lock.  The lock is dropped to complete the command, so
+	 * no iterator may be kept across that: lio_ha_forward_cmd()'s send
+	 * failure path can take out and free any entry meanwhile.
 	 *
-	 * We save cmd before ha_fwd_entry_put because the put might free the
-	 * entry immediately (if the caller ref was already dropped), after
-	 * which e->cmd is no longer safe to dereference.
+	 * We drop the hash ref here; the caller ref (ref 2) is still held by
+	 * forward_cmd() if it is concurrently in the send path.  kfree
+	 * happens when both refs reach 0.  We save cmd before
+	 * ha_fwd_entry_put because the put might free the entry immediately
+	 * (if the caller ref was already dropped), after which e->cmd is no
+	 * longer safe to dereference.
 	 */
-	spin_lock(&ha_fwd_lock);
-	hash_for_each_safe(ha_fwd_ht, bkt, tmp, e, node) {
-		struct se_cmd *cmd = e->cmd;
-
-		hash_del(&e->node);
-		spin_unlock(&ha_fwd_lock);
-
-		ha_fwd_entry_put(e);            /* drop hash ref */
-		target_complete_cmd(cmd, SAM_STAT_BUSY);
+	for (;;) {
+		struct se_cmd *cmd;
 
 		spin_lock(&ha_fwd_lock);
+		hash_for_each(ha_fwd_ht, bkt, e, node)
+			break;
+		if (e)
+			hash_del(&e->node);
+		spin_unlock(&ha_fwd_lock);
+		if (!e)
+			break;
+
+		cmd = e->cmd;
+		ha_fwd_entry_put(e);            /* drop hash ref */
+		target_complete_cmd(cmd, SAM_STAT_BUSY);
 	}
-	spin_unlock(&ha_fwd_lock);
 
 	/* Flush any pending READ data -- no CMD_RESPONSE will arrive now. */
-	spin_lock(&ha_fwd_data_lock);
-	hash_for_each_safe(ha_fwd_data_ht, bkt, tmp, de, node) {
-		hash_del(&de->node);
+	for (;;) {
+		spin_lock(&ha_fwd_data_lock);
+		hash_for_each(ha_fwd_data_ht, bkt, de, node)
+			break;
+		if (de)
+			hash_del(&de->node);
 		spin_unlock(&ha_fwd_data_lock);
+		if (!de)
+			break;
+
 		kvfree(de->data);
 		kfree(de);
-		spin_lock(&ha_fwd_data_lock);
 	}
-	spin_unlock(&ha_fwd_data_lock);
 
 	/* Drain in-flight TMR table -- no TMR_RESPONSE will arrive now. */
-	spin_lock(&ha_fwd_tmr_lock);
-	hash_for_each_safe(ha_fwd_tmr_ht, bkt, tmp_tmr, te, node) {
-		struct se_cmd *tcmd = te->cmd;
+	for (;;) {
+		struct se_cmd *tcmd;
 
-		hash_del(&te->node);
+		spin_lock(&ha_fwd_tmr_lock);
+		hash_for_each(ha_fwd_tmr_ht, bkt, te, node)
+			break;
+		if (te)
+			hash_del(&te->node);
 		spin_unlock(&ha_fwd_tmr_lock);
+		if (!te)
+			break;
 
+		tcmd = te->cmd;
 		ha_fwd_tmr_entry_put(te);   /* drop hash ref */
 		tcmd->se_tmr_req->response = TMR_FUNCTION_REJECTED;
 		target_complete_tmr(tcmd);
-
-		spin_lock(&ha_fwd_tmr_lock);
 	}
-	spin_unlock(&ha_fwd_tmr_lock);
 }
 
 /* ------------------------------------------------------------------ */

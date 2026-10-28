@@ -114,6 +114,15 @@ static DECLARE_COMPLETION(ha_rx_done);
 static atomic_t ha_tcp_stopping = ATOMIC_INIT(0);
 
 /*
+ * Set under ha_tcp_lock while ha_tcp_on_disconnected() runs the disconnect
+ * handlers for a dropped connection.  ha_tcp_on_connected() refuses a new
+ * connection meanwhile, so nothing from the old connection -- a response
+ * to a command, a session, buffered data -- is still being cleaned up when
+ * the new one starts.  The peer retries the connection.
+ */
+static bool ha_tcp_disconnecting;
+
+/*
  * CTL-channel dispatch table.  Indexed by enum lio_ha_msg_type.
  * Protected by module load ordering: handlers are registered at init
  * time, before any messages can arrive.
@@ -127,10 +136,13 @@ static void (*ctl_handlers[_LIO_HA_MSG_MAX])(const void *buf, size_t len);
 static void (*data_handler_fn)(u64 cookie, const void *data, u32 data_len);
 
 /*
- * Disconnect handler: called when the TCP link drops (not at module exit).
- * Flushes in-flight command tables so initiators get SAM_STAT_BUSY.
+ * Disconnect handlers: called when the TCP link drops (not at module exit).
+ * lio_ha_fwd flushes its in-flight command tables so initiators get
+ * SAM_STAT_BUSY; lio_ha_recv tears down the sessions it created for the
+ * peer's initiators.
  */
-static void (*disconnect_handler_fn)(void);
+#define HA_TCP_MAX_DISCONNECT_HANDLERS	2
+static void (*disconnect_handler_fns[HA_TCP_MAX_DISCONNECT_HANDLERS])(void);
 
 /*
  * Connect handler: called when a new TCP connection is established.
@@ -271,8 +283,12 @@ static void ha_tcp_on_connected(struct socket *sock)
 
 	mutex_lock(&ha_tcp_lock);
 
-	if (ha_conn_sock || atomic_read(&ha_tcp_stopping)) {
-		/* Already connected, or module is shutting down -- drop. */
+	if (ha_conn_sock || ha_tcp_disconnecting ||
+	    atomic_read(&ha_tcp_stopping)) {
+		/*
+		 * Already connected, still cleaning up after the previous
+		 * connection, or module is shutting down -- drop.
+		 */
 		mutex_unlock(&ha_tcp_lock);
 		sock_release(sock);
 		return;
@@ -358,6 +374,7 @@ static void ha_tcp_on_disconnected(struct socket *sock)
 
 	ha_conn_sock = NULL;
 	ha_rx_task   = NULL;
+	ha_tcp_disconnecting = true;
 
 	spin_lock(&lio_ha_cfg.lock);
 	lio_ha_cfg.ha_state = LIO_HA_DISCONNECTED;
@@ -382,8 +399,17 @@ static void ha_tcp_on_disconnected(struct socket *sock)
 	 * they can complete in-flight commands with SAM_STAT_BUSY.  Called
 	 * only on a real link drop; not during module exit (ha_tcp_stopping).
 	 */
-	if (!atomic_read(&ha_tcp_stopping) && disconnect_handler_fn)
-		disconnect_handler_fn();
+	if (!atomic_read(&ha_tcp_stopping)) {
+		int i;
+
+		for (i = 0; i < HA_TCP_MAX_DISCONNECT_HANDLERS; i++)
+			if (disconnect_handler_fns[i])
+				disconnect_handler_fns[i]();
+	}
+
+	mutex_lock(&ha_tcp_lock);
+	ha_tcp_disconnecting = false;
+	mutex_unlock(&ha_tcp_lock);
 
 	if (!atomic_read(&ha_tcp_stopping))
 		pr_info("ha_tcp: disconnected\n");
@@ -701,7 +727,15 @@ void lio_ha_tcp_register_data_handler(void (*handler)(u64 cookie, const void *da
 
 void lio_ha_tcp_register_disconnect_handler(void (*handler)(void))
 {
-	disconnect_handler_fn = handler;
+	int i;
+
+	for (i = 0; i < HA_TCP_MAX_DISCONNECT_HANDLERS; i++) {
+		if (!disconnect_handler_fns[i]) {
+			disconnect_handler_fns[i] = handler;
+			return;
+		}
+	}
+	WARN(1, "ha_tcp: no free disconnect handler slot\n");
 }
 
 void lio_ha_tcp_register_connect_handler(void (*handler)(void))

@@ -87,8 +87,11 @@ void lio_ha_tcp_register_connect_handler(void (*handler)(void));
  * lio_ha_tcp_exit().
  *
  * @handler: called when the TCP connection drops (from the rx kthread,
- *   before sock_release()).  May sleep briefly to flush in-flight tables.
- *   NOT called during module exit (lio_ha_tcp_exit handles that path).
+ *   before sock_release()).  May sleep to flush in-flight tables and wait
+ *   for commands.  No new connection is accepted until every handler has
+ *   returned.  NOT called during module exit (lio_ha_tcp_exit handles that
+ *   path).  Up to two handlers can be registered; they run in the order
+ *   they were registered.
  */
 void lio_ha_tcp_register_disconnect_handler(void (*handler)(void));
 

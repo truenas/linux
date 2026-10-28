@@ -721,6 +721,86 @@ static void ha_recv_session_disconnect_handler(const void *buf, size_t len)
 	lio_ha_recv_session_destroy(be64_to_cpu(msg->session_id));
 }
 
+/*
+ * Free a session taken out of ha_recv_sess_ht.  Commands submitted on it
+ * may still be running: STANDBY sends SESSION_DISCONNECT once its own
+ * copies are done, not ours, and ours send CMD_RESPONSE before they drop
+ * their session reference.  Wait for them before freeing the session.
+ * They run against local storage, and none of them needs a message from
+ * the peer to complete, so the wait is bounded.
+ */
+static void ha_recv_sess_free(struct ha_recv_sess_entry *e)
+{
+	target_stop_session(e->se_sess);
+	target_wait_for_sess_cmds(e->se_sess);
+	target_remove_session(e->se_sess);
+	kfree(e);
+}
+
+/* Take any one session out of ha_recv_sess_ht; NULL if it is empty. */
+static struct ha_recv_sess_entry *ha_recv_sess_pop(void)
+{
+	struct ha_recv_sess_entry *e;
+	int bkt;
+
+	spin_lock(&ha_recv_sess_lock);
+	hash_for_each(ha_recv_sess_ht, bkt, e, node)
+		break;
+	if (e)
+		hash_del(&e->node);
+	spin_unlock(&ha_recv_sess_lock);
+	return e;
+}
+
+/* Take any one entry out of ha_recv_data_ht; NULL if it is empty. */
+static struct ha_recv_data_entry *ha_recv_data_pop(void)
+{
+	struct ha_recv_data_entry *de;
+	int bkt;
+
+	spin_lock(&ha_recv_data_lock);
+	hash_for_each(ha_recv_data_ht, bkt, de, node)
+		break;
+	if (de)
+		hash_del(&de->node);
+	spin_unlock(&ha_recv_data_lock);
+	return de;
+}
+
+/*
+ * Free every session and every buffered DATA message.  Called when the
+ * link drops and at module exit.
+ */
+static void ha_recv_free_all(void)
+{
+	struct ha_recv_sess_entry *e;
+	struct ha_recv_data_entry *de;
+
+	while ((e = ha_recv_sess_pop()))
+		ha_recv_sess_free(e);
+	/* After the sessions: their commands may still take their data. */
+	while ((de = ha_recv_data_pop())) {
+		kvfree(de->data);
+		kfree(de);
+	}
+}
+
+/*
+ * TCP disconnect handler.  The peer's sessions are not ours to keep: a
+ * SESSION_DISCONNECT sent while the link was down is lost, and the
+ * session id, a pointer on the peer, can then be reused for another
+ * initiator.  Free them all; the peer replays SESSION_CONNECT for the
+ * sessions it still has once the link is back.  WRITE data buffered for
+ * a CMD_FORWARD that will not arrive goes too.  lio_ha_tcp accepts no new
+ * connection until this returns, so nothing from the old connection
+ * (a command's response, a session id, a cookie) reaches the new one.
+ */
+static void ha_recv_disconnect_handler(void)
+{
+	lio_ha_dbg(1, "link dropped: removing the peer's sessions\n");
+	ha_recv_free_all();
+}
+
 void lio_ha_recv_session_destroy(u64 session_id)
 {
 	struct ha_recv_sess_entry *e;
@@ -736,18 +816,7 @@ void lio_ha_recv_session_destroy(u64 session_id)
 			 (unsigned long long)session_id);
 		lio_ha_dbg(1, "session destroyed: id=%llu\n",
 			   (unsigned long long)session_id);
-		/*
-		 * Commands submitted on this session may still be running:
-		 * STANDBY sends SESSION_DISCONNECT once its own copies are
-		 * done, not ours, and ours send CMD_RESPONSE before they drop
-		 * their session reference.  Wait for them as
-		 * lio_ha_recv_exit() does before freeing the session.  They
-		 * run against local storage, so the wait is bounded.
-		 */
-		target_stop_session(e->se_sess);
-		target_wait_for_sess_cmds(e->se_sess);
-		target_remove_session(e->se_sess);
-		kfree(e);
+		ha_recv_sess_free(e);
 		return;
 	}
 	spin_unlock(&ha_recv_sess_lock);
@@ -880,6 +949,7 @@ int lio_ha_recv_init(void)
 					ha_recv_cmd_forward_handler);
 	lio_ha_tcp_register_ctl_handler(LIO_HA_MSG_TMR_FORWARD,
 					ha_recv_tmr_forward_handler);
+	lio_ha_tcp_register_disconnect_handler(ha_recv_disconnect_handler);
 
 	pr_debug("ha_recv: initialized\n");
 	return 0;
@@ -887,11 +957,6 @@ int lio_ha_recv_init(void)
 
 void lio_ha_recv_exit(void)
 {
-	struct ha_recv_sess_entry *e;
-	struct ha_recv_data_entry *de;
-	struct hlist_node *tmp;
-	int bkt;
-
 	/*
 	 * Destroy any sessions that were not cleaned up by SESSION_DISCONNECT
 	 * messages (e.g. TCP link dropped without clean disconnect).
@@ -906,30 +971,9 @@ void lio_ha_recv_exit(void)
 	 * lio_ha.ko is loaded on both nodes.  On whichever node is currently
 	 * acting as STANDBY, ha_recv_sess_ht is always empty: SESSION_CONNECT
 	 * is S->A only, so the STANDBY node never populates its own session
-	 * table.  This loop is therefore a no-op on the STANDBY node.
+	 * table.  This is therefore a no-op on the STANDBY node.
 	 */
-	spin_lock(&ha_recv_sess_lock);
-	hash_for_each_safe(ha_recv_sess_ht, bkt, tmp, e, node) {
-		hash_del(&e->node);
-		spin_unlock(&ha_recv_sess_lock);
-		target_stop_session(e->se_sess);
-		target_wait_for_sess_cmds(e->se_sess);
-		target_remove_session(e->se_sess);
-		kfree(e);
-		spin_lock(&ha_recv_sess_lock);
-	}
-	spin_unlock(&ha_recv_sess_lock);
-
-	/* Discard any buffered WRITE data whose CMD_FORWARD never arrived. */
-	spin_lock(&ha_recv_data_lock);
-	hash_for_each_safe(ha_recv_data_ht, bkt, tmp, de, node) {
-		hash_del(&de->node);
-		spin_unlock(&ha_recv_data_lock);
-		kvfree(de->data);
-		kfree(de);
-		spin_lock(&ha_recv_data_lock);
-	}
-	spin_unlock(&ha_recv_data_lock);
+	ha_recv_free_all();
 
 	core_tpg_deregister(&ha_recv_tpg.se_tpg);
 	pr_debug("ha_recv: exited\n");
