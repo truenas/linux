@@ -1765,6 +1765,16 @@ core_scsi3_decode_spec_i_port(
 
 	if (core_scsi3_lunacl_depend_item(local_pr_reg->pr_reg_deve)) {
 		kfree(tidh_new);
+		/*
+		 * Release the ALL_TG_PT=1 registrations allocated with it.
+		 */
+		list_for_each_entry_safe(pr_reg_tmp, pr_reg_tmp_safe,
+					 &local_pr_reg->pr_reg_atp_list,
+					 pr_reg_atp_mem_list) {
+			list_del(&pr_reg_tmp->pr_reg_atp_mem_list);
+			core_scsi3_lunacl_undepend_item(pr_reg_tmp->pr_reg_deve);
+			kmem_cache_free(t10_pr_reg_cache, pr_reg_tmp);
+		}
 		kref_put(&local_pr_reg->pr_reg_deve->pr_kref,
 			 target_pr_kref_release);
 		kmem_cache_free(t10_pr_reg_cache, local_pr_reg);
