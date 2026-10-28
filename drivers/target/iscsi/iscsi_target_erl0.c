@@ -765,8 +765,22 @@ void iscsit_handle_time2retain_timeout(struct timer_list *t)
 			" iSCSI session.\n", sess->sid);
 
 	iscsit_fill_cxn_timeout_err_stats(sess);
+	/*
+	 * Closing the session sleeps, so do it from a work item.  Queue it
+	 * under session_lock: whoever sees ISCSI_TF_EXPIRED there leaves the
+	 * session to this work, and iscsit_release_sessions_for_tpg() relies
+	 * on it being queued by then.
+	 */
+	queue_work(iscsit_global->time2retain_wq, &sess->time2retain_work);
 	spin_unlock_bh(&se_tpg->session_lock);
-	iscsit_close_session(sess, false);
+}
+
+void iscsit_time2retain_work(struct work_struct *work)
+{
+	struct iscsit_session *sess = container_of(work, struct iscsit_session,
+						   time2retain_work);
+
+	iscsit_close_session(sess, true);
 }
 
 void iscsit_start_time2retain_handler(struct iscsit_session *sess)
