@@ -54,6 +54,7 @@
 #include <linux/atomic.h>
 #include <linux/unaligned.h>
 #include <scsi/scsi_cmnd.h>    /* SCSI_SENSE_BUFFERSIZE */
+#include <scsi/scsi_common.h>
 
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
@@ -191,6 +192,16 @@ void lio_ha_forward_cmd(struct se_cmd *cmd)
 	struct ha_fwd_entry *e;
 	bool still_in_hash;
 	int ret;
+
+	/*
+	 * CMD_FORWARD carries LIO_HA_CDB_LEN bytes of CDB.  A longer variable
+	 * length CDB would reach ACTIVE cut short, so refuse it here.
+	 */
+	if (scsi_command_size(cmd->t_task_cdb) > LIO_HA_CDB_LEN) {
+		target_complete_cmd_with_sense(cmd, SAM_STAT_CHECK_CONDITION,
+					       TCM_INVALID_CDB_FIELD);
+		return;
+	}
 
 	e = ha_fwd_entry_alloc(cookie, cmd);
 	if (!e) {

@@ -51,6 +51,8 @@
 #include <linux/scatterlist.h>
 #include <linux/vmalloc.h>
 #include <scsi/scsi_cmnd.h>   /* SCSI_SENSE_BUFFERSIZE */
+#include <scsi/scsi_common.h>
+#include <scsi/scsi_proto.h>
 
 #include <target/target_core_base.h>
 #include <target/target_core_backend.h>
@@ -419,6 +421,27 @@ static void ha_recv_cmd_forward_handler(const void *buf, size_t len)
 
 	if (len < sizeof(*fwd)) {
 		pr_warn("ha_recv: CMD_FORWARD too short (%zu bytes)\n", len);
+		return;
+	}
+	/*
+	 * target_submit_cmd() copies scsi_command_size(cdb) bytes, which a
+	 * variable length CDB sets from its own byte 7, up to 260.  Only
+	 * LIO_HA_CDB_LEN of them came over the wire.  STANDBY does not
+	 * forward a longer CDB, so this is a misbehaving peer.
+	 */
+	if (scsi_command_size(fwd->cdb) > LIO_HA_CDB_LEN) {
+		u8 buf[sizeof(struct lio_ha_msg_cmd_response) + 18] = {};
+		struct lio_ha_msg_cmd_response *resp = (void *)buf;
+
+		pr_warn_ratelimited("ha_recv: CMD_FORWARD CDB 0x%02x longer than %d bytes\n",
+				    fwd->cdb[0], LIO_HA_CDB_LEN);
+		resp->hdr.type    = cpu_to_be32(LIO_HA_MSG_CMD_RESPONSE);
+		resp->cmd_cookie  = fwd->cmd_cookie;
+		resp->scsi_status = SAM_STAT_CHECK_CONDITION;
+		resp->sense_len   = 18;
+		scsi_build_sense_buffer(0, buf + sizeof(*resp),
+					ILLEGAL_REQUEST, 0x24, 0x00);
+		lio_ha_tcp_send(LIO_HA_CHAN_CTL, buf, sizeof(buf));
 		return;
 	}
 
