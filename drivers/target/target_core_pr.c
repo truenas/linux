@@ -1467,12 +1467,28 @@ static void core_scsi3_put_pr_reg(struct t10_pr_registration *pr_reg)
 	atomic_dec_mb(&pr_reg->pr_res_holders);
 }
 
+/*
+ * Is @pr_reg_p one of @pr_reg's ALL_TG_PT=1 registrations on the other
+ * target ports?  These are the registrations that an UNREGISTER from
+ * @pr_reg with RESERVATION KEY @res_key frees along with @pr_reg.
+ */
+static bool core_scsi3_is_atp_sibling(struct t10_pr_registration *pr_reg,
+				      struct t10_pr_registration *pr_reg_p,
+				      u64 res_key)
+{
+	return pr_reg_p != pr_reg && pr_reg_p->pr_reg_all_tg_pt &&
+	       pr_reg_p->pr_res_key == res_key &&
+	       !strcmp(pr_reg->pr_reg_nacl->initiatorname,
+		       pr_reg_p->pr_reg_nacl->initiatorname);
+}
+
 static int core_scsi3_check_implicit_release(
 	struct se_device *dev,
-	struct t10_pr_registration *pr_reg)
+	struct t10_pr_registration *pr_reg,
+	u64 res_key)
 {
 	struct se_node_acl *nacl = pr_reg->pr_reg_nacl;
-	struct t10_pr_registration *pr_res_holder;
+	struct t10_pr_registration *pr_res_holder, *pr_reg_p;
 	int ret = 0;
 
 	spin_lock(&dev->dev_reservation_lock);
@@ -1502,7 +1518,38 @@ static int core_scsi3_check_implicit_release(
 		 * registrations are still processed as reservation holders
 		 * in core_scsi3_pr_seq_non_holder() after the initial
 		 * reservation holder is implicitly released here.
+		 *
+		 * The release above passed an 'All Registrants' reservation
+		 * to the first registration left on the list.  For an
+		 * ALL_TG_PT=1 UNREGISTER that may be one of pr_reg's
+		 * registrations on the other target ports, which the caller
+		 * frees next.  Pass the reservation on to the first
+		 * registration that stays, or release it if none does.
 		 */
+		pr_res_holder = dev->dev_pr_res_holder;
+		if (pr_res_holder && pr_reg->pr_reg_all_tg_pt &&
+		    core_scsi3_is_atp_sibling(pr_reg, pr_res_holder, res_key)) {
+			spin_lock(&dev->t10_pr.registration_lock);
+			dev->dev_pr_res_holder = NULL;
+			list_for_each_entry(pr_reg_p,
+					    &dev->t10_pr.registration_list,
+					    pr_reg_list) {
+				if (core_scsi3_is_atp_sibling(pr_reg, pr_reg_p,
+							      res_key))
+					continue;
+				pr_reg_p->pr_res_type =
+					pr_res_holder->pr_res_type;
+				pr_reg_p->pr_res_scope =
+					pr_res_holder->pr_res_scope;
+				pr_reg_p->pr_res_holder = 1;
+				dev->dev_pr_res_holder = pr_reg_p;
+				break;
+			}
+			spin_unlock(&dev->t10_pr.registration_lock);
+			pr_res_holder->pr_res_holder = 0;
+			pr_res_holder->pr_res_type = 0;
+			pr_res_holder->pr_res_scope = 0;
+		}
 	} else if (pr_reg->pr_reg_all_tg_pt &&
 		  (!strcmp(pr_res_holder->pr_reg_nacl->initiatorname,
 			  pr_reg->pr_reg_nacl->initiatorname)) &&
@@ -2446,7 +2493,7 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 		 */
 		type = pr_reg->pr_res_type;
 		pr_holder = core_scsi3_check_implicit_release(cmd->se_dev,
-							      pr_reg);
+							      pr_reg, res_key);
 		if (pr_holder < 0) {
 			ret = TCM_RESERVATION_CONFLICT;
 			goto out;
@@ -2462,14 +2509,8 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 					&pr_tmpl->registration_list,
 					pr_reg_list) {
 
-				if (!pr_reg_p->pr_reg_all_tg_pt)
-					continue;
-				if (pr_reg_p->pr_res_key != res_key)
-					continue;
-				if (pr_reg == pr_reg_p)
-					continue;
-				if (strcmp(pr_reg->pr_reg_nacl->initiatorname,
-					   pr_reg_p->pr_reg_nacl->initiatorname))
+				if (!core_scsi3_is_atp_sibling(pr_reg, pr_reg_p,
+							       res_key))
 					continue;
 
 				__core_scsi3_free_registration(dev,
