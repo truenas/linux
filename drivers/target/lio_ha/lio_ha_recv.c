@@ -736,6 +736,16 @@ void lio_ha_recv_session_destroy(u64 session_id)
 			 (unsigned long long)session_id);
 		lio_ha_dbg(1, "session destroyed: id=%llu\n",
 			   (unsigned long long)session_id);
+		/*
+		 * Commands submitted on this session may still be running:
+		 * STANDBY sends SESSION_DISCONNECT once its own copies are
+		 * done, not ours, and ours send CMD_RESPONSE before they drop
+		 * their session reference.  Wait for them as
+		 * lio_ha_recv_exit() does before freeing the session.  They
+		 * run against local storage, so the wait is bounded.
+		 */
+		target_stop_session(e->se_sess);
+		target_wait_for_sess_cmds(e->se_sess);
 		target_remove_session(e->se_sess);
 		kfree(e);
 		return;
