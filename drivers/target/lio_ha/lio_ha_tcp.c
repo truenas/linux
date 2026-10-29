@@ -96,6 +96,17 @@
 #define LIO_HA_CONNECT_BACKOFF_INIT 1000   /* initial retry delay */
 #define LIO_HA_CONNECT_BACKOFF_MAX  30000  /* maximum retry delay */
 
+/*
+ * A connected socket gives up on a peer that has not acknowledged sent
+ * data for this long (TCP_USER_TIMEOUT), and a send that cannot make
+ * progress for this long fails (SO_SNDTIMEO).  Either way the connection
+ * is closed and in-flight commands complete with BUSY.  Keepalive covers
+ * an idle link; these cover one with data outstanding, which keepalive
+ * does not probe, and which would otherwise hold ha_send_lock, and every
+ * sender behind it, for the kernel's retransmission timeout (~15 min).
+ */
+#define LIO_HA_IO_TIMEOUT_MS        10000
+
 /* ------------------------------------------------------------------ */
 /* State                                                               */
 /* ------------------------------------------------------------------ */
@@ -320,6 +331,8 @@ static void ha_tcp_on_connected(struct socket *sock)
 	if (tcp_sock_set_keepcnt(sock->sk, 5))
 		pr_warn("ha_tcp: failed to set TCP_KEEPCNT\n");
 	tcp_sock_set_nodelay(sock->sk);
+	tcp_sock_set_user_timeout(sock->sk, LIO_HA_IO_TIMEOUT_MS);
+	sock->sk->sk_sndtimeo = msecs_to_jiffies(LIO_HA_IO_TIMEOUT_MS);
 
 	ha_conn_sock = sock;
 
@@ -670,9 +683,6 @@ static int ha_tcp_connect_fn(void *unused)
 			goto backoff;
 		}
 
-		/* Restore default send timeout for normal operation. */
-		sock->sk->sk_sndtimeo = MAX_SCHEDULE_TIMEOUT;
-
 		ha_tcp_on_connected(sock);
 		delay_ms = LIO_HA_CONNECT_BACKOFF_INIT;
 		continue;
@@ -714,6 +724,16 @@ int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len)
 		ret = ha_tcp_send_full(sock, &hdr, sizeof(hdr));
 		if (!ret && len > 0)
 			ret = ha_tcp_send_full(sock, payload, len);
+		/*
+		 * A failed send may have written part of the message, and
+		 * the stream can no longer be framed: close the connection.
+		 * The rx thread sees it and runs the disconnect handling.
+		 */
+		if (ret) {
+			pr_warn_ratelimited("ha_tcp: send failed (%d), closing the connection\n",
+					    ret);
+			kernel_sock_shutdown(sock, SHUT_RDWR);
+		}
 	}
 	mutex_unlock(&ha_send_lock);
 
