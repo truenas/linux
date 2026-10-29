@@ -17,7 +17,7 @@
  *
  *   lio_ha_recv.c  SESSION_CONNECT / SESSION_DISCONNECT
  *   lio_ha_fwd.c   CMD_FORWARD / CMD_RESPONSE / TMR_FORWARD / TMR_RESPONSE
- *   lio_ha_main.c  PERS_ACTION / LUN_SYNC / LUN_SYNC_DONE
+ *   lio_ha_main.c  LUN_SYNC / LUN_SYNC_DONE
  */
 #ifndef _LIO_HA_TCP_H
 #define _LIO_HA_TCP_H
@@ -26,11 +26,12 @@
 #include "lio_ha_wire.h"
 
 /*
- * Maximum CTL-channel payload size (enforced by the rx loop).
- * DATA-channel payloads are raw SCSI data and are handled without
- * this limit (see ha_rx_task's DATA channel path).
+ * Maximum CTL-channel payload size (enforced by the rx loop).  The largest
+ * CTL message is a LUN_SYNC, which carries all of one device's PR
+ * registrations: 4 MiB holds several thousand even with the longest names.
+ * DATA-channel payloads have their own limit, LIO_HA_MAX_DATA_PAYLOAD.
  */
-#define LIO_HA_MAX_CTL_PAYLOAD    (64 * 1024)   /* 64 KiB */
+#define LIO_HA_MAX_CTL_PAYLOAD    (4 * 1024 * 1024)   /* 4 MiB */
 
 /* Initialise / shut down the TCP channel (call from module init/exit). */
 int  lio_ha_tcp_init(void);

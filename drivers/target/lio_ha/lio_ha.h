@@ -82,23 +82,15 @@ struct lio_ha_cfg {
 extern struct lio_ha_cfg lio_ha_cfg;
 
 /**
- * lio_ha_pr_apply - update the replicated PR table on STANDBY
- * @action:         enum lio_ha_pr_action value
- * @dev_name:       storage object name (e.g. "iblock_0/disk0")
- * @nx:             the I_T nexus the change applies to; @nx->tpg_tag is the
- *                  global tag of the physical port, stored as given
- * @res_key:        RESERVATION KEY from the PR OUT parameter list
- * @sa_res_key:     SERVICE ACTION RESERVATION KEY
- * @res_type:       reservation type (0 if not applicable)
+ * lio_ha_pr_replace_device - replace a device's entries in the PR table
+ * @dev_name: storage object name (e.g. "iblock_0/disk0")
+ * @text:     the device's registrations, in target_ha_pr_export()'s format
+ * @len:      length of @text
  *
- * Called from ha_fwd_pers_action_handler() when a PERS_ACTION message
- * arrives from ACTIVE, and from ha_fwd_lun_sync_handler() when bulk PR
- * state arrives.  Updates the in-memory replicated PR table (defined in
- * lio_ha_main.c) according to @action.
+ * Called on STANDBY from ha_fwd_lun_sync_handler() when a LUN_SYNC message
+ * arrives from ACTIVE.  Defined in lio_ha_main.c.
  */
-struct lio_ha_pr_nexus;
-void lio_ha_pr_apply(u8 action, const char *dev_name,
-		     const struct lio_ha_pr_nexus *nx,
-		     u64 res_key, u64 sa_res_key, u8 res_type);
+void lio_ha_pr_replace_device(const char *dev_name, const char *text,
+			      size_t len);
 
 #endif /* _LIO_HA_H */

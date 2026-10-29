@@ -4,12 +4,14 @@
  *
  * Loaded on both ACTIVE and STANDBY nodes.  Provides:
  *   - lio_ha_ops registration so LIO core can forward I/O and TMRs to ACTIVE
- *   - PR change notification for incremental PR replication (PERS_ACTION)
+ *   - PR replication: ACTIVE sends a device's whole PR state (LUN_SYNC)
+ *     after PR OUT changes it
  *   - Configfs subsystem at /sys/kernel/config/lio_ha/ for middleware to
  *     configure local_addr, peer_addr, port, and forward_active
  *
  * This file: module init/exit, configfs attributes, replicated PR table,
- * lio_ha_pr_apply(), ha_main_failover_device(), and the forward_active handler.
+ * lio_ha_pr_replace_device(), ha_main_failover_device(), and the
+ * forward_active handler.
  *
  * See drivers/target/lio_ha/README for the full design.
  */
@@ -72,10 +74,11 @@ static const char * const ha_state_names[] = {
 /* ------------------------------------------------------------------ */
 /* Replicated PR table (STANDBY side)                                */
 /*                                                                     */
-/* Maintained by lio_ha_pr_apply(), called from the PERS_ACTION TCP   */
-/* handler when ACTIVE pushes incremental PR mutations.  At failover  */
-/* ha_main_failover_device() snapshots this table and calls             */
-/* target_ha_pr_add_reg() to inject registrations directly.           */
+/* Maintained by lio_ha_pr_replace_device(), called from the LUN_SYNC */
+/* TCP handler with a device's whole PR state from ACTIVE.  At        */
+/* failover ha_main_failover_device() snapshots this table and calls  */
+/* target_ha_pr_add_reg() to inject registrations directly.  One      */
+/* entry stands for an ALL_TG_PT registrant on every port.            */
 /* ------------------------------------------------------------------ */
 
 struct lio_ha_pr_entry {
@@ -95,23 +98,32 @@ struct lio_ha_pr_entry {
 static LIST_HEAD(lio_ha_pr_table);
 static DEFINE_SPINLOCK(lio_ha_pr_lock);
 
-/* Work item queued by ha_main_pr_change() to send PERS_ACTION via TCP. */
-struct lio_ha_pr_work {
-	struct work_struct work;
-	char               dev_name[LIO_HA_DEV_NAME_LEN];
-	char               initiator_name[LIO_HA_INITIATOR_NAME_LEN];
-	char               initiator_sid[LIO_HA_ISID_LEN];
-	char               fabric_name[LIO_HA_FABRIC_NAME_LEN];
-	char               target_name[LIO_HA_INITIATOR_NAME_LEN];
-	u16                tpg_tag;     /* physical port, global tag */
-	bool               all_tg_pt;
-	u64                res_key;
-	u64                sa_res_key;
-	u8                 action;
-	u8                 res_type;
+/*
+ * ACTIVE side: devices whose PR state changed and has not been sent to
+ * STANDBY since.  ha_main_pr_change() adds a device once, however many PR
+ * OUT commands change it before ha_main_pr_sync_work_fn() gets to it, so
+ * a burst of them costs one LUN_SYNC.  ha_main_pr_dirty_all is set
+ * instead when an entry cannot be allocated: then every device is sent.
+ */
+struct ha_main_pr_dirty {
+	struct list_head list;
+	char             dev_name[LIO_HA_DEV_NAME_LEN];
 };
 
+static LIST_HEAD(ha_main_pr_dirty_list);
+static DEFINE_SPINLOCK(ha_main_pr_dirty_lock);
+static bool ha_main_pr_dirty_all;
+
+static void ha_main_pr_sync_work_fn(struct work_struct *work);
+static DECLARE_WORK(ha_main_pr_sync_work, ha_main_pr_sync_work_fn);
 static struct workqueue_struct *lio_ha_pr_wq;
+
+/*
+ * Held across reading a device's PR state and sending it, so that the
+ * LUN_SYNCs for a device go out in the order their snapshots were taken
+ * and the last one STANDBY applies is the newest.
+ */
+static DEFINE_MUTEX(ha_main_pr_sync_mutex);
 
 /* ------------------------------------------------------------------ */
 /* Shadow session table (STANDBY side)                                  */
@@ -170,33 +182,36 @@ static void ha_main_pr_table_flush(void)
 }
 
 /*
- * A table entry is for the same I_T nexus when initiator, discriminator and
- * target port all match.  An ALL_TG_PT entry registers its initiator port
- * (name and discriminator) on every target port, so it also covers a nexus
- * with the same initiator and discriminator on any other port.  A different
- * discriminator is a different initiator port and is not covered.
+ * Entries of one device, being built from a LUN_SYNC.
+ *
+ * An entry is for the same I_T nexus as @nx when initiator, discriminator
+ * and target port all match.  An ALL_TG_PT entry registers its initiator
+ * port (name and discriminator) on every target port, so it also covers a
+ * nexus with the same initiator and discriminator on any other port.  A
+ * different discriminator is a different initiator port and is not
+ * covered.
  */
-static bool ha_pr_entry_exact(const struct lio_ha_pr_entry *e,
-			      const struct lio_ha_pr_nexus *nx)
+static struct lio_ha_pr_entry *ha_pr_list_find(struct list_head *list,
+					       const struct lio_ha_pr_entry *nx)
 {
-	return !strncmp(e->initiator_name, nx->initiator_name,
-			LIO_HA_INITIATOR_NAME_LEN) &&
-	       !strncmp(e->initiator_sid, nx->initiator_sid ?: "",
-			LIO_HA_ISID_LEN) &&
-	       !strncmp(e->target_name, nx->target_name,
-			LIO_HA_INITIATOR_NAME_LEN) &&
-	       e->tpg_tag == nx->tpg_tag;
-}
+	struct lio_ha_pr_entry *e, *covering = NULL;
 
-static bool ha_pr_entry_covers(const struct lio_ha_pr_entry *e,
-			       const struct lio_ha_pr_nexus *nx)
-{
-	return ha_pr_entry_exact(e, nx) ||
-	       (e->all_tg_pt &&
-		!strncmp(e->initiator_name, nx->initiator_name,
-			 LIO_HA_INITIATOR_NAME_LEN) &&
-		!strncmp(e->initiator_sid, nx->initiator_sid ?: "",
-			 LIO_HA_ISID_LEN));
+	list_for_each_entry(e, list, list) {
+		bool same_port = !strncmp(e->initiator_name, nx->initiator_name,
+					  LIO_HA_INITIATOR_NAME_LEN) &&
+				 !strncmp(e->initiator_sid, nx->initiator_sid,
+					  LIO_HA_ISID_LEN);
+
+		if (!same_port)
+			continue;
+		if (!strncmp(e->target_name, nx->target_name,
+			     LIO_HA_INITIATOR_NAME_LEN) &&
+		    e->tpg_tag == nx->tpg_tag)
+			return e;
+		if (!covering && e->all_tg_pt)
+			covering = e;
+	}
+	return covering;
 }
 
 /*
@@ -204,19 +219,17 @@ static bool ha_pr_entry_covers(const struct lio_ha_pr_entry *e,
  * without a discriminator on the other ports of a registrant that has one.
  * The registrant's own entry already stands for it, and failover recreates
  * it with the registrant's discriminator, so it gets no entry of its own.
- * Caller holds lio_ha_pr_lock.
  */
-static bool ha_pr_is_sibling_of_entry(const char *dev_name,
-				      const struct lio_ha_pr_nexus *nx)
+static bool ha_pr_list_has_registrant(struct list_head *list,
+				      const struct lio_ha_pr_entry *nx)
 {
 	struct lio_ha_pr_entry *e;
 
-	if (!nx->all_tg_pt || (nx->initiator_sid && nx->initiator_sid[0]))
+	if (!nx->all_tg_pt || nx->initiator_sid[0])
 		return false;
 
-	list_for_each_entry(e, &lio_ha_pr_table, list) {
+	list_for_each_entry(e, list, list) {
 		if (e->all_tg_pt && e->initiator_sid[0] &&
-		    !strncmp(e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN) &&
 		    !strncmp(e->initiator_name, nx->initiator_name,
 			     LIO_HA_INITIATOR_NAME_LEN))
 			return true;
@@ -224,206 +237,160 @@ static bool ha_pr_is_sibling_of_entry(const char *dev_name,
 	return false;
 }
 
-/* Caller holds lio_ha_pr_lock. */
-static struct lio_ha_pr_entry *ha_pr_find(const char *dev_name,
-					  const struct lio_ha_pr_nexus *nx)
-{
-	struct lio_ha_pr_entry *e, *covering = NULL;
-
-	list_for_each_entry(e, &lio_ha_pr_table, list) {
-		if (strncmp(e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN) != 0)
-			continue;
-		if (ha_pr_entry_exact(e, nx))
-			return e;
-		if (!covering && ha_pr_entry_covers(e, nx))
-			covering = e;
-	}
-	return covering;
-}
-
 /*
- * Make @holder (which may be NULL) the reservation holder of @dev_name
- * and clear the flag on every other entry of the device.
- * Caller holds lio_ha_pr_lock.
+ * Parse one LUN_SYNC line (see target_ha_pr_export()) into @e.  Returns
+ * false if it names no registration.  @holder and @type are set from the
+ * line's res_holder and res_type; @e's own flags are left clear.
  */
-static void ha_pr_set_holder(const char *dev_name,
-			     const struct lio_ha_pr_entry *holder, u8 res_type)
+static bool ha_pr_parse_line(char *line, struct lio_ha_pr_entry *e,
+			     bool *holder, u8 *type)
 {
-	struct lio_ha_pr_entry *e;
+	char *tok;
 
-	list_for_each_entry(e, &lio_ha_pr_table, list) {
-		if (strncmp(e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN) != 0)
-			continue;
-		if (e == holder) {
-			e->res_holder = 1;
-			e->res_type   = res_type;
-		} else {
-			e->res_holder = 0;
+	*holder = false;
+	*type = 0;
+	while ((tok = strsep(&line, ",")) != NULL) {
+		unsigned long v;
+		u64 u;
+
+		if (!strncmp(tok, "initiator_fabric=", 17)) {
+			strscpy(e->fabric_name, tok + 17, LIO_HA_FABRIC_NAME_LEN);
+		} else if (!strncmp(tok, "initiator_node=", 15)) {
+			strscpy(e->initiator_name, tok + 15,
+				LIO_HA_INITIATOR_NAME_LEN);
+		} else if (!strncmp(tok, "initiator_sid=", 14)) {
+			strscpy(e->initiator_sid, tok + 14, LIO_HA_ISID_LEN);
+		} else if (!strncmp(tok, "target_node=", 12)) {
+			strscpy(e->target_name, tok + 12,
+				LIO_HA_INITIATOR_NAME_LEN);
+		} else if (!strncmp(tok, "tpgt=", 5)) {
+			if (!kstrtoul(tok + 5, 10, &v))
+				e->tpg_tag = (u16)v;
+		} else if (!strncmp(tok, "res_all_tg_pt=", 14)) {
+			if (!kstrtoul(tok + 14, 10, &v))
+				e->all_tg_pt = !!v;
+		} else if (!strncmp(tok, "sa_res_key=", 11)) {
+			if (!kstrtoull(tok + 11, 10, &u))
+				e->res_key = u;
+		} else if (!strncmp(tok, "res_holder=", 11)) {
+			if (!kstrtoul(tok + 11, 10, &v))
+				*holder = !!v;
+		} else if (!strncmp(tok, "res_type=", 9)) {
+			if (!kstrtoul(tok + 9, 10, &v))
+				*type = (u8)v;
 		}
 	}
+	return e->initiator_name[0] && e->res_key;
 }
 
-/*
- * lio_ha_pr_apply - update the replicated PR table
- *
- * Called on STANDBY from ha_fwd_pers_action_handler() when a
- * PERS_ACTION message arrives from ACTIVE, and from ha_fwd_lun_sync_handler()
- * when bulk PR state arrives.  Process context (workqueue or kthread) --
- * GFP_KERNEL is fine.
- */
-void lio_ha_pr_apply(u8 action, const char *dev_name,
-		     const struct lio_ha_pr_nexus *nx,
-		     u64 res_key, u64 sa_res_key, u8 res_type)
-{
-	struct lio_ha_pr_entry *e, *tmp, *new_e = NULL;
-	LIST_HEAD(free_list);
+/* Longest LUN_SYNC line accepted; target_ha_pr_export() writes < 1 KiB. */
+#define HA_PR_LINE_MAX	1024
 
-	/*
-	 * REGISTER_AND_MOVE (0x07) is never sent as a raw action: the ACTIVE
-	 * node decomposes it inside core_scsi3_emulate_pro_register_and_move()
-	 * into individual REGISTER / RESERVE / REGISTER(key=0) messages before
-	 * the destination nacl reference is released.  So it can never arrive
-	 * here and needs no special handling.
-	 *
-	 * REGISTER_AND_IGNORE (0x06) has the same effect on the replicated
-	 * table as a plain REGISTER: update or create the entry with the new
-	 * key, or remove it if the new key is zero.  The distinction (skip
-	 * the existing-key check) only matters on ACTIVE during CDB execution.
-	 * Both actions use the REGISTER case in the switch below.
-	 *
-	 * Pre-allocate a new entry before taking the spinlock so we can use
-	 * GFP_KERNEL rather than GFP_ATOMIC.
-	 */
-	if ((action == LIO_HA_PR_REGISTER ||
-	     action == LIO_HA_PR_REGISTER_AND_IGNORE) && sa_res_key != 0) {
-		new_e = kzalloc(sizeof(*new_e), GFP_KERNEL);
-		if (!new_e)
-			return;
+/*
+ * lio_ha_pr_replace_device - replace a device's entries in the PR table
+ * @dev_name: storage object name (e.g. "iblock_0/disk0")
+ * @text:     the device's registrations as target_ha_pr_export() wrote them
+ * @len:      length of @text; 0 means the device has no registrations
+ *
+ * Called on STANDBY from the LUN_SYNC handler.  Builds the device's new
+ * entries on a private list and swaps them in for the old ones in one step
+ * under lio_ha_pr_lock, so a failover never sees a half-replaced device.
+ * On allocation failure the old entries are kept.
+ *
+ * The registrations are merged as failover expects: one entry per
+ * ALL_TG_PT registrant, which also stands for its registrations on the
+ * other ports, and the reservation on the entry for the holder's nexus.
+ */
+void lio_ha_pr_replace_device(const char *dev_name, const char *text,
+			      size_t len)
+{
+	struct lio_ha_pr_entry *e, *tmp, *cand = NULL, *holder = NULL;
+	const char *line = text, *end, *text_end = text + len;
+	LIST_HEAD(new_list);
+	LIST_HEAD(old_list);
+	u8 holder_type = 0;
+	char *linebuf;
+
+	linebuf = kmalloc(HA_PR_LINE_MAX, GFP_KERNEL);
+	if (!linebuf)
+		goto nomem;
+
+	while (line < text_end) {
+		size_t line_len;
+		bool is_holder;
+		u8 type;
+
+		end = memchr(line, '\n', text_end - line);
+		line_len = end ? (size_t)(end - line) : (size_t)(text_end - line);
+		if (line_len >= HA_PR_LINE_MAX) {
+			pr_warn_ratelimited("lio_ha: LUN_SYNC line too long (%zu) for %s, skipping\n",
+					    line_len, dev_name);
+			goto next;
+		}
+		memcpy(linebuf, line, line_len);
+		linebuf[line_len] = '\0';
+
+		if (!cand) {
+			cand = kzalloc(sizeof(*cand), GFP_KERNEL);
+			if (!cand)
+				goto nomem;
+		} else {
+			memset(cand, 0, sizeof(*cand));
+		}
+		if (!ha_pr_parse_line(linebuf, cand, &is_holder, &type))
+			goto next;
+		strscpy(cand->dev_name, dev_name, LIO_HA_DEV_NAME_LEN);
+
+		e = ha_pr_list_find(&new_list, cand);
+		if (e) {
+			e->res_key = cand->res_key;
+		} else if (!ha_pr_list_has_registrant(&new_list, cand)) {
+			list_add_tail(&cand->list, &new_list);
+			e = cand;
+			cand = NULL;
+		}
+		/*
+		 * LIO flags only the one registration that holds the
+		 * reservation, also for an all registrants type.  If it is
+		 * merged into another entry, that entry holds it.
+		 */
+		if (is_holder && e) {
+			holder = e;
+			holder_type = type;
+		}
+next:
+		line = end ? end + 1 : text_end;
+	}
+	if (holder) {
+		holder->res_holder = 1;
+		holder->res_type   = holder_type;
 	}
 
 	spin_lock(&lio_ha_pr_lock);
-
-	switch ((enum lio_ha_pr_action)action) {
-	case LIO_HA_PR_REGISTER_AND_IGNORE:
-		/* REGISTER_AND_IGNORE: same table update as REGISTER. */
-		fallthrough;
-	case LIO_HA_PR_REGISTER:
-		e = ha_pr_find(dev_name, nx);
-		if (e && sa_res_key != 0) {
-			e->res_key = sa_res_key;
-		} else if (e) {
-			bool all_tg_pt = e->all_tg_pt;
-			char initiator_name[LIO_HA_INITIATOR_NAME_LEN];
-			char initiator_sid[LIO_HA_ISID_LEN];
-
-			strscpy(initiator_name, e->initiator_name,
-				LIO_HA_INITIATOR_NAME_LEN);
-			strscpy(initiator_sid, e->initiator_sid,
-				LIO_HA_ISID_LEN);
-			list_move(&e->list, &free_list);
-			/* Unregistering an ALL_TG_PT registrant drops its siblings. */
-			if (all_tg_pt) {
-				list_for_each_entry_safe(e, tmp, &lio_ha_pr_table, list) {
-					if (e->all_tg_pt &&
-					    !strncmp(e->dev_name, dev_name,
-						     LIO_HA_DEV_NAME_LEN) &&
-					    !strncmp(e->initiator_name,
-						     initiator_name,
-						     LIO_HA_INITIATOR_NAME_LEN) &&
-					    !strncmp(e->initiator_sid,
-						     initiator_sid,
-						     LIO_HA_ISID_LEN))
-						list_move(&e->list, &free_list);
-				}
-			}
-		} else if (sa_res_key != 0 && new_e &&
-			   !ha_pr_is_sibling_of_entry(dev_name, nx)) {
-			strscpy(new_e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN);
-			strscpy(new_e->initiator_name, nx->initiator_name,
-				LIO_HA_INITIATOR_NAME_LEN);
-			strscpy(new_e->initiator_sid, nx->initiator_sid ?: "",
-				LIO_HA_ISID_LEN);
-			strscpy(new_e->fabric_name, nx->fabric_name,
-				LIO_HA_FABRIC_NAME_LEN);
-			strscpy(new_e->target_name, nx->target_name,
-				LIO_HA_INITIATOR_NAME_LEN);
-			new_e->tpg_tag   = nx->tpg_tag;
-			new_e->all_tg_pt = nx->all_tg_pt;
-			new_e->res_key   = sa_res_key;
-			list_add_tail(&new_e->list, &lio_ha_pr_table);
-			new_e = NULL;
-		}
-		break;
-
-	case LIO_HA_PR_RESERVE:
-		ha_pr_set_holder(dev_name, ha_pr_find(dev_name, nx), res_type);
-		break;
-
-	case LIO_HA_PR_RELEASE:
-		e = ha_pr_find(dev_name, nx);
-		if (e) {
-			e->res_holder = 0;
-			e->res_type   = 0;
-		}
-		break;
-
-	case LIO_HA_PR_CLEAR:
-		list_for_each_entry_safe(e, tmp, &lio_ha_pr_table, list) {
-			if (strncmp(e->dev_name, dev_name,
-				    LIO_HA_DEV_NAME_LEN) == 0)
-				list_move(&e->list, &free_list);
-		}
-		break;
-
-	case LIO_HA_PR_PREEMPT:
-	case LIO_HA_PR_PREEMPT_AND_ABORT:
-		/*
-		 * Remove all registrations with sa_res_key (the preempted key)
-		 * for this device, then set the preempting initiator as holder.
-		 */
-		list_for_each_entry_safe(e, tmp, &lio_ha_pr_table, list) {
-			if (strncmp(e->dev_name, dev_name,
-				    LIO_HA_DEV_NAME_LEN) == 0 &&
-			    e->res_key == sa_res_key)
-				list_move(&e->list, &free_list);
-		}
-		ha_pr_set_holder(dev_name, ha_pr_find(dev_name, nx), res_type);
-		break;
+	list_for_each_entry_safe(e, tmp, &lio_ha_pr_table, list) {
+		if (!strncmp(e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN))
+			list_move(&e->list, &old_list);
 	}
-
+	list_splice_tail(&new_list, &lio_ha_pr_table);
 	spin_unlock(&lio_ha_pr_lock);
 
-	list_for_each_entry_safe(e, tmp, &free_list, list) {
+	list_for_each_entry_safe(e, tmp, &old_list, list) {
 		list_del(&e->list);
 		kfree(e);
 	}
-	kfree(new_e);
-}
+	kfree(cand);
+	kfree(linebuf);
+	return;
 
-/* Worker: builds and sends a PERS_ACTION wire message, then frees pw. */
-static void ha_main_pr_work_fn(struct work_struct *work)
-{
-	struct lio_ha_pr_work *pw =
-		container_of(work, struct lio_ha_pr_work, work);
-	struct lio_ha_msg_pers_action msg = {};
-
-	msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_PERS_ACTION);
-	msg.action     = cpu_to_be32(pw->action);
-	msg.res_type   = pw->res_type;
-	msg.res_key    = cpu_to_be64(pw->res_key);
-	msg.sa_res_key = cpu_to_be64(pw->sa_res_key);
-	msg.all_tg_pt  = pw->all_tg_pt;
-	msg.tpg_tag    = cpu_to_be16(pw->tpg_tag);
-	strscpy(msg.initiator_name, pw->initiator_name, LIO_HA_INITIATOR_NAME_LEN);
-	strscpy(msg.initiator_sid, pw->initiator_sid, LIO_HA_ISID_LEN);
-	strscpy(msg.target_name, pw->target_name, LIO_HA_INITIATOR_NAME_LEN);
-	strscpy(msg.dev_name, pw->dev_name, LIO_HA_DEV_NAME_LEN);
-	strscpy(msg.fabric_name, pw->fabric_name, LIO_HA_FABRIC_NAME_LEN);
-
-	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
-		pr_warn_ratelimited("lio_ha: PERS_ACTION send failed for %s\n",
-				    pw->dev_name);
-	kfree(pw);
+nomem:
+	pr_warn_ratelimited("lio_ha: out of memory replacing the PR state of %s; keeping the old\n",
+			    dev_name);
+	list_for_each_entry_safe(e, tmp, &new_list, list) {
+		list_del(&e->list);
+		kfree(e);
+	}
+	kfree(cand);
+	kfree(linebuf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -553,18 +520,21 @@ static const struct lio_ha_ops ha_ops = {
 };
 
 /* ------------------------------------------------------------------ */
-/* PR notifier -- ACTIVE pushes PERS_ACTION to STANDBY              */
+/* PR notifier -- ACTIVE sends a device's PR state to STANDBY          */
 /*                                                                     */
 /* Called from target_core_pr.c after each successful PR OUT on       */
-/* ACTIVE, under RCU read lock.  Must not sleep.  Queues a work item */
-/* that builds and sends the PERS_ACTION wire message via TCP.        */
+/* ACTIVE, under RCU read lock.  Must not sleep.  Marks the device     */
+/* dirty and queues ha_main_pr_sync_work, which sends its whole PR     */
+/* state as a LUN_SYNC.  Sending the state rather than the change      */
+/* keeps STANDBY's table exactly what this node has, whatever the      */
+/* service action did.                                                 */
 /* ------------------------------------------------------------------ */
 
-static void ha_main_pr_change(struct se_device *dev, u8 action,
-			      u64 res_key, u64 sa_res_key, u8 type,
-			      const struct lio_ha_pr_nexus *nx)
+static void ha_main_pr_change(struct se_device *dev)
 {
-	struct lio_ha_pr_work *pw;
+	struct ha_main_pr_dirty *d;
+	char dev_name[LIO_HA_DEV_NAME_LEN];
+	bool found = false;
 
 	/*
 	 * On ACTIVE, forward_active == 0 (we execute locally).
@@ -576,28 +546,30 @@ static void ha_main_pr_change(struct se_device *dev, u8 action,
 	if (!lio_ha_pr_wq)
 		return;
 
-	pw = kmalloc(sizeof(*pw), GFP_ATOMIC);
-	if (!pw)
-		return;
-	snprintf(pw->dev_name, LIO_HA_DEV_NAME_LEN, "%s/%s",
+	snprintf(dev_name, LIO_HA_DEV_NAME_LEN, "%s/%s",
 		 config_item_name(&dev->se_hba->hba_group.cg_item),
 		 config_item_name(&dev->dev_group.cg_item));
-	strscpy(pw->initiator_name, nx->initiator_name, LIO_HA_INITIATOR_NAME_LEN);
-	strscpy(pw->initiator_sid, nx->initiator_sid ?: "", LIO_HA_ISID_LEN);
-	strscpy(pw->fabric_name, nx->fabric_name, LIO_HA_FABRIC_NAME_LEN);
-	strscpy(pw->target_name, nx->target_name, LIO_HA_INITIATOR_NAME_LEN);
-	pw->tpg_tag    = nx->tpg_tag;
-	pw->all_tg_pt  = nx->all_tg_pt;
-	pw->res_key    = res_key;
-	pw->sa_res_key = sa_res_key;
-	pw->action     = action;
-	pw->res_type   = type;
-	INIT_WORK(&pw->work, ha_main_pr_work_fn);
-	lio_ha_dbg(2, "PR change: dev=%s initiator=%s action=%u key=%016llx sa=%016llx\n",
-		   pw->dev_name, pw->initiator_name, pw->action,
-		   (unsigned long long)pw->res_key,
-		   (unsigned long long)pw->sa_res_key);
-	queue_work(lio_ha_pr_wq, &pw->work);
+	lio_ha_dbg(2, "PR change: dev=%s\n", dev_name);
+
+	spin_lock(&ha_main_pr_dirty_lock);
+	list_for_each_entry(d, &ha_main_pr_dirty_list, list) {
+		if (!strncmp(d->dev_name, dev_name, LIO_HA_DEV_NAME_LEN)) {
+			found = true;
+			break;
+		}
+	}
+	if (!found && !ha_main_pr_dirty_all) {
+		d = kmalloc(sizeof(*d), GFP_ATOMIC);
+		if (d) {
+			strscpy(d->dev_name, dev_name, LIO_HA_DEV_NAME_LEN);
+			list_add_tail(&d->list, &ha_main_pr_dirty_list);
+		} else {
+			ha_main_pr_dirty_all = true;
+		}
+	}
+	spin_unlock(&ha_main_pr_dirty_lock);
+
+	queue_work(lio_ha_pr_wq, &ha_main_pr_sync_work);
 }
 
 static const struct lio_ha_pr_notifier pr_notifier = {
@@ -619,44 +591,29 @@ static const struct lio_ha_pr_notifier pr_notifier = {
 /*
  * Per-device callback for target_for_each_device().
  * Exports the device's live PR state as APTPL text and sends it as a
- * LUN_SYNC CTL message.
- *
- * Starts with a 4 KiB allocation (sufficient for ~15 registrations).
- * If target_ha_pr_export() returns -ENOSPC the buffer is grown to
- * LIO_HA_MAX_CTL_PAYLOAD (64 KiB) and the export is retried once.
- * Uses kvmalloc/kvfree to avoid requiring physically contiguous pages.
+ * LUN_SYNC CTL message.  The snapshot and the send are made under
+ * ha_main_pr_sync_mutex, so two LUN_SYNCs for one device cannot be sent
+ * in the opposite order to their snapshots.
  */
 static int ha_main_send_lun_sync_for_device(struct se_device *dev, void *data)
 {
 	const size_t hdr_size = sizeof(struct lio_ha_msg_lun_sync);
-	size_t buf_size = 4096;
 	struct lio_ha_msg_lun_sync *msg;
+	size_t aptpl_len;
 	void *full_buf;
-	int aptpl_len;
 
 	/* We are ACTIVE: skip if forward_active has been set since we started. */
 	if (atomic_read(&lio_ha_forward_active))
 		return 0;
 
-	full_buf = kvmalloc(buf_size, GFP_KERNEL);
-	if (!full_buf)
-		return 0;
-
-	aptpl_len = target_ha_pr_export(dev, (char *)(full_buf + hdr_size),
-					buf_size - hdr_size);
-	if (aptpl_len == -ENOSPC) {
-		kvfree(full_buf);
-		buf_size = LIO_HA_MAX_CTL_PAYLOAD;
-		full_buf = kvmalloc(buf_size, GFP_KERNEL);
-		if (!full_buf)
-			return 0;
-		aptpl_len = target_ha_pr_export(dev,
-						(char *)(full_buf + hdr_size),
-						buf_size - hdr_size);
-	}
-	if (aptpl_len < 0) {
-		kvfree(full_buf);
-		return 0;
+	mutex_lock(&ha_main_pr_sync_mutex);
+	full_buf = target_ha_pr_export(dev, hdr_size, &aptpl_len);
+	if (IS_ERR(full_buf)) {
+		pr_warn_ratelimited("lio_ha: cannot read PR state of %s/%s: %ld\n",
+				    config_item_name(&dev->se_hba->hba_group.cg_item),
+				    config_item_name(&dev->dev_group.cg_item),
+				    PTR_ERR(full_buf));
+		goto out;
 	}
 
 	msg = full_buf;
@@ -668,13 +625,90 @@ static int ha_main_send_lun_sync_for_device(struct se_device *dev, void *data)
 		 config_item_name(&dev->se_hba->hba_group.cg_item),
 		 config_item_name(&dev->dev_group.cg_item));
 
-	lio_ha_dbg(3, "LUN_SYNC: %s (%d bytes APTPL)\n", msg->dev_name, aptpl_len);
-	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, full_buf,
-			    (u32)(hdr_size + (size_t)aptpl_len)))
-		pr_debug("lio_ha: LUN_SYNC send failed for %s\n", msg->dev_name);
+	/* Partial PR state is worse than none: STANDBY keeps the last. */
+	if (hdr_size + aptpl_len > LIO_HA_MAX_CTL_PAYLOAD) {
+		pr_warn_ratelimited("lio_ha: PR state of %s (%zu bytes) too large for LUN_SYNC, not sent\n",
+				    msg->dev_name, aptpl_len);
+		goto free;
+	}
 
+	lio_ha_dbg(3, "LUN_SYNC: %s (%zu bytes APTPL)\n", msg->dev_name, aptpl_len);
+	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, full_buf,
+			    (u32)(hdr_size + aptpl_len)))
+		pr_debug("lio_ha: LUN_SYNC send failed for %s\n", msg->dev_name);
+free:
 	kvfree(full_buf);
+out:
+	mutex_unlock(&ha_main_pr_sync_mutex);
 	return 0;
+}
+
+/* target_for_each_device() callback: send the device named @data. */
+static int ha_main_send_lun_sync_if_named(struct se_device *dev, void *data)
+{
+	char dev_name[LIO_HA_DEV_NAME_LEN];
+
+	snprintf(dev_name, LIO_HA_DEV_NAME_LEN, "%s/%s",
+		 config_item_name(&dev->se_hba->hba_group.cg_item),
+		 config_item_name(&dev->dev_group.cg_item));
+	if (strncmp(dev_name, data, LIO_HA_DEV_NAME_LEN))
+		return 0;
+	ha_main_send_lun_sync_for_device(dev, NULL);
+	return 1;	/* found: stop iterating */
+}
+
+/*
+ * Send each device ha_main_pr_change() marked, taking it off the list
+ * first: a change after that marks it again.  A device that has been
+ * removed meanwhile is not found and needs nothing.  If the link is down
+ * the sends fail; the LUN_SYNC of every device when it comes back covers
+ * them.
+ */
+static void ha_main_pr_sync_work_fn(struct work_struct *work)
+{
+	struct ha_main_pr_dirty *d, *tmp;
+	LIST_HEAD(all_list);
+	bool all;
+
+	for (;;) {
+		spin_lock(&ha_main_pr_dirty_lock);
+		all = ha_main_pr_dirty_all;
+		ha_main_pr_dirty_all = false;
+		if (all)
+			list_splice_init(&ha_main_pr_dirty_list, &all_list);
+		d = list_first_entry_or_null(&ha_main_pr_dirty_list,
+					     struct ha_main_pr_dirty, list);
+		if (d)
+			list_del(&d->list);
+		spin_unlock(&ha_main_pr_dirty_lock);
+
+		if (all) {
+			list_for_each_entry_safe(d, tmp, &all_list, list) {
+				list_del(&d->list);
+				kfree(d);
+			}
+			target_for_each_device(ha_main_send_lun_sync_for_device,
+					       NULL);
+			continue;
+		}
+		if (!d)
+			break;
+		target_for_each_device(ha_main_send_lun_sync_if_named,
+				       d->dev_name);
+		kfree(d);
+	}
+}
+
+/* Free the dirty list.  Called at module exit, after the work is flushed. */
+static void ha_main_pr_dirty_flush(void)
+{
+	struct ha_main_pr_dirty *d, *tmp;
+
+	list_for_each_entry_safe(d, tmp, &ha_main_pr_dirty_list, list) {
+		list_del(&d->list);
+		kfree(d);
+	}
+	ha_main_pr_dirty_all = false;
 }
 
 /*
@@ -950,7 +984,41 @@ static void ha_main_failover_restore_entry(struct se_device *dev,
 	}
 }
 
-#define FAILOVER_PR_SNAP_MAX  128
+/*
+ * Copy @dev_name's entries of the PR table into @snap, at most @max.
+ * Returns how many the device has, which may be more than @max.
+ */
+static int ha_main_failover_snapshot(const char *dev_name,
+				     struct pr_snap_entry *snap, int max)
+{
+	struct lio_ha_pr_entry *e;
+	int n = 0;
+
+	spin_lock(&lio_ha_pr_lock);
+	list_for_each_entry(e, &lio_ha_pr_table, list) {
+		if (strncmp(e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN) != 0)
+			continue;
+		if (n < max) {
+			strscpy(snap[n].initiator_name, e->initiator_name,
+				LIO_HA_INITIATOR_NAME_LEN);
+			strscpy(snap[n].initiator_sid, e->initiator_sid,
+				LIO_HA_ISID_LEN);
+			strscpy(snap[n].fabric_name, e->fabric_name,
+				LIO_HA_FABRIC_NAME_LEN);
+			strscpy(snap[n].target_name, e->target_name,
+				LIO_HA_INITIATOR_NAME_LEN);
+			snap[n].tpg_tag    = e->tpg_tag;
+			snap[n].all_tg_pt  = e->all_tg_pt;
+			snap[n].sa_res_key = e->res_key;
+			snap[n].res_holder = e->res_holder;
+			snap[n].res_type   = e->res_type;
+		}
+		n++;
+	}
+	spin_unlock(&lio_ha_pr_lock);
+
+	return n;
+}
 
 /*
  * Per-device callback for target_for_each_device() during failover.
@@ -961,47 +1029,29 @@ static int ha_main_failover_device(struct se_device *dev, void *data)
 {
 	char dev_name[LIO_HA_DEV_NAME_LEN];
 	struct pr_snap_entry *snap;
-	struct lio_ha_pr_entry *e;
-	int nsnap = 0, i;
+	int max = 16, nsnap = 0, i;
 
 	snprintf(dev_name, LIO_HA_DEV_NAME_LEN, "%s/%s",
 		 config_item_name(&dev->se_hba->hba_group.cg_item),
 		 config_item_name(&dev->dev_group.cg_item));
 
-	snap = kcalloc(FAILOVER_PR_SNAP_MAX, sizeof(*snap), GFP_KERNEL);
-	if (!snap)
-		goto open_backend;
-
 	/*
-	 * Phase 1: snapshot all PR entries for this device under the spinlock.
-	 * The table is not modified during failover (STANDBY is still in
-	 * forwarding mode -- no PR OUTs run locally).
+	 * Phase 1: snapshot all PR entries for this device under the
+	 * spinlock, growing the array until it holds them all.
 	 */
-	spin_lock(&lio_ha_pr_lock);
-	list_for_each_entry(e, &lio_ha_pr_table, list) {
-		if (strncmp(e->dev_name, dev_name, LIO_HA_DEV_NAME_LEN) != 0)
-			continue;
-		if (nsnap >= FAILOVER_PR_SNAP_MAX) {
-			pr_warn_ratelimited("lio_ha: PR snapshot full for %s (max %d)\n",
-					    dev_name, FAILOVER_PR_SNAP_MAX);
-			break;
+	for (;;) {
+		snap = kvcalloc(max, sizeof(*snap), GFP_KERNEL);
+		if (!snap) {
+			pr_warn("lio_ha: failover: out of memory; PR state of %s not restored\n",
+				dev_name);
+			goto open_backend;
 		}
-		strscpy(snap[nsnap].initiator_name, e->initiator_name,
-			LIO_HA_INITIATOR_NAME_LEN);
-		strscpy(snap[nsnap].initiator_sid, e->initiator_sid,
-			LIO_HA_ISID_LEN);
-		strscpy(snap[nsnap].fabric_name, e->fabric_name,
-			LIO_HA_FABRIC_NAME_LEN);
-		strscpy(snap[nsnap].target_name, e->target_name,
-			LIO_HA_INITIATOR_NAME_LEN);
-		snap[nsnap].tpg_tag    = e->tpg_tag;
-		snap[nsnap].all_tg_pt  = e->all_tg_pt;
-		snap[nsnap].sa_res_key = e->res_key;
-		snap[nsnap].res_holder = e->res_holder;
-		snap[nsnap].res_type   = e->res_type;
-		nsnap++;
+		nsnap = ha_main_failover_snapshot(dev_name, snap, max);
+		if (nsnap <= max)
+			break;
+		kvfree(snap);
+		max = nsnap;
 	}
-	spin_unlock(&lio_ha_pr_lock);
 
 	/*
 	 * Phase 2a: inject non-holder registrations first.
@@ -1027,7 +1077,7 @@ static int ha_main_failover_device(struct se_device *dev, void *data)
 		ha_main_failover_restore_entry(dev, &snap[i]);
 	}
 
-	kfree(snap);
+	kvfree(snap);
 
 open_backend:
 	/*
@@ -1344,7 +1394,7 @@ static void __exit lio_ha_exit(void)
 	 * Unregister the PR notifier first: lio_ha_unregister_pr_notifier()
 	 * calls synchronize_rcu(), guaranteeing that no pr_change() call is
 	 * in progress and no new ones will start.  Flush and destroy the
-	 * workqueue next so all PERS_ACTION sends complete before TCP exits.
+	 * workqueue next so all LUN_SYNC sends complete before TCP exits.
 	 *
 	 * lio_ha_forward_active is 0 by the time __exit runs (the module
 	 * self-reference taken when forward_active is set to 1 prevents
@@ -1354,6 +1404,7 @@ static void __exit lio_ha_exit(void)
 	flush_workqueue(lio_ha_pr_wq);
 	destroy_workqueue(lio_ha_pr_wq);
 	lio_ha_pr_wq = NULL;
+	ha_main_pr_dirty_flush();
 	lio_ha_tcp_exit();
 	lio_ha_fwd_exit();
 	lio_ha_recv_exit();

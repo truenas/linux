@@ -62,10 +62,9 @@ enum lio_ha_msg_type {
 	LIO_HA_MSG_TMR_FORWARD        = 5,  /* S->A */
 	LIO_HA_MSG_TMR_RESPONSE       = 6,  /* A->S */
 
-	/* PR replication */
-	LIO_HA_MSG_PERS_ACTION        = 7,  /* A->S */
+	/* 7 was PERS_ACTION, an incremental PR change; no longer sent. */
 
-	/* PR bulk sync on link up */
+	/* PR replication: on link up, and after PR OUT changes a device */
 	LIO_HA_MSG_LUN_SYNC           = 8,  /* A->S; one per storage object */
 	LIO_HA_MSG_LUN_SYNC_DONE      = 9,  /* A->S; all LUN_SYNCs complete */
 
@@ -223,60 +222,11 @@ struct lio_ha_msg_tmr_response {
 };
 
 /* ------------------------------------------------------------------ */
-/* PERS_ACTION (A->S)                                                  */
-/*                                                                     */
-/* Incremental PR mutation: fired after each successful PR OUT on      */
-/* ACTIVE.  STANDBY applies it to its replicated PR table.            */
-/* Fire-and-forget (no ACK).                                           */
-/* ------------------------------------------------------------------ */
-
-enum lio_ha_pr_action {
-	/*
-	 * Wire values match the SPC-4 PR OUT service action codes (CDB byte 1
-	 * bits [4:0]) so that no translation is needed between the raw CDB
-	 * value and the wire value.
-	 *
-	 * PRO_REGISTER_AND_MOVE (0x07) never appears on the wire.  The ACTIVE
-	 * node decomposes it inside core_scsi3_emulate_pro_register_and_move()
-	 * into a REGISTER for the destination (with sa_res_key), a RESERVE for
-	 * the destination (with the inherited type), and -- if the UNREG bit is
-	 * set -- a key-zero REGISTER for the source (unregisters it).  Those
-	 * three individual actions are what STANDBY receives and applies.
-	 */
-	LIO_HA_PR_REGISTER            = 0x00,
-	LIO_HA_PR_RESERVE             = 0x01,
-	LIO_HA_PR_RELEASE             = 0x02,
-	LIO_HA_PR_CLEAR               = 0x03,
-	LIO_HA_PR_PREEMPT             = 0x04,
-	LIO_HA_PR_PREEMPT_AND_ABORT   = 0x05,
-	/*
-	 * REGISTER_AND_IGNORE_EXISTING_KEY: treated identically to REGISTER
-	 * by lio_ha_pr_apply() -- the distinction (skip key check) matters
-	 * only on ACTIVE where the CDB is executed.
-	 */
-	LIO_HA_PR_REGISTER_AND_IGNORE = 0x06,
-};
-
-struct lio_ha_msg_pers_action {
-	struct lio_ha_msg_hdr hdr;    /* type = LIO_HA_MSG_PERS_ACTION */
-	__be32 action;                /* enum lio_ha_pr_action; values match SPC PR OUT sa codes */
-	u8     res_type;              /* reservation type field from CDB */
-	u8     all_tg_pt;             /* registration made with ALL_TG_PT set */
-	__be16 tpg_tag;               /* physical port the registration was made through */
-	__be64 res_key;               /* RESERVATION KEY */
-	__be64 sa_res_key;            /* SERVICE ACTION RESERVATION KEY */
-	char   initiator_name[LIO_HA_INITIATOR_NAME_LEN];  /* whose key changed */
-	/* Nexus discriminator (iSCSI/iSER ISID); empty if the fabric has none */
-	char   initiator_sid[LIO_HA_ISID_LEN];
-	char   target_name[LIO_HA_INITIATOR_NAME_LEN];     /* target of the reg */
-	char   dev_name[LIO_HA_DEV_NAME_LEN];              /* storage object */
-	char   fabric_name[LIO_HA_FABRIC_NAME_LEN];        /* fabric driver name */
-};
-
-/* ------------------------------------------------------------------ */
 /* LUN_SYNC (A->S)                                                     */
 /*                                                                     */
-/* Full PR state for one storage object, sent on TCP link up.         */
+/* Full PR state for one storage object, sent on TCP link up and     */
+/* after PR OUT commands change it.  STANDBY replaces the object's    */
+/* entries with these.                                                 */
 /* Payload: this fixed header immediately followed by aptpl_buf_len   */
 /* bytes of APTPL-format text (same format as LIO's res_aptpl_metadata */
 /* configfs attribute).                                                */

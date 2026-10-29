@@ -305,7 +305,7 @@ static void ha_tcp_on_connected(struct socket *sock)
 	 * with idle=1s, intvl=1s, cnt=5 for years on the same kind of HA
 	 * interconnect.  Detection time is roughly idle + cnt*intvl ~= 6s.
 	 *
-	 * NODELAY: control messages (CMD_FORWARD, CMD_RESPONSE, PERS_ACTION,
+	 * NODELAY: control messages (CMD_FORWARD, CMD_RESPONSE, LUN_SYNC,
 	 * etc.) are tiny -- Nagle would coalesce them and add latency for
 	 * no throughput benefit.
 	 *

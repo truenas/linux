@@ -188,7 +188,7 @@ SESSION_CONNECT (S->A)
   otherwise translated = tag + 32000.  This ensures ACTIVE's lookup
   finds the real TPG (which holds the initiator's node_acl) rather than
   the phantom TPG (which has no real ACLs and no portals).  The same
-  rule applies to PERS_ACTION and to the tpgt= field of LUN_SYNC.
+  rule applies to the tpgt= field of LUN_SYNC.
 
   SESSION_CONNECT replay on link recovery: STANDBY maintains a
   shadow session list (ha_main_sess_list, protected by
@@ -245,22 +245,27 @@ TMR_RESPONSE (A->S)
   Returns the TMR response code: TMR_FUNCTION_COMPLETE or
   TMR_FUNCTION_REJECTED.
 
-PERS_ACTION (A->S)
-  Sent after each successful PR OUT executed on ACTIVE.
-  Fire-and-forget -- no ACK.  Carries the PR action code, RESERVATION
-  KEY, SERVICE ACTION RESERVATION KEY, reservation type, and the I_T
-  nexus the change applies to: initiator name, nexus discriminator
-  (ISID, empty if the fabric has none), fabric name, target name, TPG
-  tag and the ALL_TG_PT flag; plus the device name.  STANDBY translates
-  the tag and calls lio_ha_pr_apply() to update its replicated in-memory
-  PR table, which is keyed on the full nexus.
+PERS_ACTION (A->S), type 7
+  Retired.  It carried one PR OUT for STANDBY to re-apply, which meant
+  re-implementing the PR rules on STANDBY, and the messages could be
+  applied out of order.  LUN_SYNC replaces it.
 
 LUN_SYNC (A->S)
-  Sent by ACTIVE when the TCP link comes up, once per storage object.
-  Payload: a fixed header (dev_name + aptpl_buf_len) followed by
-  aptpl_buf_len bytes of APTPL-format text describing the full PR
-  state for that device.  STANDBY calls lio_ha_pr_apply() for each
-  registration in the text to initialise its in-memory PR table.
+  The full PR state of one storage object.  Sent by ACTIVE when the
+  TCP link comes up, once per storage object, and after PR OUT
+  commands change an object.  Payload: a fixed header (dev_name +
+  aptpl_buf_len) followed by aptpl_buf_len bytes of APTPL-format text,
+  one line per registration (target_ha_pr_export()), up to the 4 MiB
+  CTL limit.  STANDBY replaces the object's entries in its in-memory PR
+  table with these in one step (lio_ha_pr_replace_device()).
+
+  After a PR OUT, the notifier only marks the object; a work item sends
+  each marked object once, so a burst of PR OUT costs one LUN_SYNC.
+  The snapshot and its send are made under one mutex, so the LUN_SYNCs
+  for an object reach STANDBY in snapshot order and the last one is
+  current.  The registrations are copied under the PR locks and the
+  text is written after they are dropped.  Fire-and-forget: the PR OUT
+  completes without waiting for STANDBY.
 
 LUN_SYNC_DONE (A->S)
   Sent after all LUN_SYNC messages for the current sync cycle.  On
@@ -306,8 +311,9 @@ No-data command (DMA_NONE):
 
 PR commands (PR IN, PR OUT) go through target_execute_cmd() on
 STANDBY and are forwarded using the same CMD_FORWARD/CMD_RESPONSE
-path as data I/O.  A successful PR OUT on ACTIVE additionally fires
-a PERS_ACTION to STANDBY so the replicated PR table stays current.
+path as data I/O.  A successful PR OUT on ACTIVE additionally marks
+the storage object for a LUN_SYNC to STANDBY so the replicated PR
+table stays current.
 
 
 IN-FLIGHT COMMAND TRACKING
@@ -468,8 +474,8 @@ FILE MAP
   lio_ha_main.c    Module init/exit.  Configfs subsystem registration
                    and all five attributes.  Replicated PR table
                    (lio_ha_pr_table, protected by lio_ha_pr_lock) and
-                   lio_ha_pr_apply() which handles both PERS_ACTION
-                   (incremental) and LUN_SYNC (bulk) updates.
+                   lio_ha_pr_replace_device(), which applies a
+                   LUN_SYNC.  The PR notifier and the LUN_SYNC sender.
                    Shadow session list (ha_main_sess_list, protected by
                    ha_main_sess_mutex) for SESSION_CONNECT replay on TCP
                    link recovery (see SESSION_CONNECT above).
@@ -538,7 +544,7 @@ Functions follow a two-prefix convention:
 
   Public (cross-file API, declared in headers):
     lio_ha_*       e.g. lio_ha_tcp_send(), lio_ha_recv_init(),
-                        lio_ha_forward_cmd(), lio_ha_pr_apply()
+                        lio_ha_forward_cmd(), lio_ha_pr_replace_device()
 
   Private (static, internal to each .c file):
     ha_tcp_*       lio_ha_tcp.c
