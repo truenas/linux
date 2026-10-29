@@ -542,7 +542,8 @@ int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 			       const char *fabric_name)
 {
 	struct ha_recv_sess_entry *e, *existing;
-	struct se_portal_group *real_tpg, *port_tpg;
+	struct se_portal_group *real_tpg;
+	u16 port_rtpi;
 	struct se_node_acl *real_nacl;
 	struct target_cmd_counter *cmd_cnt;
 	struct se_session *se_sess;
@@ -580,11 +581,14 @@ int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 	 * se_cmd->se_tfo = ha_recv_ops and all fabric callbacks (queue_data_in,
 	 * queue_status, queue_tm_rsp) route back through ha_recv.
 	 */
-	real_tpg  = target_ha_lookup_tpg(fabric_name, target_name, tpg_tag);
+	real_tpg  = target_ha_get_tpg(fabric_name, target_name, tpg_tag);
 	real_nacl = real_tpg
 		? core_tpg_get_initiator_node_acl(real_tpg,
 					(unsigned char *)initiator_name)
 		: NULL;
+	/* From here on the nacl reference keeps what the session uses. */
+	if (real_tpg)
+		target_ha_put_tpg(real_tpg);
 
 	if (real_nacl) {
 		cmd_cnt = target_alloc_cmd_counter();
@@ -617,11 +621,11 @@ int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 		 * port's relative target port identifier.  TrueNAS gives every
 		 * TPG an rtpi equal to its tag, which is the fallback.
 		 */
-		port_tpg = target_ha_lookup_tpg(fabric_name, target_name,
-						port_tag);
+		if (!target_ha_tpg_rtpi(fabric_name, target_name, port_tag,
+					&port_rtpi))
+			port_rtpi = port_tag;
 		se_sess->sess_port_tag  = port_tag;
-		se_sess->sess_port_rtpi = port_tpg ? port_tpg->tpg_rtpi :
-						     port_tag;
+		se_sess->sess_port_rtpi = port_rtpi;
 		se_sess->sess_port_set  = true;
 		transport_register_session(&ha_recv_tpg.se_tpg, real_nacl,
 					   se_sess, e);

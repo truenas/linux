@@ -171,7 +171,7 @@ SESSION_CONNECT (S->A)
   the initiator IQN/WWPN, the initiator's nexus discriminator (the
   iSCSI/iSER ISID; empty for fabrics without one), target IQN/WWPN,
   fabric name, and TPG tag.
-  ACTIVE calls target_ha_lookup_tpg() to find the matching TPG,
+  ACTIVE calls target_ha_get_tpg() to find the matching TPG,
   looks up the node_acl for initiator_name, and creates a synthetic
   se_session keyed by STANDBY's se_session pointer (session_id).
   The synthetic session points to the real node_acl so that LUN
@@ -405,7 +405,7 @@ sequence is:
             holding lio_ha_pr_lock across LIO core calls).
 
         ii. For each registrant, the TPG it was made on is resolved
-            with target_ha_lookup_tpg(); target_ha_foreach_tpg_nacl_dev()
+            with target_ha_get_tpg(); target_ha_foreach_tpg_nacl_dev()
             finds the (nacl, lun, mapped_lun) tuple there, and
             target_ha_pr_add_reg() installs the PR registration, with
             its ISID, directly into LIO core.  For ALL_TG_PT
@@ -617,8 +617,9 @@ All additions in the core files are gated on #ifdef CONFIG_TRUENAS.
     - target_ha_pr_add_reg(): install one PR registration at failover.
 
   drivers/target/target_core_tpg.c
-    - target_ha_lookup_tpg(): find a TPG by fabric name, target name,
-      and TPG tag.
+    - target_ha_get_tpg() / target_ha_put_tpg(): find a TPG by fabric
+      name, target name and TPG tag, and pin it on tpg_pr_ref_count;
+      target_ha_tpg_rtpi(): just its relative target port id.
     - target_ha_foreach_nacl_dev(): iterate nacl+lun mappings for an
       initiator/device pair across all registered TPGs.
     - ha_tpg_reg_list: list of TPGs maintained by

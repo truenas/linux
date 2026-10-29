@@ -884,15 +884,14 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 		const struct target_core_fabric_ops *tfo =
 						nacl->se_tpg->se_tpg_tfo;
 		u16 mate_tag = lio_ha_peer_tpg_tag(port_tag);
-		struct se_portal_group *mate_tpg =
-			target_ha_lookup_tpg(tfo->fabric_name,
-					     tfo->tpg_get_wwn(nacl->se_tpg),
-					     mate_tag);
+		u16 mate_rtpi;
 
-		if (mate_tpg)
+		if (target_ha_tpg_rtpi(tfo->fabric_name,
+				       tfo->tpg_get_wwn(nacl->se_tpg),
+				       mate_tag, &mate_rtpi))
 			ret = target_ha_pr_add_reg(ctx->dev, nacl, lun,
 						   mapped_lun, ctx->isid,
-						   mate_tag, mate_tpg->tpg_rtpi,
+						   mate_tag, mate_rtpi,
 						   true, ctx->sa_res_key, 0, 0);
 	}
 	lio_ha_dbg(3, "failover PR reg: initiator=%s key=%016llx holder=%d type=%u ret=%d\n",
@@ -943,29 +942,37 @@ static void ha_main_failover_restore_entry(struct se_device *dev,
 		.res_holder = pe->res_holder,
 		.res_type   = pe->res_type,
 	};
-	struct se_portal_group *port_tpg, *tpg;
+	struct se_portal_group *tpg;
 
+	tpg = target_ha_get_tpg(pe->fabric_name, pe->target_name,
+				pe->tpg_tag);
 	/*
 	 * TrueNAS gives every TPG an rtpi equal to its tag, which is the
 	 * fallback if the port's TPG is not found.
 	 */
-	port_tpg = target_ha_lookup_tpg(pe->fabric_name, pe->target_name,
-					pe->tpg_tag);
-	ctx.port_rtpi = port_tpg ? port_tpg->tpg_rtpi : pe->tpg_tag;
-
-	tpg = port_tpg;
-	if (tpg)
+	ctx.port_rtpi = tpg ? tpg->tpg_rtpi : pe->tpg_tag;
+	if (tpg) {
 		target_ha_foreach_tpg_nacl_dev(tpg, pe->initiator_name, dev,
 					       ha_main_failover_add_reg_cb,
 					       &ctx);
-	if (!ctx.found) {
-		tpg = target_ha_lookup_tpg(pe->fabric_name, pe->target_name,
-					   lio_ha_peer_tpg_tag(pe->tpg_tag));
-		if (tpg)
+		if (!ctx.found) {
+			target_ha_put_tpg(tpg);
+			tpg = NULL;
+		}
+	}
+	if (!tpg) {
+		tpg = target_ha_get_tpg(pe->fabric_name, pe->target_name,
+					lio_ha_peer_tpg_tag(pe->tpg_tag));
+		if (tpg) {
 			target_ha_foreach_tpg_nacl_dev(tpg, pe->initiator_name,
 						       dev,
 						       ha_main_failover_add_reg_cb,
 						       &ctx);
+			if (!ctx.found) {
+				target_ha_put_tpg(tpg);
+				tpg = NULL;
+			}
+		}
 	}
 	if (!ctx.found) {
 		pr_warn_ratelimited("lio_ha: failover: no node ACL for %s on %s/%s tpg%u or its peer; PR reg not restored\n",
@@ -982,6 +989,7 @@ static void ha_main_failover_restore_entry(struct se_device *dev,
 					   dev, ha_main_failover_add_reg_cb,
 					   &ctx);
 	}
+	target_ha_put_tpg(tpg);
 }
 
 /*
