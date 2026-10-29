@@ -529,6 +529,16 @@ static void ha_fwd_cmd_response_handler(const void *buf, size_t len)
 		}
 		kvfree(de->data);
 		kfree(de);
+	} else if (scsi_status == SAM_STAT_GOOD &&
+		   cmd->data_direction == DMA_FROM_DEVICE && cmd->data_length) {
+		/*
+		 * ACTIVE sent the data before the response, but it was not
+		 * kept here (no memory in ha_fwd_data_handler()).  GOOD
+		 * would hand the initiator a buffer it never filled.
+		 */
+		pr_warn_ratelimited("ha_fwd: READ data missing for cookie %llu; BUSY\n",
+				    (unsigned long long)cookie);
+		scsi_status = SAM_STAT_BUSY;
 	}
 
 	/* Populate sense buffer for CHECK_CONDITION. */
@@ -635,6 +645,7 @@ static void ha_fwd_data_handler(u64 cookie, const void *data, u32 data_len)
 		/* READ data from ACTIVE -- buffer for CMD_RESPONSE handler. */
 		struct ha_fwd_data_entry *de = kzalloc(sizeof(*de), GFP_KERNEL);
 
+		/* Dropped: the CMD_RESPONSE handler then completes with BUSY. */
 		if (!de)
 			return;
 		de->cookie = cookie;

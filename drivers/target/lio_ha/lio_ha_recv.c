@@ -182,36 +182,34 @@ static int ha_recv_check_stop_free(struct se_cmd *cmd)
 /* ------------------------------------------------------------------ */
 
 /* Build and send CMD_RESPONSE on the CTL channel (no inline data). */
-static void ha_recv_send_cmd_response(struct se_cmd *cmd, u64 cookie)
+static void ha_recv_send_cmd_response(struct se_cmd *cmd, u64 cookie,
+				      bool data_lost)
 {
-	struct lio_ha_msg_cmd_response *resp;
+	struct {
+		struct lio_ha_msg_cmd_response resp;
+		u8 sense[SCSI_SENSE_BUFFERSIZE];
+	} msg = {};
 	u8 sense_len = 0;
-	size_t total;
-	u8 *buf;
 
-	if (cmd->scsi_status == SAM_STAT_CHECK_CONDITION)
-		sense_len = (u8)min_t(u16, cmd->scsi_sense_length,
-				      SCSI_SENSE_BUFFERSIZE);
+	msg.resp.hdr.type   = cpu_to_be32(LIO_HA_MSG_CMD_RESPONSE);
+	msg.resp.cmd_cookie = cpu_to_be64(cookie);
+	if (data_lost) {
+		/* The initiator must not see GOOD for data it did not get. */
+		msg.resp.scsi_status = SAM_STAT_BUSY;
+	} else {
+		msg.resp.scsi_status = cmd->scsi_status;
+		if (cmd->scsi_status == SAM_STAT_CHECK_CONDITION) {
+			sense_len = (u8)min_t(u16, cmd->scsi_sense_length,
+					      SCSI_SENSE_BUFFERSIZE);
+			memcpy(msg.sense, cmd->sense_buffer, sense_len);
+		}
+	}
+	msg.resp.sense_len = sense_len;
 
-	total = sizeof(*resp) + sense_len;
-	buf   = kmalloc(total, GFP_KERNEL);
-	if (!buf)
-		return;
-
-	resp = (struct lio_ha_msg_cmd_response *)buf;
-	resp->hdr.type     = cpu_to_be32(LIO_HA_MSG_CMD_RESPONSE);
-	resp->hdr.reserved = 0;
-	resp->cmd_cookie   = cpu_to_be64(cookie);
-	resp->scsi_status  = cmd->scsi_status;
-	resp->sense_len    = sense_len;
-	memset(resp->pad, 0, sizeof(resp->pad));
-	if (sense_len > 0)
-		memcpy(buf + sizeof(*resp), cmd->sense_buffer, sense_len);
-
-	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, buf, (u32)total))
+	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg,
+			    (u32)(sizeof(msg.resp) + sense_len)))
 		pr_debug("ha_recv: CMD_RESPONSE send failed cookie=%llu\n",
 			 (unsigned long long)cookie);
-	kfree(buf);
 }
 
 /* Send DATA (READ response), then CMD_RESPONSE. */
@@ -220,6 +218,7 @@ static void ha_recv_send_cmd_response_with_data(struct se_cmd *cmd, u64 cookie)
 	size_t data_len = cmd->data_length;
 	size_t buf_len  = sizeof(struct lio_ha_data_hdr) + data_len;
 	struct lio_ha_data_hdr *dhdr;
+	bool data_lost = true;
 	u8 *buf;
 
 	buf = kvmalloc(buf_len, GFP_KERNEL);
@@ -231,10 +230,15 @@ static void ha_recv_send_cmd_response_with_data(struct se_cmd *cmd, u64 cookie)
 		if (lio_ha_tcp_send(LIO_HA_CHAN_DATA, buf, (u32)buf_len))
 			pr_debug("ha_recv: DATA send failed cookie=%llu\n",
 				 (unsigned long long)cookie);
+		else
+			data_lost = false;
 		kvfree(buf);
+	} else {
+		pr_warn_ratelimited("ha_recv: no memory for %zu bytes of READ data; BUSY\n",
+				    data_len);
 	}
 
-	ha_recv_send_cmd_response(cmd, cookie);
+	ha_recv_send_cmd_response(cmd, cookie, data_lost);
 }
 
 /* ------------------------------------------------------------------ */
@@ -344,7 +348,7 @@ static int ha_recv_queue_status(struct se_cmd *cmd)
 	struct ha_recv_cmd *hcmd = container_of(cmd, struct ha_recv_cmd, se_cmd);
 
 	/* No data: send CMD_RESPONSE only. */
-	ha_recv_send_cmd_response(cmd, hcmd->cookie);
+	ha_recv_send_cmd_response(cmd, hcmd->cookie, false);
 	return 0;
 }
 
@@ -379,7 +383,7 @@ static void ha_recv_aborted_task(struct se_cmd *cmd)
 	struct ha_recv_cmd *hcmd = container_of(cmd, struct ha_recv_cmd, se_cmd);
 
 	cmd->scsi_status = SAM_STAT_TASK_ABORTED;
-	ha_recv_send_cmd_response(cmd, hcmd->cookie);
+	ha_recv_send_cmd_response(cmd, hcmd->cookie, false);
 }
 
 static const struct target_core_fabric_ops ha_recv_ops = {
