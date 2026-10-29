@@ -229,6 +229,7 @@ struct statx {
 #define STATX_WRITE_ATOMIC	0x00010000U	/* Want/got atomic_write_* fields */
 #define STATX_DIO_READ_ALIGN	0x00020000U	/* Want/got dio read alignment info */
 
+#define STATX_ACL		0x08000000U	/* Want/got STATX_ATTR_ACL_* */
 #define STATX_ZFSFLAGS	0x10000000U	/* Want/got stx_zfsflags */
 #define STATX_GEN		0x20000000U	/* Want/got stx_gen */
 #define STATX_CHANGE_COOKIE	0x40000000U	/* Want/got stx_change_attr */
@@ -276,5 +277,13 @@ struct statx {
  */
 #define STATX_ATTR_POSIXACL		0x0100000000000000 /* The file system keeps POSIX ACLs */
 #define STATX_ATTR_NFSV4ACL		0x0200000000000000 /* The file system keeps NFSv4 ACLs */
+
+/*
+ * The POSIX ACLs a file has beyond its mode, from those the inode caches.
+ * Set when STATX_ACL is asked on a file system that keeps POSIX ACLs, and
+ * both are then in stx_attributes_mask.
+ */
+#define STATX_ATTR_ACL_ACCESS		0x0400000000000000 /* File has an access ACL */
+#define STATX_ATTR_ACL_DEFAULT		0x0800000000000000 /* Directory has a default ACL */
 
 #endif /* _UAPI_LINUX_STAT_H */
