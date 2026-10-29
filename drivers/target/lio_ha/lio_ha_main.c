@@ -1210,6 +1210,14 @@ static ssize_t lio_ha_forward_active_show(struct config_item *item, char *page)
 	return sysfs_emit(page, "%d\n", atomic_read(&lio_ha_forward_active));
 }
 
+/*
+ * Serialises writes of forward_active.  configfs serialises the writes of
+ * one open file only, and a transition is several steps: a 1->0 restores
+ * PR state on every device, which must not run twice at once, and each
+ * transition takes or drops the module reference exactly once.
+ */
+static DEFINE_MUTEX(lio_ha_forward_active_mutex);
+
 static ssize_t lio_ha_forward_active_store(struct config_item *item,
 					   const char *page, size_t count)
 {
@@ -1222,15 +1230,16 @@ static ssize_t lio_ha_forward_active_store(struct config_item *item,
 	if (val > 1)
 		return -EINVAL;
 
+	mutex_lock(&lio_ha_forward_active_mutex);
 	if (val == 1) {
 		if (atomic_read(&lio_ha_forward_active))
-			return count;   /* already set -- idempotent */
+			goto out;   /* already set -- idempotent */
 		__module_get(THIS_MODULE);
 		atomic_set(&lio_ha_forward_active, 1);
 		lio_ha_dbg(1, "forward_active set: STANDBY forwarding mode active\n");
 	} else {
 		if (!atomic_read(&lio_ha_forward_active))
-			return count;   /* already clear -- idempotent */
+			goto out;   /* already clear -- idempotent */
 		/*
 		 * Failover: the pool has been imported.  Restore replicated PR
 		 * state to each device's registration_list, then clear
@@ -1274,6 +1283,8 @@ static ssize_t lio_ha_forward_active_store(struct config_item *item,
 
 		module_put(THIS_MODULE);
 	}
+out:
+	mutex_unlock(&lio_ha_forward_active_mutex);
 	return count;
 }
 CONFIGFS_ATTR(lio_ha_, forward_active);
