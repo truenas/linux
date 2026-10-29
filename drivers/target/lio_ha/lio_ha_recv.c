@@ -461,12 +461,25 @@ static void ha_recv_cmd_forward_handler(const void *buf, size_t len)
  * Submit a TMR to LIO core on ACTIVE.
  * On completion, ha_recv_queue_tm_rsp() sends TMR_RESPONSE to STANDBY.
  */
+/* Answer a TMR that was not submitted, so STANDBY does not wait for it. */
+static void ha_recv_reject_tmr(u64 cmd_cookie)
+{
+	struct lio_ha_msg_tmr_response resp = {
+		.hdr.type   = cpu_to_be32(LIO_HA_MSG_TMR_RESPONSE),
+		.cmd_cookie = cpu_to_be64(cmd_cookie),
+		.response   = cpu_to_be32(TMR_FUNCTION_REJECTED),
+	};
+
+	lio_ha_tcp_send(LIO_HA_CHAN_CTL, &resp, sizeof(resp));
+}
+
 static void ha_recv_submit_tmr(u64 session_id, u64 cmd_cookie,
 			       u64 ref_cookie, u32 function, u32 lun)
 {
 	struct ha_recv_sess_entry *e;
 	struct se_session *se_sess = NULL;
 	struct ha_recv_cmd *hcmd;
+	int ret;
 
 	spin_lock(&ha_recv_sess_lock);
 	hash_for_each_possible(ha_recv_sess_ht, e, node, session_id) {
@@ -478,25 +491,15 @@ static void ha_recv_submit_tmr(u64 session_id, u64 cmd_cookie,
 	spin_unlock(&ha_recv_sess_lock);
 
 	if (!se_sess) {
-		struct lio_ha_msg_tmr_response resp = {
-			.hdr.type   = cpu_to_be32(LIO_HA_MSG_TMR_RESPONSE),
-			.cmd_cookie = cpu_to_be64(cmd_cookie),
-			.response   = cpu_to_be32(TMR_FUNCTION_REJECTED),
-		};
 		pr_warn_ratelimited("ha_recv: TMR: unknown session %llu\n",
 				    (unsigned long long)session_id);
-		lio_ha_tcp_send(LIO_HA_CHAN_CTL, &resp, sizeof(resp));
+		ha_recv_reject_tmr(cmd_cookie);
 		return;
 	}
 
 	hcmd = kzalloc(sizeof(*hcmd), GFP_KERNEL);
 	if (!hcmd) {
-		struct lio_ha_msg_tmr_response resp = {
-			.hdr.type   = cpu_to_be32(LIO_HA_MSG_TMR_RESPONSE),
-			.cmd_cookie = cpu_to_be64(cmd_cookie),
-			.response   = cpu_to_be32(TMR_FUNCTION_REJECTED),
-		};
-		lio_ha_tcp_send(LIO_HA_CHAN_CTL, &resp, sizeof(resp));
+		ha_recv_reject_tmr(cmd_cookie);
 		return;
 	}
 	hcmd->cookie = cmd_cookie;
@@ -512,9 +515,15 @@ static void ha_recv_submit_tmr(u64 session_id, u64 cmd_cookie,
 	 * ABORT_TASK may return TMR_FUNCTION_FAILED; LUN_RESET/TARGET_RESET
 	 * work normally.
 	 */
-	target_submit_tmr(&hcmd->se_cmd, se_sess, hcmd->sense_buf,
-			  (u64)lun, NULL, (unsigned char)function,
-			  GFP_KERNEL, ref_cookie, 0);
+	ret = target_submit_tmr(&hcmd->se_cmd, se_sess, hcmd->sense_buf,
+				(u64)lun, NULL, (unsigned char)function,
+				GFP_KERNEL, ref_cookie, 0);
+	if (ret) {
+		/* Not submitted: no callback will free hcmd or answer. */
+		pr_warn_ratelimited("ha_recv: TMR submit failed: %d\n", ret);
+		kfree(hcmd);
+		ha_recv_reject_tmr(cmd_cookie);
+	}
 }
 
 /*

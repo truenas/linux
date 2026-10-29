@@ -660,6 +660,14 @@ static void ha_fwd_data_handler(u64 cookie, const void *data, u32 data_len)
 		spin_lock(&ha_fwd_data_lock);
 		hash_add(ha_fwd_data_ht, &de->node, cookie);
 		spin_unlock(&ha_fwd_data_lock);
+	} else if (atomic_read(&lio_ha_forward_active)) {
+		/*
+		 * Forwarding: this node only receives READ data, and this is
+		 * for no command it has in flight.  Buffering it would keep
+		 * it until the link drops.
+		 */
+		pr_warn_ratelimited("ha_fwd: DATA for unknown cookie %016llx, dropped\n",
+				    (unsigned long long)cookie);
 	} else {
 		lio_ha_dbg(3, "data rx: WRITE data cookie=%016llx len=%u\n",
 			   (unsigned long long)cookie, data_len);
