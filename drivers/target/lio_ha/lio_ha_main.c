@@ -1410,9 +1410,10 @@ static void __exit lio_ha_exit(void)
 	/*
 	 * Unregister configfs first, so forward_active cannot change while
 	 * the module is torn down.  Then the PR notifier:
-	 * lio_ha_unregister_pr_notifier() calls synchronize_rcu(), guaranteeing that no pr_change() call is
-	 * in progress and no new ones will start.  Flush and destroy the
-	 * workqueue next so all LUN_SYNC sends complete before TCP exits.
+	 * lio_ha_unregister_pr_notifier() calls synchronize_rcu(),
+	 * guaranteeing that no pr_change() call is in progress and no new
+	 * ones will start.  Flush and destroy the workqueue next so all
+	 * LUN_SYNC sends complete before TCP exits.
 	 *
 	 * lio_ha_forward_active is 0 by the time __exit runs (the module
 	 * self-reference taken when forward_active is set to 1 prevents
