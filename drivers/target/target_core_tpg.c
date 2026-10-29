@@ -189,18 +189,36 @@ EXPORT_SYMBOL(target_ha_foreach_tpg_nacl_dev);
 void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_name,
 				struct se_device *dev, target_ha_nacl_fn_t fn, void *data)
 {
-#define HA_NACL_MAX_TPGS  32
-	struct se_portal_group *tpg_arr[HA_NACL_MAX_TPGS];
+	struct se_portal_group **tpg_arr;
 	struct ha_tpg_reg_entry *re;
-	int ntpg = 0, i;
+	int max = 0, ntpg = 0, i;
 
-	/* Snapshot matching TPG pointers under the spinlock. */
+	/*
+	 * Snapshot and pin the fabric's TPGs, sizing the array from a count
+	 * taken first; a TPG registered in between is not visited.
+	 */
+	spin_lock(&ha_tpg_reg_lock);
+	list_for_each_entry(re, &ha_tpg_reg_list, node)
+		max++;
+	spin_unlock(&ha_tpg_reg_lock);
+	if (!max)
+		return;
+
+	tpg_arr = kmalloc_array(max, sizeof(*tpg_arr), GFP_KERNEL);
+	if (!tpg_arr) {
+		pr_warn("TARGET_CORE: out of memory looking up %s's node ACLs\n",
+			initiator_name);
+		return;
+	}
+
 	spin_lock(&ha_tpg_reg_lock);
 	list_for_each_entry(re, &ha_tpg_reg_list, node) {
 		if (strcmp(re->tpg->se_tpg_tfo->fabric_name, fabric_name) != 0)
 			continue;
-		if (ntpg < HA_NACL_MAX_TPGS)
-			tpg_arr[ntpg++] = re->tpg;
+		if (ntpg == max)
+			break;
+		atomic_inc_mb(&re->tpg->tpg_pr_ref_count);
+		tpg_arr[ntpg++] = re->tpg;
 	}
 	spin_unlock(&ha_tpg_reg_lock);
 
@@ -228,6 +246,10 @@ void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_n
 
 		target_put_nacl(nacl);
 	}
+
+	for (i = 0; i < ntpg; i++)
+		target_ha_put_tpg(tpg_arr[i]);
+	kfree(tpg_arr);
 }
 EXPORT_SYMBOL(target_ha_foreach_nacl_dev);
 #endif /* CONFIG_TRUENAS */
