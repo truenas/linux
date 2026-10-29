@@ -18,11 +18,14 @@
  * Thread model
  * ------------
  * ha_listen_task : bind -> listen -> loop on kernel_accept.
- *                  On accept: calls ha_tcp_on_connected().
+ *                  On accept: calls ha_tcp_on_connected().  Any failure
+ *                  is retried after 5 s with the address read again.
  *
  * ha_connect_task: loop: if disconnected, try kernel_connect with 5 s
  *                  connect timeout; exponential backoff (1 s -> 30 s) on
  *                  failure.  On success: calls ha_tcp_on_connected().
+ *                  Only the node with the lower local address dials, so
+ *                  the pair never has two connections to choose from.
  *
  * ha_rx_task     : started per-connection inside ha_tcp_on_connected().
  *                  Reads wire header + payload in a loop.  On error:
@@ -517,6 +520,21 @@ out:
 /* Listen thread                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Sleep @ms unless the thread is stopped meanwhile; true if it should stop. */
+static bool ha_tcp_sleep(unsigned long ms)
+{
+	schedule_timeout_interruptible(msecs_to_jiffies(ms));
+	return kthread_should_stop() || atomic_read(&ha_tcp_stopping);
+}
+
+#define LIO_HA_LISTEN_RETRY_MS	5000
+
+/*
+ * Listen for the peer's connection.  Any failure -- an address that does
+ * not parse or is not up yet, a failed bind, an accept error -- is logged
+ * and retried with the configuration read again, so the thread lasts as
+ * long as the module.
+ */
 static int ha_tcp_listen_fn(void *unused)
 {
 	char local[LIO_HA_ADDR_LEN];
@@ -525,78 +543,82 @@ static int ha_tcp_listen_fn(void *unused)
 	struct socket *lsock;
 	int ret;
 
-	/* Wait until local_addr and port are configured. */
-	while (!kthread_should_stop()) {
+	while (!kthread_should_stop() && !atomic_read(&ha_tcp_stopping)) {
 		spin_lock(&lio_ha_cfg.lock);
 		memcpy(local, lio_ha_cfg.local_addr, LIO_HA_ADDR_LEN);
 		port = lio_ha_cfg.port;
 		spin_unlock(&lio_ha_cfg.lock);
 
-		if (local[0] && port)
-			break;
-
-		schedule_timeout_interruptible(msecs_to_jiffies(1000));
-	}
-
-	if (kthread_should_stop() || atomic_read(&ha_tcp_stopping))
-		return 0;
-
-	ret = ha_tcp_make_addr(local, port, &sin);
-	if (ret) {
-		pr_err("ha_tcp: invalid local_addr '%s': %d\n", local, ret);
-		return ret;
-	}
-
-	ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
-			       &lsock);
-	if (ret) {
-		pr_err("ha_tcp: sock_create_kern failed: %d\n", ret);
-		return ret;
-	}
-
-	lsock->sk->sk_reuse = SK_CAN_REUSE;
-
-	ret = kernel_bind(lsock, (struct sockaddr_unsized *)&sin, sizeof(sin));
-	if (ret) {
-		pr_err("ha_tcp: kernel_bind(%s:%u) failed: %d\n",
-		       local, port, ret);
-		sock_release(lsock);
-		return ret;
-	}
-
-	ret = kernel_listen(lsock, 4);
-	if (ret) {
-		pr_err("ha_tcp: kernel_listen failed: %d\n", ret);
-		sock_release(lsock);
-		return ret;
-	}
-
-	mutex_lock(&ha_tcp_lock);
-	ha_listen_sock = lsock;
-	mutex_unlock(&ha_tcp_lock);
-
-	pr_info("ha_tcp: listening on %s:%u\n", local, port);
-
-	while (!kthread_should_stop() && !atomic_read(&ha_tcp_stopping)) {
-		struct socket *new_sock;
-
-		ret = kernel_accept(lsock, &new_sock, 0);
-		if (ret < 0) {
-			if (!atomic_read(&ha_tcp_stopping) &&
-			    !kthread_should_stop())
-				pr_warn("ha_tcp: kernel_accept error: %d\n",
-					ret);
-			break;
+		/* Wait until local_addr and port are configured. */
+		if (!local[0] || !port) {
+			ha_tcp_sleep(1000);
+			continue;
 		}
 
-		ha_tcp_on_connected(new_sock);
+		ret = ha_tcp_make_addr(local, port, &sin);
+		if (ret) {
+			pr_err_ratelimited("ha_tcp: invalid local_addr '%s': %d\n",
+					   local, ret);
+			goto retry;
+		}
+
+		ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM,
+				       IPPROTO_TCP, &lsock);
+		if (ret) {
+			pr_err_ratelimited("ha_tcp: sock_create_kern failed: %d\n",
+					   ret);
+			goto retry;
+		}
+
+		lsock->sk->sk_reuse = SK_CAN_REUSE;
+
+		ret = kernel_bind(lsock, (struct sockaddr_unsized *)&sin,
+				  sizeof(sin));
+		if (ret) {
+			pr_err_ratelimited("ha_tcp: kernel_bind(%s:%u) failed: %d\n",
+					   local, port, ret);
+			sock_release(lsock);
+			goto retry;
+		}
+
+		ret = kernel_listen(lsock, 4);
+		if (ret) {
+			pr_err_ratelimited("ha_tcp: kernel_listen failed: %d\n",
+					   ret);
+			sock_release(lsock);
+			goto retry;
+		}
+
+		mutex_lock(&ha_tcp_lock);
+		ha_listen_sock = lsock;
+		mutex_unlock(&ha_tcp_lock);
+
+		pr_info("ha_tcp: listening on %s:%u\n", local, port);
+
+		while (!kthread_should_stop() && !atomic_read(&ha_tcp_stopping)) {
+			struct socket *new_sock;
+
+			ret = kernel_accept(lsock, &new_sock, 0);
+			if (ret < 0) {
+				if (!atomic_read(&ha_tcp_stopping) &&
+				    !kthread_should_stop())
+					pr_warn("ha_tcp: kernel_accept error: %d; listening again\n",
+						ret);
+				break;
+			}
+
+			ha_tcp_on_connected(new_sock);
+		}
+
+		mutex_lock(&ha_tcp_lock);
+		ha_listen_sock = NULL;
+		mutex_unlock(&ha_tcp_lock);
+
+		sock_release(lsock);
+retry:
+		if (ha_tcp_sleep(LIO_HA_LISTEN_RETRY_MS))
+			break;
 	}
-
-	mutex_lock(&ha_tcp_lock);
-	ha_listen_sock = NULL;
-	mutex_unlock(&ha_tcp_lock);
-
-	sock_release(lsock);
 	return 0;
 }
 
@@ -657,6 +679,19 @@ static int ha_tcp_connect_fn(void *unused)
 		if (ha_tcp_make_addr(peer,  port, &peer_sin)  < 0 ||
 		    ha_tcp_make_addr(local, 0,    &local_sin) < 0)
 			goto backoff;
+
+		/*
+		 * Only the node with the lower address dials; the other only
+		 * accepts.  When both dialled at once, each could keep its own
+		 * outbound connection and drop the one it accepted, closing
+		 * both links, again and again.
+		 */
+		if (ntohl(local_sin.sin_addr.s_addr) >
+		    ntohl(peer_sin.sin_addr.s_addr)) {
+			schedule_timeout_interruptible(msecs_to_jiffies(5000));
+			delay_ms = LIO_HA_CONNECT_BACKOFF_INIT;
+			continue;
+		}
 
 		ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM,
 				       IPPROTO_TCP, &sock);
