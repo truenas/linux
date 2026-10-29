@@ -1319,19 +1319,9 @@ static int __init lio_ha_init(void)
 		strscpy(lio_ha_cfg.peer_addr, default_peer_addr,
 			LIO_HA_ADDR_LEN);
 
-	config_group_init(&lio_ha_subsys.su_group);
-	mutex_init(&lio_ha_subsys.su_mutex);
-
-	ret = configfs_register_subsystem(&lio_ha_subsys);
-	if (ret) {
-		pr_err("lio_ha: configfs_register_subsystem failed: %d\n", ret);
-		return ret;
-	}
-
 	lio_ha_pr_wq = alloc_workqueue("lio_ha_pr", WQ_UNBOUND, 0);
 	if (!lio_ha_pr_wq) {
 		pr_err("lio_ha: failed to create PR workqueue\n");
-		configfs_unregister_subsystem(&lio_ha_subsys);
 		return -ENOMEM;
 	}
 
@@ -1340,14 +1330,8 @@ static int __init lio_ha_init(void)
 	lio_ha_tcp_register_connect_handler(ha_main_on_connect);
 
 	ret = lio_ha_recv_init();
-	if (ret) {
-		lio_ha_unregister_pr_notifier();
-		destroy_workqueue(lio_ha_pr_wq);
-		lio_ha_pr_wq = NULL;
-		lio_ha_unregister_ops();
-		configfs_unregister_subsystem(&lio_ha_subsys);
-		return ret;
-	}
+	if (ret)
+		goto out_ops;
 
 	/*
 	 * lio_ha_fwd_init() registers the TCP CTL and DATA channel handlers
@@ -1356,43 +1340,58 @@ static int __init lio_ha_init(void)
 	 * dispatched before the handlers are installed.
 	 */
 	ret = lio_ha_fwd_init();
-	if (ret) {
-		lio_ha_recv_exit();
-		lio_ha_unregister_pr_notifier();
-		destroy_workqueue(lio_ha_pr_wq);
-		lio_ha_pr_wq = NULL;
-		lio_ha_unregister_ops();
-		configfs_unregister_subsystem(&lio_ha_subsys);
-		return ret;
-	}
+	if (ret)
+		goto out_recv;
 
 	ret = lio_ha_tcp_init();
-	if (ret) {
-		lio_ha_fwd_exit();
-		lio_ha_recv_exit();
-		lio_ha_unregister_pr_notifier();
-		destroy_workqueue(lio_ha_pr_wq);
-		lio_ha_pr_wq = NULL;
-		lio_ha_unregister_ops();
-		configfs_unregister_subsystem(&lio_ha_subsys);
-		return ret;
-	}
+	if (ret)
+		goto out_fwd;
 
 	if (default_forward_active) {
 		__module_get(THIS_MODULE);
 		atomic_set(&lio_ha_forward_active, 1);
 	}
 
+	/*
+	 * Last: once registered, middleware can write forward_active, and
+	 * forwarding needs everything above.
+	 */
+	config_group_init(&lio_ha_subsys.su_group);
+	mutex_init(&lio_ha_subsys.su_mutex);
+	ret = configfs_register_subsystem(&lio_ha_subsys);
+	if (ret) {
+		pr_err("lio_ha: configfs_register_subsystem failed: %d\n", ret);
+		if (default_forward_active) {
+			atomic_set(&lio_ha_forward_active, 0);
+			module_put(THIS_MODULE);
+		}
+		goto out_tcp;
+	}
+
 	pr_info("lio_ha: loaded (port=%u forward_active=%d)\n",
 		lio_ha_cfg.port, atomic_read(&lio_ha_forward_active));
 	return 0;
+
+out_tcp:
+	lio_ha_tcp_exit();
+out_fwd:
+	lio_ha_fwd_exit();
+out_recv:
+	lio_ha_recv_exit();
+out_ops:
+	lio_ha_unregister_pr_notifier();
+	destroy_workqueue(lio_ha_pr_wq);
+	lio_ha_pr_wq = NULL;
+	lio_ha_unregister_ops();
+	return ret;
 }
 
 static void __exit lio_ha_exit(void)
 {
 	/*
-	 * Unregister the PR notifier first: lio_ha_unregister_pr_notifier()
-	 * calls synchronize_rcu(), guaranteeing that no pr_change() call is
+	 * Unregister configfs first, so forward_active cannot change while
+	 * the module is torn down.  Then the PR notifier:
+	 * lio_ha_unregister_pr_notifier() calls synchronize_rcu(), guaranteeing that no pr_change() call is
 	 * in progress and no new ones will start.  Flush and destroy the
 	 * workqueue next so all LUN_SYNC sends complete before TCP exits.
 	 *
@@ -1400,6 +1399,7 @@ static void __exit lio_ha_exit(void)
 	 * self-reference taken when forward_active is set to 1 prevents
 	 * rmmod from succeeding while forwarding is active).
 	 */
+	configfs_unregister_subsystem(&lio_ha_subsys);
 	lio_ha_unregister_pr_notifier();
 	flush_workqueue(lio_ha_pr_wq);
 	destroy_workqueue(lio_ha_pr_wq);
@@ -1409,7 +1409,6 @@ static void __exit lio_ha_exit(void)
 	lio_ha_fwd_exit();
 	lio_ha_recv_exit();
 	lio_ha_unregister_ops();
-	configfs_unregister_subsystem(&lio_ha_subsys);
 	ha_main_sess_list_flush();
 	ha_main_pr_table_flush();
 	pr_info("lio_ha: unloaded\n");
