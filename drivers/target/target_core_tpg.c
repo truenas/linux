@@ -55,25 +55,13 @@ struct ha_tpg_reg_entry {
 static LIST_HEAD(ha_tpg_reg_list);
 static DEFINE_SPINLOCK(ha_tpg_reg_lock);
 
-/**
- * target_ha_lookup_tpg - find a fabric TPG by identity, real or phantom
- * @fabric_name: target_core_fabric_ops.fabric_name (e.g. "iscsi", "qla2xxx")
- * @target_name: IQN or WWPN string from tpg_get_wwn()
- * @tpg_tag:     portal group tag from tpg_get_tag()
- *
- * Returns the matching se_portal_group pointer, or NULL if not found.  The
- * TPG of the peer node's port, which this node carries without portals, is
- * found by the peer's tag.
- * The caller must not sleep; called from TCP RX context on ACTIVE.
- */
-struct se_portal_group *target_ha_lookup_tpg(const char *fabric_name,
-					     const char *target_name,
-					     u16 tpg_tag)
+/* Caller holds ha_tpg_reg_lock. */
+static struct se_portal_group *target_ha_find_tpg(const char *fabric_name,
+						  const char *target_name,
+						  u16 tpg_tag)
 {
 	struct ha_tpg_reg_entry *re;
-	struct se_portal_group *found = NULL;
 
-	spin_lock(&ha_tpg_reg_lock);
 	list_for_each_entry(re, &ha_tpg_reg_list, node) {
 		struct se_portal_group *tpg = re->tpg;
 		const struct target_core_fabric_ops *tfo = tpg->se_tpg_tfo;
@@ -86,13 +74,64 @@ struct se_portal_group *target_ha_lookup_tpg(const char *fabric_name,
 		wwn = tfo->tpg_get_wwn(tpg);
 		if (!wwn || strcmp(wwn, target_name) != 0)
 			continue;
-		found = tpg;
-		break;
+		return tpg;
 	}
-	spin_unlock(&ha_tpg_reg_lock);
-	return found;
+	return NULL;
 }
-EXPORT_SYMBOL(target_ha_lookup_tpg);
+
+/**
+ * target_ha_get_tpg - find and pin a TPG by fabric identity
+ * @fabric_name: target_core_fabric_ops.fabric_name (e.g. "iscsi", "qla2xxx")
+ * @target_name: IQN or WWPN string from tpg_get_wwn()
+ * @tpg_tag:     portal group tag from tpg_get_tag()
+ *
+ * Returns the matching se_portal_group with a reference on
+ * tpg_pr_ref_count, which core_tpg_deregister() waits for, or NULL if
+ * none is registered.  The caller drops it with target_ha_put_tpg().  The
+ * TPG of the peer node's port, which this node carries without portals,
+ * is found by the peer's tag.  Does not sleep.
+ */
+struct se_portal_group *target_ha_get_tpg(const char *fabric_name,
+					  const char *target_name,
+					  u16 tpg_tag)
+{
+	struct se_portal_group *tpg;
+
+	spin_lock(&ha_tpg_reg_lock);
+	tpg = target_ha_find_tpg(fabric_name, target_name, tpg_tag);
+	if (tpg)
+		atomic_inc_mb(&tpg->tpg_pr_ref_count);
+	spin_unlock(&ha_tpg_reg_lock);
+	return tpg;
+}
+EXPORT_SYMBOL(target_ha_get_tpg);
+
+void target_ha_put_tpg(struct se_portal_group *tpg)
+{
+	atomic_dec_mb(&tpg->tpg_pr_ref_count);
+}
+EXPORT_SYMBOL(target_ha_put_tpg);
+
+/**
+ * target_ha_tpg_rtpi - relative target port identifier of a TPG
+ * @fabric_name, @target_name, @tpg_tag: as for target_ha_get_tpg()
+ * @rtpi: set to the TPG's tpg_rtpi if it is found
+ *
+ * Returns true if the TPG is registered.  Does not sleep.
+ */
+bool target_ha_tpg_rtpi(const char *fabric_name, const char *target_name,
+			u16 tpg_tag, u16 *rtpi)
+{
+	struct se_portal_group *tpg;
+
+	spin_lock(&ha_tpg_reg_lock);
+	tpg = target_ha_find_tpg(fabric_name, target_name, tpg_tag);
+	if (tpg)
+		*rtpi = tpg->tpg_rtpi;
+	spin_unlock(&ha_tpg_reg_lock);
+	return tpg;
+}
+EXPORT_SYMBOL(target_ha_tpg_rtpi);
 
 /*
  * target_ha_foreach_tpg_nacl_dev - find the nacl+lun mappings for an
@@ -670,6 +709,9 @@ int core_tpg_register(
 	struct se_portal_group *se_tpg,
 	int proto_id)
 {
+#ifdef CONFIG_TRUENAS
+	struct ha_tpg_reg_entry *re = NULL;
+#endif
 	int ret;
 
 	if (!se_tpg)
@@ -703,35 +745,43 @@ int core_tpg_register(
 	mutex_init(&se_tpg->acl_node_mutex);
 #ifdef CONFIG_TRUENAS
 	/*
-	 * Add to the global TPG registry so lio_ha.ko can look up this
+	 * An entry in the global TPG registry, so lio_ha.ko can look up this
 	 * TPG by fabric_name + target_name + tpg_tag.  Internal TPGs
-	 * (se_wwn=NULL, e.g. iSCSI discovery, ha_recv) are excluded.
+	 * (se_wwn=NULL, e.g. iSCSI discovery, ha_recv) are excluded.  Added
+	 * once the TPG is set up; a TPG that lio_ha cannot find would have
+	 * its PR registrations and peer sessions silently dropped, so
+	 * failing to allocate the entry fails the registration.
 	 */
 	if (se_wwn) {
-		struct ha_tpg_reg_entry *re;
-
 		re = kzalloc(sizeof(*re), GFP_KERNEL);
-		if (re) {
-			re->tpg = se_tpg;
-			spin_lock(&ha_tpg_reg_lock);
-			list_add_tail(&re->node, &ha_tpg_reg_list);
-			spin_unlock(&ha_tpg_reg_lock);
-		}
+		if (!re)
+			return -ENOMEM;
+		re->tpg = se_tpg;
 	}
 #endif /* CONFIG_TRUENAS */
 
 	if (se_tpg->proto_id >= 0) {
 		se_tpg->tpg_virt_lun0 = core_tpg_alloc_lun(se_tpg, 0);
-		if (IS_ERR(se_tpg->tpg_virt_lun0))
-			return PTR_ERR(se_tpg->tpg_virt_lun0);
+		if (IS_ERR(se_tpg->tpg_virt_lun0)) {
+			ret = PTR_ERR(se_tpg->tpg_virt_lun0);
+			goto out_free_re;
+		}
 
 		ret = core_tpg_add_lun(se_tpg, se_tpg->tpg_virt_lun0,
 				true, g_lun0_dev);
 		if (ret < 0) {
 			kfree(se_tpg->tpg_virt_lun0);
-			return ret;
+			goto out_free_re;
 		}
 	}
+
+#ifdef CONFIG_TRUENAS
+	if (re) {
+		spin_lock(&ha_tpg_reg_lock);
+		list_add_tail(&re->node, &ha_tpg_reg_list);
+		spin_unlock(&ha_tpg_reg_lock);
+	}
+#endif /* CONFIG_TRUENAS */
 
 	pr_debug("TARGET_CORE[%s]: Allocated portal_group for endpoint: %s, "
 		 "Proto: %d, Portal Tag: %u\n", se_tpg->se_tpg_tfo->fabric_name,
@@ -740,6 +790,12 @@ int core_tpg_register(
 		se_tpg->proto_id, se_tpg->se_tpg_tfo->tpg_get_tag(se_tpg));
 
 	return 0;
+
+out_free_re:
+#ifdef CONFIG_TRUENAS
+	kfree(re);
+#endif
+	return ret;
 }
 EXPORT_SYMBOL(core_tpg_register);
 
@@ -753,6 +809,26 @@ int core_tpg_deregister(struct se_portal_group *se_tpg)
 		 "Proto: %d, Portal Tag: %u\n", tfo->fabric_name,
 		tfo->tpg_get_wwn(se_tpg) ? tfo->tpg_get_wwn(se_tpg) : NULL,
 		se_tpg->proto_id, tfo->tpg_get_tag(se_tpg));
+
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Out of the HA registry before waiting for tpg_pr_ref_count, so
+	 * target_ha_get_tpg() takes no reference the wait could miss.
+	 */
+	{
+		struct ha_tpg_reg_entry *re, *tmp;
+
+		spin_lock(&ha_tpg_reg_lock);
+		list_for_each_entry_safe(re, tmp, &ha_tpg_reg_list, node) {
+			if (re->tpg == se_tpg) {
+				list_del(&re->node);
+				kfree(re);
+				break;
+			}
+		}
+		spin_unlock(&ha_tpg_reg_lock);
+	}
+#endif /* CONFIG_TRUENAS */
 
 	while (atomic_read(&se_tpg->tpg_pr_ref_count) != 0)
 		cpu_relax();
@@ -777,24 +853,6 @@ int core_tpg_deregister(struct se_portal_group *se_tpg)
 		core_tpg_remove_lun(se_tpg, se_tpg->tpg_virt_lun0);
 		kfree_rcu(se_tpg->tpg_virt_lun0, rcu_head);
 	}
-
-#ifdef CONFIG_TRUENAS
-	{
-		struct ha_tpg_reg_entry *re, *tmp;
-
-		spin_lock(&ha_tpg_reg_lock);
-		list_for_each_entry_safe(re, tmp, &ha_tpg_reg_list, node) {
-			if (re->tpg == se_tpg) {
-				list_del(&re->node);
-				spin_unlock(&ha_tpg_reg_lock);
-				kfree(re);
-				goto ha_tpg_removed;
-			}
-		}
-		spin_unlock(&ha_tpg_reg_lock);
-ha_tpg_removed:;
-	}
-#endif /* CONFIG_TRUENAS */
 
 	target_tpg_deregister_rtpi(se_tpg);
 

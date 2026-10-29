@@ -86,11 +86,13 @@
  * both nodes (because core_tpg_register runs on both), but is only
  * consumed on ACTIVE.
  *
- * target_ha_lookup_tpg() -- used during SESSION_CONNECT processing
+ * target_ha_get_tpg() / target_ha_put_tpg() -- used during SESSION_CONNECT
+ * processing and failover; target_ha_tpg_rtpi() where only the port id is
+ * needed
  *
  *   When STANDBY reports an initiator connection it identifies the TPG
  *   by three strings: fabric_name, target_name (IQN or WWPN), and
- *   tpg_tag.  ACTIVE calls target_ha_lookup_tpg() to resolve those
+ *   tpg_tag.  ACTIVE calls target_ha_get_tpg() to resolve those
  *   identifiers to a live se_portal_group *, then looks up the
  *   node_acl for the initiator within that TPG.  The synthetic
  *   se_session is given that real node_acl so that LUN lookups and
@@ -281,10 +283,17 @@ int target_ha_reopen_backend(struct se_device *dev);
 /* Defined in target_core_transport.c */
 void target_complete_tmr(struct se_cmd *cmd);
 
-/* Defined in target_core_tpg.c -- find a real fabric TPG by identity */
-struct se_portal_group *target_ha_lookup_tpg(const char *fabric_name,
-					     const char *target_name,
-					     u16 tpg_tag);
+/*
+ * Defined in target_core_tpg.c -- find a real fabric TPG by identity.
+ * target_ha_get_tpg() pins the TPG until target_ha_put_tpg();
+ * target_ha_tpg_rtpi() returns only its relative target port identifier.
+ */
+struct se_portal_group *target_ha_get_tpg(const char *fabric_name,
+					  const char *target_name,
+					  u16 tpg_tag);
+void target_ha_put_tpg(struct se_portal_group *tpg);
+bool target_ha_tpg_rtpi(const char *fabric_name, const char *target_name,
+			u16 tpg_tag, u16 *rtpi);
 
 /* Callback type for target_ha_foreach_nacl_dev(). */
 typedef void (*target_ha_nacl_fn_t)(struct se_node_acl *nacl, struct se_lun *lun,
@@ -293,7 +302,7 @@ typedef void (*target_ha_nacl_fn_t)(struct se_node_acl *nacl, struct se_lun *lun
 /**
  * target_ha_foreach_tpg_nacl_dev - find the nacl+lun mappings for an
  *                                  initiator/device on one TPG
- * @tpg:             the TPG, from target_ha_lookup_tpg()
+ * @tpg:             the TPG, pinned with target_ha_get_tpg()
  * @initiator_name:  IQN or WWPN of the initiator
  * @dev:             the se_device to match LUN mappings against
  * @fn:              callback invoked for each (nacl, lun, mapped_lun) match

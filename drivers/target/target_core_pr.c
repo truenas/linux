@@ -120,7 +120,6 @@ static bool core_scsi3_mate_port(struct se_node_acl *nacl, u16 tag,
 {
 	const struct target_core_fabric_ops *tfo = nacl->se_tpg->se_tpg_tfo;
 	const struct lio_ha_pr_notifier *n;
-	struct se_portal_group *mate_tpg;
 
 	rcu_read_lock();
 	n = rcu_dereference(pr_notifier);
@@ -131,14 +130,9 @@ static bool core_scsi3_mate_port(struct se_node_acl *nacl, u16 tag,
 	*mate_tag = n->peer_port_tag(tag);
 	rcu_read_unlock();
 
-	mate_tpg = target_ha_lookup_tpg(tfo->fabric_name,
-					tfo->tpg_get_wwn(nacl->se_tpg),
-					*mate_tag);
-	if (!mate_tpg)
-		return false;
-
-	*mate_rtpi = mate_tpg->tpg_rtpi;
-	return true;
+	return target_ha_tpg_rtpi(tfo->fabric_name,
+				  tfo->tpg_get_wwn(nacl->se_tpg),
+				  *mate_tag, mate_rtpi);
 }
 #endif /* CONFIG_TRUENAS */
 
