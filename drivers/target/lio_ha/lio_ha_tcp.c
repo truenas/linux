@@ -26,7 +26,11 @@
  *
  * ha_rx_task     : started per-connection inside ha_tcp_on_connected().
  *                  Reads wire header + payload in a loop.  On error:
- *                  calls ha_tcp_on_disconnected(), then exits.
+ *                  calls ha_tcp_on_disconnected(), then exits.  Held by a
+ *                  task reference until it is joined with kthread_stop():
+ *                  by the next ha_tcp_on_connected(), or by
+ *                  lio_ha_tcp_exit(), so no rx thread is still running
+ *                  module code when a new one starts or the module goes.
  *
  * Locking
  * -------
@@ -50,10 +54,6 @@
  * clears the pointer under ha_tcp_lock before releasing the socket, so
  * a socket read under ha_tcp_lock may be shut down before it is dropped.
  *
- * ha_rx_done (completion): signalled by ha_rx_task when it exits.
- *     lio_ha_tcp_exit() waits on it after shutting down the socket so
- *     that sock_release is not called while the rx task is still
- *     blocked in kernel_recvmsg.
  *
  * Message dispatch
  * ----------------
@@ -121,7 +121,6 @@ static struct task_struct *ha_listen_task;
 static struct task_struct *ha_connect_task;
 static struct task_struct *ha_rx_task;
 
-static DECLARE_COMPLETION(ha_rx_done);
 static atomic_t ha_tcp_stopping = ATOMIC_INIT(0);
 
 /*
@@ -334,27 +333,28 @@ static void ha_tcp_on_connected(struct socket *sock)
 	tcp_sock_set_user_timeout(sock->sk, LIO_HA_IO_TIMEOUT_MS);
 	sock->sk->sk_sndtimeo = msecs_to_jiffies(LIO_HA_IO_TIMEOUT_MS);
 
-	ha_conn_sock = sock;
-
-	reinit_completion(&ha_rx_done);
-
-	rx = kthread_run(ha_tcp_rx_fn, sock, "lio_ha_rx");
-	if (IS_ERR(rx)) {
-		pr_err("ha_tcp: failed to start rx thread: %ld\n", PTR_ERR(rx));
-		ha_conn_sock = NULL;
-		mutex_unlock(&ha_tcp_lock);
-		sock_release(sock);
-		/*
-		 * reinit_completion() was called above; since the rx thread
-		 * never started it will never signal ha_rx_done.  Restore
-		 * the "already done" state so lio_ha_tcp_exit() does not
-		 * time out waiting on the completion.
-		 */
-		complete(&ha_rx_done);
-		return;
+	/*
+	 * Join the previous connection's rx thread.  It has run its
+	 * disconnect handling (ha_tcp_disconnecting is clear) and takes no
+	 * lock on its way out, so this does not wait on us.
+	 */
+	if (ha_rx_task) {
+		kthread_stop(ha_rx_task);
+		put_task_struct(ha_rx_task);
+		ha_rx_task = NULL;
 	}
 
-	ha_rx_task = rx;
+	rx = kthread_create(ha_tcp_rx_fn, sock, "lio_ha_rx");
+	if (IS_ERR(rx)) {
+		pr_err("ha_tcp: failed to start rx thread: %ld\n", PTR_ERR(rx));
+		mutex_unlock(&ha_tcp_lock);
+		sock_release(sock);
+		return;
+	}
+	get_task_struct(rx);
+	ha_rx_task   = rx;
+	ha_conn_sock = sock;
+	wake_up_process(rx);
 
 	spin_lock(&lio_ha_cfg.lock);
 	lio_ha_cfg.ha_state = LIO_HA_CONNECTED;
@@ -386,7 +386,6 @@ static void ha_tcp_on_disconnected(struct socket *sock)
 	}
 
 	ha_conn_sock = NULL;
-	ha_rx_task   = NULL;
 	ha_tcp_disconnecting = true;
 
 	spin_lock(&lio_ha_cfg.lock);
@@ -429,7 +428,6 @@ static void ha_tcp_on_disconnected(struct socket *sock)
 
 done:
 	sock_release(sock);
-	complete(&ha_rx_done);
 }
 
 /* ------------------------------------------------------------------ */
@@ -773,12 +771,6 @@ void lio_ha_tcp_register_ctl_handler(u32 msg_type,
 
 int lio_ha_tcp_init(void)
 {
-	init_completion(&ha_rx_done);
-	/* Mark as already done so exit() does not wait if no connection
-	 * was ever established.
-	 */
-	complete(&ha_rx_done);
-
 	/*
 	 * Each channel thread can return on its own, e.g. when bind() or
 	 * listen() fails, and a kthread that has returned is freed unless
@@ -821,6 +813,7 @@ int lio_ha_tcp_init(void)
 
 void lio_ha_tcp_exit(void)
 {
+	struct task_struct *task;
 	struct socket *sock;
 
 	atomic_set(&ha_tcp_stopping, 1);
@@ -856,20 +849,24 @@ void lio_ha_tcp_exit(void)
 	}
 
 	/*
-	 * Wait for the rx thread to finish.  The socket shutdown above
-	 * unblocks its kernel_recvmsg; it calls ha_tcp_on_disconnected()
-	 * which signals ha_rx_done.  If no connection was ever established,
-	 * ha_rx_done is already signalled from lio_ha_tcp_init().
+	 * Join the rx thread.  The socket shutdown above unblocks its
+	 * kernel_recvmsg(); it runs ha_tcp_on_disconnected(), which releases
+	 * the socket, and returns.  The listen and connect threads are
+	 * stopped, so no new rx thread can start.
 	 */
-	wait_for_completion_timeout(&ha_rx_done, msecs_to_jiffies(5000));
+	mutex_lock(&ha_tcp_lock);
+	task = ha_rx_task;
+	ha_rx_task = NULL;
+	mutex_unlock(&ha_tcp_lock);
+	if (task) {
+		kthread_stop(task);
+		put_task_struct(task);
+	}
 
-	/* Release any remaining socket (covers the edge case where the rx
-	 * thread exited without calling on_disconnected, e.g. OOM).
-	 */
+	/* Release any remaining socket: none, once the rx thread is joined. */
 	mutex_lock(&ha_tcp_lock);
 	sock = ha_conn_sock;
 	ha_conn_sock = NULL;
-	ha_rx_task   = NULL;
 	mutex_unlock(&ha_tcp_lock);
 	if (sock) {
 		mutex_lock(&ha_send_lock);	/* as ha_tcp_on_disconnected() */
