@@ -4744,6 +4744,28 @@ void *target_ha_pr_export(struct se_device *dev, size_t headroom,
 EXPORT_SYMBOL(target_ha_pr_export);
 
 /*
+ * Make @pr_reg the reservation holder with @res_type, releasing any other
+ * holder first so that only one registration claims the reservation.
+ * Caller holds dev_reservation_lock.
+ */
+static void target_ha_pr_set_holder(struct se_device *dev,
+				    struct t10_pr_registration *pr_reg,
+				    u8 res_type)
+{
+	struct t10_pr_registration *old = dev->dev_pr_res_holder;
+
+	lockdep_assert_held(&dev->dev_reservation_lock);
+
+	if (old && old != pr_reg)
+		__core_scsi3_complete_pro_release(dev, old->pr_reg_nacl, old,
+						  0, 0);
+	pr_reg->pr_res_scope  = 0;   /* LUN_SCOPE */
+	pr_reg->pr_res_type   = res_type;
+	pr_reg->pr_res_holder = 1;
+	dev->dev_pr_res_holder = pr_reg;
+}
+
+/*
  * target_ha_pr_add_reg - directly add one PR registration at failover
  *
  * Called by lio_ha.ko at failover time to restore replicated PR state that
@@ -4762,7 +4784,8 @@ EXPORT_SYMBOL(target_ha_pr_export);
  * and relative target port identifier of the physical target port it was made
  * through, which need not be the port of @nacl's TPG.  If the device already
  * has a registration for @nacl with the same discriminator and port, nothing
- * is added; @res_holder is still applied to that registration.
+ * is added; that registration takes @sa_res_key, and @res_holder is applied
+ * to it.  Making a registration the holder releases any other holder.
  *
  * Must not be called concurrently for the same device.
  * Returns 0 on success, -ENOMEM if allocation fails (registration skipped).
@@ -4791,6 +4814,15 @@ int target_ha_pr_add_reg(struct se_device *dev,
 	if (isid && !isid[0])
 		isid = NULL;
 
+	/*
+	 * Nothing else changes this device's registrations meanwhile: the
+	 * restore runs once per failover (lio_ha serialises forward_active),
+	 * before the device's backend is reopened, and until then every
+	 * command to it, PR OUT included, fails in target_cmd_parse_cdb().
+	 * A registration found here therefore stays valid after the locks
+	 * are dropped; the existing one is still updated under them.
+	 */
+	spin_lock(&dev->dev_reservation_lock);
 	spin_lock(&pr_tmpl->registration_lock);
 	list_for_each_entry(pr_reg, &pr_tmpl->registration_list, pr_reg_list) {
 		if (pr_reg->pr_reg_nacl != nacl)
@@ -4804,12 +4836,16 @@ int target_ha_pr_add_reg(struct se_device *dev,
 		existing = pr_reg;
 		break;
 	}
-	spin_unlock(&pr_tmpl->registration_lock);
-
 	if (existing) {
-		pr_reg = existing;
-		goto set_holder;
+		existing->pr_res_key = sa_res_key;
+		spin_unlock(&pr_tmpl->registration_lock);
+		if (res_holder)
+			target_ha_pr_set_holder(dev, existing, res_type);
+		spin_unlock(&dev->dev_reservation_lock);
+		return 0;
 	}
+	spin_unlock(&pr_tmpl->registration_lock);
+	spin_unlock(&dev->dev_reservation_lock);
 
 	/*
 	 * No live session at failover-restore time -- pass NULL for sess,
@@ -4828,13 +4864,9 @@ int target_ha_pr_add_reg(struct se_device *dev,
 
 	__core_scsi3_add_registration(dev, nacl, pr_reg, REGISTER, 0);
 
-set_holder:
 	if (res_holder) {
 		spin_lock(&dev->dev_reservation_lock);
-		pr_reg->pr_res_scope  = 0;   /* LUN_SCOPE */
-		pr_reg->pr_res_type   = res_type;
-		pr_reg->pr_res_holder = 1;
-		dev->dev_pr_res_holder = pr_reg;
+		target_ha_pr_set_holder(dev, pr_reg, res_type);
 		spin_unlock(&dev->dev_reservation_lock);
 	}
 
