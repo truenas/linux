@@ -3508,25 +3508,6 @@ core_scsi3_emulate_pro_register_and_move(struct se_cmd *cmd, u64 res_key,
 	unsigned short rtpi;
 	unsigned char proto_ident;
 	bool tid_found;
-#ifdef CONFIG_TRUENAS
-	/*
-	 * Snapshot buffers for HA notification.  dest_node_acl and
-	 * dest_tf_ops are released before this function returns; we capture
-	 * their strings here (at the top so no goto skips the declarations)
-	 * and populate them just before the undepend calls.  TRANSPORT_IQN_LEN
-	 * matches the field width in se_node_acl.initiatorname.  64 bytes is
-	 * more than sufficient for any fabric_name ("iscsi", "qla2xxx", …).
-	 */
-	char ha_dest_iname[TRANSPORT_IQN_LEN] = { };
-	char ha_dest_fname[64] = { };
-	char ha_src_iname[TRANSPORT_IQN_LEN] = { };
-	char ha_src_fname[64] = { };
-	char ha_dest_tname[TRANSPORT_IQN_LEN] = { };
-	char ha_src_tname[TRANSPORT_IQN_LEN] = { };
-	char ha_src_sid[PR_REG_ISID_LEN] = { };
-	char ha_dest_sid[PR_REG_ISID_LEN] = { };
-	u16 ha_dest_tag, ha_src_tag;
-#endif
 
 	if (!se_sess || !se_lun) {
 		pr_err("SPC-3 PR: se_sess || struct se_lun is NULL!\n");
@@ -3894,41 +3875,6 @@ after_iport_check:
 		i_buf, dest_tf_ops->fabric_name,
 		dest_node_acl->initiatorname, (iport_ptr != NULL) ?
 		iport_ptr : "");
-#ifdef CONFIG_TRUENAS
-	/*
-	 * Snapshot the destination and source identity strings before the
-	 * undepend calls below release dest_node_acl and dest_tf_ops.  We
-	 * cannot call the HA notifier yet because the source's UNREG has not
-	 * been applied locally; the notification fires after that block so
-	 * that the local and replicated states stay in step.
-	 */
-	strscpy(ha_dest_iname, dest_node_acl->initiatorname,
-		sizeof(ha_dest_iname));
-	strscpy(ha_dest_fname, dest_tf_ops->fabric_name,
-		sizeof(ha_dest_fname));
-	strscpy(ha_src_iname, pr_reg_nacl->initiatorname,
-		sizeof(ha_src_iname));
-	strscpy(ha_src_fname, tf_ops->fabric_name,
-		sizeof(ha_src_fname));
-	strscpy(ha_dest_tname, dest_tf_ops->tpg_get_wwn(dest_se_tpg),
-		sizeof(ha_dest_tname));
-	ha_dest_tag = dest_tf_ops->tpg_get_tag(dest_se_tpg);
-	/*
-	 * The destination's ISID is the one of the registration that now
-	 * holds the reservation, so the peer restores the same initiator
-	 * port and not every ISID of the initiator name.
-	 */
-	if (dest_pr_reg->isid_present_at_reg)
-		strscpy(ha_dest_sid, dest_pr_reg->pr_reg_isid,
-			sizeof(ha_dest_sid));
-	strscpy(ha_src_tname,
-		pr_reg_nacl->se_tpg->se_tpg_tfo->tpg_get_wwn(pr_reg_nacl->se_tpg),
-		sizeof(ha_src_tname));
-	ha_src_tag = pr_reg->pr_reg_port_tag;
-	if (tf_ops->sess_get_initiator_sid)
-		tf_ops->sess_get_initiator_sid(se_sess, ha_src_sid,
-					       sizeof(ha_src_sid));
-#endif /* CONFIG_TRUENAS */
 	/*
 	 * It is now safe to release configfs group dependencies for destination
 	 * of Transport ID Initiator Device/Port Identifier
@@ -3946,67 +3892,6 @@ after_iport_check:
 		spin_unlock(&pr_tmpl->registration_lock);
 	} else
 		core_scsi3_put_pr_reg(pr_reg);
-#ifdef CONFIG_TRUENAS
-	/*
-	 * Notify lio_ha.ko of the REGISTER_AND_MOVE.  Local state is now fully
-	 * settled: reservation moved, source optionally unregistered.
-	 *
-	 * REGISTER_AND_MOVE cannot be forwarded as a single PERS_ACTION message
-	 * because the wire format carries only one initiator identity, while
-	 * REGISTER_AND_MOVE involves two distinct I_T nexuses.  Instead we
-	 * decompose the operation into the sequence that lio_ha_pr_apply()
-	 * already understands:
-	 *
-	 *   1. REGISTER the destination with sa_res_key (creates or updates
-	 *      its entry in STANDBY's replicated table).
-	 *   2. RESERVE by the destination with the inherited reservation type
-	 *      (lio_ha_pr_apply()'s RESERVE case sets that entry as holder and
-	 *      clears res_holder on all others, exactly mirroring what
-	 *      REGISTER_AND_MOVE does to the reservation).
-	 *   3. If the UNREG bit was set: REGISTER the source with key=0
-	 *      (lio_ha_pr_apply()'s REGISTER case removes the entry when
-	 *      sa_res_key == 0).
-	 *
-	 * All three calls are made under a single RCU read lock so that the
-	 * notifier cannot be unregistered between them.
-	 */
-	{
-		const struct lio_ha_pr_notifier *n;
-		const struct lio_ha_pr_nexus dest_nx = {
-			.initiator_name	= ha_dest_iname,
-			.initiator_sid	= ha_dest_sid,
-			.fabric_name	= ha_dest_fname,
-			.target_name	= ha_dest_tname,
-			.tpg_tag	= ha_dest_tag,
-		};
-		const struct lio_ha_pr_nexus src_nx = {
-			.initiator_name	= ha_src_iname,
-			.initiator_sid	= ha_src_sid,
-			.fabric_name	= ha_src_fname,
-			.target_name	= ha_src_tname,
-			.tpg_tag	= ha_src_tag,
-		};
-
-		rcu_read_lock();
-		n = rcu_dereference(pr_notifier);
-		if (n) {
-			/* Step 1: register the destination initiator. */
-			n->pr_change(dev, PRO_REGISTER,
-				     0, sa_res_key, 0, &dest_nx);
-			/* Step 2: move the reservation to the destination. */
-			n->pr_change(dev, PRO_RESERVE,
-				     0, 0, (u8)type, &dest_nx);
-			/*
-			 * Step 3: unregister the source if the UNREG bit was
-			 * set in the REGISTER_AND_MOVE parameter data.
-			 */
-			if (unreg)
-				n->pr_change(dev, PRO_REGISTER,
-					     0, 0, 0, &src_nx);
-		}
-		rcu_read_unlock();
-	}
-#endif /* CONFIG_TRUENAS */
 	core_scsi3_update_and_write_aptpl(cmd->se_dev, aptpl);
 
 	core_scsi3_put_pr_reg(dest_pr_reg);
@@ -4215,54 +4100,23 @@ done:
 	if (!ret) {
 #ifdef CONFIG_TRUENAS
 		/*
-		 * Notify lio_ha.ko of the PR mutation before completing the
-		 * command.  pr_change() queues a PERS_ACTION message to
-		 * STANDBY (fire-and-forget) and returns immediately;
-		 * target_complete_cmd() follows with no added latency.
+		 * Tell lio_ha.ko that this device's PR state changed, before
+		 * completing the command.  pr_change() queues a send of the
+		 * device's whole PR state to STANDBY (fire-and-forget) and
+		 * returns at once.  Sending the state rather than the change
+		 * keeps STANDBY's copy exactly what this node has, whatever
+		 * the service action did: SPEC_I_PT and ALL_TG_PT
+		 * registrations, REGISTER AND MOVE, or a reservation passed on
+		 * or dropped.
 		 */
 		{
 			const struct lio_ha_pr_notifier *n;
 
-			if (!cmd->se_sess || !cmd->se_sess->se_node_acl) {
-				pr_err_ratelimited("target_core_pr: PR OUT with no session context\n");
-			} else {
-				rcu_read_lock();
-				n = rcu_dereference(pr_notifier);
-				/*
-				 * PRO_REGISTER_AND_MOVE is excluded here: it is
-				 * decomposed into individual REGISTER / RESERVE /
-				 * REGISTER(key=0) notifications from inside
-				 * core_scsi3_emulate_pro_register_and_move(),
-				 * where the destination I_T nexus identity is
-				 * still available.
-				 */
-				if (n && sa != PRO_REGISTER_AND_MOVE) {
-					struct se_portal_group *tpg =
-						cmd->se_sess->se_node_acl->se_tpg;
-					const struct target_core_fabric_ops *tfo =
-						tpg->se_tpg_tfo;
-					const struct target_core_fabric_ops *sess_tfo =
-						cmd->se_sess->se_tpg->se_tpg_tfo;
-					char isid_buf[PR_REG_ISID_LEN] = "";
-					struct lio_ha_pr_nexus nx;
-
-					if (sess_tfo->sess_get_initiator_sid)
-						sess_tfo->sess_get_initiator_sid(cmd->se_sess,
-							isid_buf, PR_REG_ISID_LEN);
-
-					nx.initiator_name =
-						cmd->se_sess->se_node_acl->initiatorname;
-					nx.initiator_sid  = isid_buf;
-					nx.fabric_name    = tfo->fabric_name;
-					nx.target_name    = tfo->tpg_get_wwn(tpg);
-					nx.tpg_tag        = core_scsi3_sess_port_tag(cmd->se_sess);
-					nx.all_tg_pt      = !!all_tg_pt;
-
-					n->pr_change(dev, (u8)sa, res_key,
-						     sa_res_key, (u8)type, &nx);
-				}
-				rcu_read_unlock();
-			}
+			rcu_read_lock();
+			n = rcu_dereference(pr_notifier);
+			if (n)
+				n->pr_change(dev);
+			rcu_read_unlock();
 		}
 #endif /* CONFIG_TRUENAS */
 		target_complete_cmd(cmd, SAM_STAT_GOOD);
@@ -4732,11 +4586,88 @@ target_check_reservation(struct se_cmd *cmd)
 }
 
 #ifdef CONFIG_TRUENAS
+/* One registration as target_ha_pr_export() reads it under the PR locks. */
+struct target_ha_pr_export_reg {
+	char	fabric[TARGET_FABRIC_NAME_SIZE];
+	char	initiator[TRANSPORT_IQN_LEN];
+	char	isid[PR_REG_ISID_LEN];
+	char	target[TRANSPORT_IQN_LEN];
+	u64	key;
+	u64	mapped_lun;
+	u64	target_lun;
+	u16	port_tag;
+	u16	rtpi;
+	u8	holder;
+	u8	type;
+	u8	scope;
+	u8	all_tg_pt;
+	u8	has_isid;
+};
+
+/*
+ * Longest line target_ha_pr_export() writes: the field names, the four
+ * strings at their maximum lengths and the numbers at theirs.
+ */
+#define TARGET_HA_PR_EXPORT_LINE_MAX					\
+	(2 * TARGET_FABRIC_NAME_SIZE + 2 * TRANSPORT_IQN_LEN +		\
+	 PR_REG_ISID_LEN + 256)
+
+/* Copy @dev's registrations into @regs, at most @max; return how many. */
+static int target_ha_pr_export_read(struct se_device *dev,
+				    struct target_ha_pr_export_reg *regs,
+				    int max)
+{
+	struct t10_reservation *pr_tmpl = &dev->t10_pr;
+	struct t10_pr_registration *pr_reg;
+	int n = 0;
+
+	spin_lock(&dev->dev_reservation_lock);
+	spin_lock(&pr_tmpl->registration_lock);
+	list_for_each_entry(pr_reg, &pr_tmpl->registration_list, pr_reg_list) {
+		struct target_ha_pr_export_reg *r;
+		struct se_portal_group *tpg;
+		const struct target_core_fabric_ops *tfo;
+
+		if (!pr_reg->pr_reg_nacl || !pr_reg->pr_reg_nacl->se_tpg ||
+		    !pr_reg->pr_reg_nacl->se_tpg->se_tpg_tfo)
+			continue;
+		if (n == max) {
+			n++;	/* more than @max */
+			break;
+		}
+
+		r = &regs[n];
+		tpg = pr_reg->pr_reg_nacl->se_tpg;
+		tfo = tpg->se_tpg_tfo;
+		strscpy(r->fabric, tfo->fabric_name, sizeof(r->fabric));
+		strscpy(r->initiator, pr_reg->pr_reg_nacl->initiatorname,
+			sizeof(r->initiator));
+		r->has_isid = pr_reg->isid_present_at_reg;
+		if (r->has_isid)
+			strscpy(r->isid, pr_reg->pr_reg_isid, sizeof(r->isid));
+		strscpy(r->target, tfo->tpg_get_wwn(tpg), sizeof(r->target));
+		r->key        = pr_reg->pr_res_key;
+		r->mapped_lun = pr_reg->pr_res_mapped_lun;
+		r->target_lun = pr_reg->pr_aptpl_target_lun;
+		r->port_tag   = pr_reg->pr_reg_port_tag;
+		r->rtpi       = pr_reg->tg_pt_sep_rtpi;
+		r->holder     = pr_reg->pr_res_holder;
+		r->type       = pr_reg->pr_res_type;
+		r->scope      = pr_reg->pr_res_scope;
+		r->all_tg_pt  = pr_reg->pr_reg_all_tg_pt;
+		n++;
+	}
+	spin_unlock(&pr_tmpl->registration_lock);
+	spin_unlock(&dev->dev_reservation_lock);
+
+	return n;
+}
+
 /*
  * target_ha_pr_export - serialise a device's PR state to APTPL-format text
- * @dev:     the se_device whose registrations are to be exported
- * @buf:     caller-supplied output buffer
- * @buf_len: size of @buf in bytes
+ * @dev:      the se_device whose registrations are to be exported
+ * @headroom: bytes to leave free before the text, for the caller's header
+ * @len:      set to the length of the text, without a terminating NUL
  *
  * Produces one comma-separated key=value line per registration, terminated
  * by '\n'.  The format is a subset of LIO's APTPL metadata text, containing
@@ -4751,80 +4682,70 @@ target_check_reservation(struct se_cmd *cmd)
  * made through (pr_reg_port_tag), which is the peer node's tag for a
  * registration made through a forwarded session.
  *
- * Called on the ACTIVE node from lio_ha_on_connect() when the HA TCP link
- * comes up, to bulk-sync existing PR state to the newly connected STANDBY.
- * (Subsequent PR changes are propagated incrementally via pr_notifier /
- * PERS_ACTION messages, not through this function.)
+ * Called on the ACTIVE node when the HA TCP link comes up, to bulk-sync
+ * existing PR state to the newly connected STANDBY, and after PR OUT
+ * commands changed the device's PR state (see pr_notifier).
  *
- * Called under no lock; safe to call from any non-atomic context.
- * Internally takes registration_lock (spinlock) for the iteration;
- * snprintf() with integer/string format specifiers is safe under a spinlock.
+ * The registrations are read under dev_reservation_lock and
+ * registration_lock, the order PR OUT takes them in, so that they and the
+ * holder flags are one consistent snapshot.  The text is written after
+ * both are dropped: registration_lock is on the I/O path under a
+ * registrants-only or all-registrants reservation.
  *
- * Returns the number of bytes written to @buf (not including a terminating
- * NUL).  Returns 0 if the device has no registrations.  Returns -ENOSPC if
- * the buffer was too small to hold all registrations; the caller should not
- * send a LUN_SYNC for this device (partial PR state is worse than none).
+ * Process context.  Returns a kvmalloc()ed buffer that the caller frees
+ * with kvfree(), holding @headroom bytes and then the text, or an
+ * ERR_PTR().
  */
-int target_ha_pr_export(struct se_device *dev, char *buf, size_t buf_len)
+void *target_ha_pr_export(struct se_device *dev, size_t headroom,
+			  size_t *len)
 {
-	struct t10_reservation *pr_tmpl = &dev->t10_pr;
-	struct t10_pr_registration *pr_reg;
-	bool truncated = false;
-	size_t off = 0;
-	int n;
+	struct target_ha_pr_export_reg *regs = NULL;
+	int max = 16, n, i;
+	size_t size, off;
+	char *buf;
 
-	if (!buf_len)
-		return 0;
+	/* Grow the array until it holds every registration. */
+	for (;;) {
+		regs = kvcalloc(max, sizeof(*regs), GFP_KERNEL);
+		if (!regs)
+			return ERR_PTR(-ENOMEM);
+		n = target_ha_pr_export_read(dev, regs, max);
+		if (n <= max)
+			break;
+		kvfree(regs);
+		max *= 2;
+	}
 
-	spin_lock(&pr_tmpl->registration_lock);
-	list_for_each_entry(pr_reg, &pr_tmpl->registration_list, pr_reg_list) {
-		struct se_portal_group *tpg;
-		const struct target_core_fabric_ops *tfo;
+	size = headroom + (size_t)n * TARGET_HA_PR_EXPORT_LINE_MAX + 1;
+	buf = kvmalloc(size, GFP_KERNEL);
+	if (!buf) {
+		kvfree(regs);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	off = headroom;
+	for (i = 0; i < n; i++) {
+		const struct target_ha_pr_export_reg *r = &regs[i];
 		char isid_buf[PR_REG_ISID_LEN + 16] = "";
 
-		if (!pr_reg->pr_reg_nacl || !pr_reg->pr_reg_nacl->se_tpg ||
-		    !pr_reg->pr_reg_nacl->se_tpg->se_tpg_tfo)
-			continue;
-
-		tpg = pr_reg->pr_reg_nacl->se_tpg;
-		tfo = tpg->se_tpg_tfo;
-
-		if (pr_reg->isid_present_at_reg)
+		if (r->has_isid)
 			snprintf(isid_buf, sizeof(isid_buf), "initiator_sid=%s,",
-				 pr_reg->pr_reg_isid);
-
-		n = snprintf(buf + off, buf_len - off,
-			     "initiator_fabric=%s,initiator_node=%s,%ssa_res_key=%llu,res_holder=%d,res_type=%d,res_scope=%d,res_all_tg_pt=%d,mapped_lun=%llu,target_fabric=%s,target_node=%s,tpgt=%hu,port_rtpi=%hu,target_lun=%llu\n",
-			     tfo->fabric_name, pr_reg->pr_reg_nacl->initiatorname,
-			     isid_buf,
-			     (unsigned long long)pr_reg->pr_res_key,
-			     (int)pr_reg->pr_res_holder,
-			     (int)pr_reg->pr_res_type,
-			     (int)pr_reg->pr_res_scope,
-			     (int)pr_reg->pr_reg_all_tg_pt,
-			     (unsigned long long)pr_reg->pr_res_mapped_lun,
-			     tfo->fabric_name, tfo->tpg_get_wwn(tpg),
-			     pr_reg->pr_reg_port_tag,
-			     pr_reg->tg_pt_sep_rtpi,
-			     (unsigned long long)pr_reg->pr_aptpl_target_lun);
-		if ((size_t)n >= buf_len - off) {
-			truncated = true;
-			break;
-		}
-		off += (size_t)n;
+				 r->isid);
+		off += scnprintf(buf + off, size - off,
+				 "initiator_fabric=%s,initiator_node=%s,%ssa_res_key=%llu,res_holder=%d,res_type=%d,res_scope=%d,res_all_tg_pt=%d,mapped_lun=%llu,target_fabric=%s,target_node=%s,tpgt=%hu,port_rtpi=%hu,target_lun=%llu\n",
+				 r->fabric, r->initiator, isid_buf,
+				 (unsigned long long)r->key,
+				 (int)r->holder, (int)r->type, (int)r->scope,
+				 (int)r->all_tg_pt,
+				 (unsigned long long)r->mapped_lun,
+				 r->fabric, r->target, r->port_tag, r->rtpi,
+				 (unsigned long long)r->target_lun);
 	}
-	spin_unlock(&pr_tmpl->registration_lock);
+	buf[off] = '\0';
+	kvfree(regs);
 
-	if (truncated) {
-		pr_warn_ratelimited("lio_ha: LUN_SYNC buffer too small, PR state truncated for %s/%s\n",
-				    config_item_name(&dev->se_hba->hba_group.cg_item),
-				    config_item_name(&dev->dev_group.cg_item));
-		return -ENOSPC;
-	}
-
-	if (off < buf_len)
-		buf[off] = '\0';
-	return (int)off;
+	*len = off - headroom;
+	return buf;
 }
 EXPORT_SYMBOL(target_ha_pr_export);
 

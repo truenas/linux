@@ -65,8 +65,9 @@
  *   Pointer to struct lio_ha_pr_notifier registered by lio_ha.ko.
  *   Its pr_change() callback fires after each successful PR OUT on
  *   ACTIVE, before target_complete_cmd().  lio_ha.ko uses it to
- *   enqueue a PERS_ACTION message to STANDBY (fire-and-forget)
- *   so STANDBY's replicated in-memory PR table stays current.
+ *   enqueue a send of the device's whole PR state (LUN_SYNC) to STANDBY
+ *   (fire-and-forget) so STANDBY's replicated in-memory PR table stays
+ *   current.
  *
  *
  * TPG REGISTRY (target_core_tpg.c)
@@ -194,40 +195,12 @@ struct lio_ha_ops {
 };
 
 /**
- * struct lio_ha_pr_nexus - the I_T nexus a PR change applies to
- * @initiator_name: IQN or WWPN of the initiator
- * @initiator_sid:  fabric-provided nexus discriminator (iSCSI/iSER ISID) as
- *                  a NUL-terminated string; empty if the fabric has none
- *                  (e.g. FC, where the WWPN alone is unambiguous)
- * @fabric_name:    fabric driver name (e.g. "iscsi", "qla2xxx")
- * @target_name:    IQN or WWPN of the target the registration is on
- * @tpg_tag:        global tag of the physical target port the nexus is on:
- *                  the local TPG's tag for a session on this node, the peer
- *                  node's own tag for a session lio_ha forwarded
- * @all_tg_pt:      the registration was made with ALL_TG_PT set
- */
-struct lio_ha_pr_nexus {
-	const char *initiator_name;
-	const char *initiator_sid;
-	const char *fabric_name;
-	const char *target_name;
-	u16         tpg_tag;
-	bool        all_tg_pt;
-};
-
-/**
  * struct lio_ha_pr_notifier - PR change notification hook registered by lio_ha.ko
- * @pr_change: called after each successful PR OUT on ACTIVE
- *             @dev:            the se_device whose PR state changed
- *             @action:         SERVICE ACTION field from the PR OUT CDB
- *             @res_key:        RESERVATION KEY field from the PR OUT parameter list
- *             @sa_res_key:     SERVICE ACTION RESERVATION KEY (new key for REGISTER)
- *             @type:           reservation type from the CDB (0 if not applicable)
- *             @nx:             the I_T nexus the change applies to
- *
- * lio_ha.ko registers this hook to receive incremental PR mutations and
- * push PERS_ACTION messages to STANDBY.  The hook is fired under RCU read
- * lock; implementations must not sleep.
+ * @pr_change: called after each successful PR OUT on ACTIVE with the
+ *             se_device whose PR state may have changed.  lio_ha.ko sends
+ *             the device's whole PR state, read with target_ha_pr_export(),
+ *             to STANDBY.  The hook is fired under RCU read lock;
+ *             implementations must not sleep.
  *
  * @peer_port_tag: return the global tag of the target port that pairs with
  *             the port tagged @tag on the other node of the pair.  LIO core
@@ -235,9 +208,7 @@ struct lio_ha_pr_nexus {
  *             too.  Called under RCU read lock; must not sleep.
  */
 struct lio_ha_pr_notifier {
-	void (*pr_change)(struct se_device *dev, u8 action,
-			  u64 res_key, u64 sa_res_key, u8 type,
-			  const struct lio_ha_pr_nexus *nx);
+	void (*pr_change)(struct se_device *dev);
 	u16 (*peer_port_tag)(u16 tag);
 };
 
@@ -249,7 +220,8 @@ void lio_ha_unregister_ops(void);
 /* Defined in target_core_pr.c */
 void lio_ha_register_pr_notifier(const struct lio_ha_pr_notifier *notifier);
 void lio_ha_unregister_pr_notifier(void);
-int target_ha_pr_export(struct se_device *dev, char *buf, size_t buf_len);
+void *target_ha_pr_export(struct se_device *dev, size_t headroom,
+			  size_t *len);
 
 /**
  * target_ha_pr_add_reg - directly add one PR registration at failover
