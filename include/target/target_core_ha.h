@@ -183,9 +183,11 @@ struct se_session;
  *                   as @session_create.  Called in process context;
  *                   may sleep.
  *
- * @forward_cmd and @forward_tmr are guaranteed non-NULL whenever
- * lio_ha_forward_active == 1.  @session_create and @session_destroy are
- * always checked for NULL before calling.
+ * @forward_cmd and @forward_tmr must be set.  @session_create and
+ * @session_destroy are checked for NULL before calling.  LIO core calls
+ * every hook inside an SRCU read section, and lio_ha_unregister_ops()
+ * waits for calls in progress.  While no ops are registered, a command
+ * on a forwarding node fails with NOT READY and a TMR is rejected.
  */
 struct lio_ha_ops {
 	void (*forward_cmd)(struct se_cmd *cmd);

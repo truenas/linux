@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/ratelimit.h>
 #include <linux/vmalloc.h>
+#include <linux/srcu.h>
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <scsi/scsi_proto.h>
@@ -57,11 +58,18 @@ struct kmem_cache *t10_alua_lba_map_mem_cache;
 atomic_t lio_ha_forward_active = ATOMIC_INIT(0);
 EXPORT_SYMBOL(lio_ha_forward_active);
 
-static const struct lio_ha_ops *ha_ops;
+/*
+ * The hooks lio_ha.ko registers.  Every call is made inside an SRCU read
+ * section (the hooks sleep: they send on the HA link), so that
+ * lio_ha_unregister_ops() can wait for calls in progress before the module
+ * that provides them goes away.  A caller that finds no ops does without.
+ */
+static const struct lio_ha_ops __rcu *ha_ops;
+DEFINE_STATIC_SRCU(ha_ops_srcu);
 
 void lio_ha_register_ops(const struct lio_ha_ops *ops)
 {
-	WRITE_ONCE(ha_ops, ops);
+	rcu_assign_pointer(ha_ops, ops);
 }
 EXPORT_SYMBOL(lio_ha_register_ops);
 
@@ -72,9 +80,32 @@ void lio_ha_unregister_ops(void)
 	 * the normal rmmod path.
 	 */
 	WARN_ON(atomic_read(&lio_ha_forward_active));
-	WRITE_ONCE(ha_ops, NULL);
+	rcu_assign_pointer(ha_ops, NULL);
+	synchronize_srcu(&ha_ops_srcu);
 }
 EXPORT_SYMBOL(lio_ha_unregister_ops);
+
+/*
+ * Forward @cmd, or its TMR if @tmr, to ACTIVE.  Returns false, without
+ * touching @cmd, if no ops are registered: lio_ha.ko is loading or
+ * unloading.
+ */
+static bool target_ha_forward(struct se_cmd *cmd, bool tmr)
+{
+	const struct lio_ha_ops *ops;
+	int idx;
+
+	idx = srcu_read_lock(&ha_ops_srcu);
+	ops = srcu_dereference(ha_ops, &ha_ops_srcu);
+	if (ops) {
+		if (tmr)
+			ops->forward_tmr(cmd);
+		else
+			ops->forward_cmd(cmd);
+	}
+	srcu_read_unlock(&ha_ops_srcu, idx);
+	return ops;
+}
 
 /*
  * target_ha_session_create / target_ha_session_destroy
@@ -87,19 +118,27 @@ EXPORT_SYMBOL(lio_ha_unregister_ops);
  */
 void target_ha_session_create(struct se_session *sess)
 {
-	const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
+	const struct lio_ha_ops *ops;
+	int idx;
 
+	idx = srcu_read_lock(&ha_ops_srcu);
+	ops = srcu_dereference(ha_ops, &ha_ops_srcu);
 	if (ops && ops->session_create)
 		ops->session_create(sess);
+	srcu_read_unlock(&ha_ops_srcu, idx);
 }
 EXPORT_SYMBOL(target_ha_session_create);
 
 void target_ha_session_destroy(struct se_session *sess)
 {
-	const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
+	const struct lio_ha_ops *ops;
+	int idx;
 
+	idx = srcu_read_lock(&ha_ops_srcu);
+	ops = srcu_dereference(ha_ops, &ha_ops_srcu);
 	if (ops && ops->session_destroy)
 		ops->session_destroy(sess);
+	srcu_read_unlock(&ha_ops_srcu, idx);
 }
 EXPORT_SYMBOL(target_ha_session_destroy);
 #endif /* CONFIG_TRUENAS */
@@ -604,12 +643,7 @@ target_setup_session(struct se_portal_group *tpg,
 	 * no-op when forward_active=0 or when called for internal TPGs (e.g.
 	 * ha_recv itself, which has se_tpg_wwn=NULL).
 	 */
-	{
-		const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
-
-		if (ops && ops->session_create)
-			ops->session_create(sess);
-	}
+	target_ha_session_create(sess);
 #endif /* CONFIG_TRUENAS */
 	return sess;
 
@@ -810,12 +844,7 @@ void target_remove_session(struct se_session *se_sess)
 	 * before transport_deregister_session_configfs() while se_node_acl
 	 * is still valid and se_tpg is still set.
 	 */
-	{
-		const struct lio_ha_ops *ops = READ_ONCE(ha_ops);
-
-		if (ops && ops->session_destroy)
-			ops->session_destroy(se_sess);
-	}
+	target_ha_session_destroy(se_sess);
 #endif /* CONFIG_TRUENAS */
 	transport_deregister_session_configfs(se_sess);
 	transport_deregister_session(se_sess);
@@ -2334,8 +2363,11 @@ void __target_execute_cmd(struct se_cmd *cmd, bool do_checks)
 	 * iblock_get_blocks() with a NULL ibd_bd (backend not yet open).
 	 */
 	if (atomic_read(&lio_ha_forward_active)) {
-		ha_ops->forward_cmd(cmd);
-		return;
+		if (target_ha_forward(cmd, false))
+			return;
+		/* No lio_ha.ko to forward with, and no local backend. */
+		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+		goto err;
 	}
 	/*
 	 * Backend not yet open: configure_device was deferred at STANDBY
@@ -3796,8 +3828,10 @@ static void target_tmr_work(struct work_struct *work)
 
 #ifdef CONFIG_TRUENAS
 	if (atomic_read(&lio_ha_forward_active)) {
-		ha_ops->forward_tmr(cmd);
-		return;
+		if (target_ha_forward(cmd, true))
+			return;
+		tmr->response = TMR_FUNCTION_REJECTED;
+		goto respond;
 	}
 #endif /* CONFIG_TRUENAS */
 
@@ -3832,6 +3866,9 @@ static void target_tmr_work(struct work_struct *work)
 		break;
 	}
 
+#ifdef CONFIG_TRUENAS
+respond:
+#endif
 	if (cmd->transport_state & CMD_T_ABORTED)
 		goto aborted;
 
