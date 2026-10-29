@@ -447,10 +447,30 @@ static int ha_tcp_rx_fn(void *arg)
 		if (ret)
 			goto out;
 
-		channel = be32_to_cpu(hdr.channel);
+		if (be32_to_cpu(hdr.magic) != LIO_HA_WIRE_MAGIC) {
+			pr_err_ratelimited("ha_tcp: bad message magic 0x%08x, closing the connection\n",
+					   be32_to_cpu(hdr.magic));
+			ret = -EPROTO;
+			goto out;
+		}
+		if (be16_to_cpu(hdr.version) != LIO_HA_WIRE_VERSION) {
+			pr_err_ratelimited("ha_tcp: peer runs wire version %u, this node %u; closing the connection\n",
+					   be16_to_cpu(hdr.version),
+					   LIO_HA_WIRE_VERSION);
+			ret = -EPROTO;
+			goto out;
+		}
+
+		channel = be16_to_cpu(hdr.channel);
 		plen    = be32_to_cpu(hdr.length);
 
-		/* Sanity-check payload length. */
+		/* Sanity-check the channel and payload length. */
+		if (channel != LIO_HA_CHAN_CTL && channel != LIO_HA_CHAN_DATA) {
+			pr_err("ha_tcp: unknown channel %u, closing the connection\n",
+			       channel);
+			ret = -EPROTO;
+			goto out;
+		}
 		if (channel == LIO_HA_CHAN_CTL &&
 		    plen > LIO_HA_MAX_CTL_PAYLOAD) {
 			pr_err("ha_tcp: CTL payload (%u bytes) too large, dropping\n", plen);
@@ -700,7 +720,9 @@ backoff:
 int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len)
 {
 	struct lio_ha_wire_hdr hdr = {
-		.channel = cpu_to_be32(chan),
+		.magic   = cpu_to_be32(LIO_HA_WIRE_MAGIC),
+		.version = cpu_to_be16(LIO_HA_WIRE_VERSION),
+		.channel = cpu_to_be16(chan),
 		.length  = cpu_to_be32(len),
 	};
 	struct socket *sock;

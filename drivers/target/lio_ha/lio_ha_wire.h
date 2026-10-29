@@ -3,8 +3,8 @@
  * lio_ha_wire.h -- wire protocol types for the lio_ha HA channel
  *
  * A single multiplexed TCP connection carries all lio_ha traffic.
- * Every message on the wire is prefixed by an 8-byte lio_ha_wire_hdr
- * (channel + payload length), followed by the payload.
+ * Every message on the wire is prefixed by a 12-byte lio_ha_wire_hdr
+ * (magic, version, channel, payload length), followed by the payload.
  *
  * CTL-channel (channel 0) payloads start with lio_ha_msg_hdr (type +
  * reserved), followed by a message-specific struct.
@@ -32,11 +32,22 @@
  */
 
 /* ------------------------------------------------------------------ */
-/* Wire header (8 bytes, present on every message)                    */
+/* Wire header (12 bytes, present on every message)                   */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Every message carries the protocol version.  Change LIO_HA_WIRE_VERSION
+ * whenever the layout or meaning of any message changes: a node that
+ * receives another version closes the connection rather than misparse it.
+ * Both nodes of a pair run the same version.
+ */
+#define LIO_HA_WIRE_MAGIC	0x4c484131	/* "LHA1" */
+#define LIO_HA_WIRE_VERSION	1
+
 struct lio_ha_wire_hdr {
-	__be32 channel;  /* enum lio_ha_channel */
+	__be32 magic;    /* LIO_HA_WIRE_MAGIC */
+	__be16 version;  /* LIO_HA_WIRE_VERSION */
+	__be16 channel;  /* enum lio_ha_channel */
 	__be32 length;   /* payload length; does NOT include this header */
 };
 

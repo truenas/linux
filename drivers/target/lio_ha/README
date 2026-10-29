@@ -131,8 +131,12 @@ read in isolation.
 
 Every message is framed as:
 
-  lio_ha_wire_hdr (8 bytes)
-    __be32 channel   0 = CTL, 1 = DATA
+  lio_ha_wire_hdr (12 bytes)
+    __be32 magic     LIO_HA_WIRE_MAGIC ("LHA1")
+    __be16 version   LIO_HA_WIRE_VERSION; a node receiving another
+                     version, a bad magic or an unknown channel closes
+                     the connection
+    __be16 channel   0 = CTL, 1 = DATA
     __be32 length    payload bytes, NOT including this header
 
   [lio_ha_data_hdr (8 bytes) -- DATA channel only, immediately after

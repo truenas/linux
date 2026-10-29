@@ -43,7 +43,7 @@ void lio_ha_tcp_exit(void);
  * @payload: message payload (without wire header)
  * @len:     payload length in bytes
  *
- * Prepends the 8-byte wire header and sends the complete message.
+ * Prepends the 12-byte wire header and sends the complete message.
  * Returns 0 on success, -ENOTCONN if no connection is up, or a
  * negative errno from the send path.
  *
