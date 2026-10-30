@@ -184,18 +184,27 @@ struct se_session;
  *                   ACTIVE tears down the synthetic se_session.  Same filters
  *                   as @session_create.  Called in process context;
  *                   may sleep.
+ * @nacl_release: called from core_tpg_del_initiator_node_acl() once @nacl
+ *                is off its TPG's ACL list and its fabric sessions are shut
+ *                down, before LIO core waits for the last reference to it.
+ *                On ACTIVE, removes every synthetic session of a peer's
+ *                initiator on @nacl, waiting for its commands, so that
+ *                deleting the ACL does not wait for the initiator to log
+ *                out of the peer.  Called in process context; may sleep.
  *
- * @forward_cmd and @forward_tmr must be set.  @session_create and
- * @session_destroy are checked for NULL before calling.  LIO core calls
+ * @forward_cmd and @forward_tmr must be set.  The other hooks are checked
+ * for NULL before calling.  LIO core calls
  * every hook inside an SRCU read section, and lio_ha_unregister_ops()
  * waits for calls in progress.  While no ops are registered, a command
- * on a forwarding node fails with NOT READY and a TMR is rejected.
+ * on a forwarding node fails with LOGICAL UNIT COMMUNICATION FAILURE and
+ * a TMR is rejected.
  */
 struct lio_ha_ops {
 	void (*forward_cmd)(struct se_cmd *cmd);
 	void (*forward_tmr)(struct se_cmd *cmd);
 	void (*session_create)(struct se_session *sess);
 	void (*session_destroy)(struct se_session *sess);
+	void (*nacl_release)(struct se_node_acl *nacl);
 };
 
 /**
@@ -355,6 +364,9 @@ void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_n
  */
 void target_ha_session_create(struct se_session *sess);
 void target_ha_session_destroy(struct se_session *sess);
+
+/* Fire the nacl_release hook; called by core_tpg_del_initiator_node_acl(). */
+void target_ha_nacl_release(struct se_node_acl *nacl);
 
 #endif /* CONFIG_TRUENAS */
 #endif /* _TARGET_CORE_HA_H */

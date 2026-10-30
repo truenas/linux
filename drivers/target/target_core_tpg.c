@@ -576,6 +576,15 @@ void core_tpg_del_initiator_node_acl(struct se_node_acl *acl)
 	mutex_unlock(&tpg->acl_node_mutex);
 
 	target_shutdown_sessions(acl);
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Sessions lio_ha.ko builds for an initiator logged in to the peer
+	 * node hold @acl but are not on acl_sess_list: they belong to its
+	 * own TPG.  Have them removed, or the wait below lasts until the
+	 * initiator logs out of the peer.
+	 */
+	target_ha_nacl_release(acl);
+#endif
 
 	target_put_nacl(acl);
 	/*
