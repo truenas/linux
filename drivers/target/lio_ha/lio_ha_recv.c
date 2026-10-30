@@ -47,6 +47,7 @@
 #include <linux/slab.h>
 #include <linux/hashtable.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/atomic.h>
 #include <linux/scatterlist.h>
 #include <linux/vmalloc.h>
@@ -88,6 +89,14 @@ static struct ha_recv_tpg ha_recv_tpg;
 
 static DEFINE_HASHTABLE(ha_recv_sess_ht, HA_RECV_SESS_HT_BITS);
 static DEFINE_SPINLOCK(ha_recv_sess_lock);
+/*
+ * Held from finding a session's node ACL or the session itself until the
+ * session is in the table or the command or TMR holds its own reference
+ * on the session.  lio_ha_recv_nacl_release() takes it to take an ACL's
+ * sessions out of the table, so it cannot miss one being created, and
+ * once it drops it no submission can still be about to use one.
+ */
+static DEFINE_MUTEX(ha_recv_sess_mutex);
 
 struct ha_recv_sess_entry {
 	u64			session_id;
@@ -449,12 +458,14 @@ static void ha_recv_cmd_forward_handler(const void *buf, size_t len)
 		return;
 	}
 
+	mutex_lock(&ha_recv_sess_mutex);
 	lio_ha_recv_submit_cmd(be64_to_cpu(fwd->session_id),
 			       fwd->cdb, LIO_HA_CDB_LEN,
 			       be64_to_cpu(fwd->cmd_cookie),
 			       be32_to_cpu(fwd->lun),
 			       (u32)be64_to_cpu(fwd->data_length),
 			       (u8)be32_to_cpu(fwd->data_dir));
+	mutex_unlock(&ha_recv_sess_mutex);
 }
 
 /*
@@ -538,11 +549,13 @@ static void ha_recv_tmr_forward_handler(const void *buf, size_t len)
 		return;
 	}
 
+	mutex_lock(&ha_recv_sess_mutex);
 	ha_recv_submit_tmr(be64_to_cpu(fwd->session_id),
 			   be64_to_cpu(fwd->cmd_cookie),
 			   be64_to_cpu(fwd->ref_cookie),
 			   be32_to_cpu(fwd->function),
 			   be32_to_cpu(fwd->lun));
+	mutex_unlock(&ha_recv_sess_mutex);
 }
 
 /* ------------------------------------------------------------------ */
@@ -599,6 +612,19 @@ int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 		? core_tpg_get_initiator_node_acl(real_tpg,
 					(unsigned char *)initiator_name)
 		: NULL;
+	/*
+	 * A demo-mode ACL is freed by core_tpg_deregister() without waiting
+	 * for its references, which a session held here would outlive.
+	 */
+	if (real_nacl && real_nacl->dynamic_node_acl) {
+		pr_warn_ratelimited("ha_recv: %s has no static ACL on %s/%s tpg%u -- session refused\n",
+				    initiator_name, fabric_name, target_name,
+				    tpg_tag);
+		target_put_nacl(real_nacl);
+		target_ha_put_tpg(real_tpg);
+		kfree(e);
+		return -ENOENT;
+	}
 	/* From here on the nacl reference keeps what the session uses. */
 	if (real_tpg)
 		target_ha_put_tpg(real_tpg);
@@ -716,9 +742,11 @@ static void ha_recv_session_connect_handler(const void *buf, size_t len)
 	memcpy(fabric_name, msg->fabric_name, LIO_HA_FABRIC_NAME_LEN);
 	fabric_name[LIO_HA_FABRIC_NAME_LEN - 1] = '\0';
 
+	mutex_lock(&ha_recv_sess_mutex);
 	lio_ha_recv_session_create(initiator_name, session_id,
 				   target_name, tpg_tag, port_tag,
 				   initiator_sid, fabric_name);
+	mutex_unlock(&ha_recv_sess_mutex);
 }
 
 /*
@@ -818,6 +846,40 @@ static void ha_recv_disconnect_handler(void)
 	ha_recv_free_all();
 }
 
+/*
+ * The node ACL @nacl is being deleted on this node.  Remove every session
+ * built on it, waiting for its commands: they hold the ACL, which LIO core
+ * waits for, and the initiator may stay logged in to the peer
+ * indefinitely.  Commands the peer forwards on such a session afterwards
+ * find no session and get BUSY.
+ */
+void lio_ha_recv_nacl_release(struct se_node_acl *nacl)
+{
+	struct ha_recv_sess_entry *e;
+	struct hlist_node *tmp;
+	HLIST_HEAD(gone);
+	int bkt;
+
+	mutex_lock(&ha_recv_sess_mutex);
+	spin_lock(&ha_recv_sess_lock);
+	hash_for_each_safe(ha_recv_sess_ht, bkt, tmp, e, node) {
+		if (e->se_sess->se_node_acl != nacl)
+			continue;
+		hash_del(&e->node);
+		hlist_add_head(&e->node, &gone);
+	}
+	spin_unlock(&ha_recv_sess_lock);
+	mutex_unlock(&ha_recv_sess_mutex);
+
+	hlist_for_each_entry_safe(e, tmp, &gone, node) {
+		hlist_del(&e->node);
+		lio_ha_dbg(1, "ACL %s deleted: removing session id=%llu\n",
+			   nacl->initiatorname,
+			   (unsigned long long)e->session_id);
+		ha_recv_sess_free(e);
+	}
+}
+
 void lio_ha_recv_session_destroy(u64 session_id)
 {
 	struct ha_recv_sess_entry *e;
@@ -888,8 +950,11 @@ void lio_ha_recv_submit_cmd(u64 session_id, const void *cdb, size_t cdb_len,
 				    (unsigned long long)session_id);
 		/*
 		 * Send a BUSY response so STANDBY retries after
-		 * SESSION_CONNECT re-establishes the session.
+		 * SESSION_CONNECT re-establishes the session.  WRITE data
+		 * sent ahead of the command would otherwise stay buffered
+		 * until the link drops.
 		 */
+		ha_recv_flush_data(cookie);
 		struct lio_ha_msg_cmd_response resp = {
 			.hdr.type    = cpu_to_be32(LIO_HA_MSG_CMD_RESPONSE),
 			.cmd_cookie  = cpu_to_be64(cookie),
@@ -906,6 +971,7 @@ void lio_ha_recv_submit_cmd(u64 session_id, const void *cdb, size_t cdb_len,
 			.cmd_cookie  = cpu_to_be64(cookie),
 			.scsi_status = SAM_STAT_BUSY,
 		};
+		ha_recv_flush_data(cookie);
 		lio_ha_tcp_send(LIO_HA_CHAN_CTL, &resp, sizeof(resp));
 		return;
 	}

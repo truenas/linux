@@ -28,6 +28,8 @@
 #include <linux/types.h>
 #include <scsi/scsi_cmnd.h>   /* SCSI_SENSE_BUFFERSIZE */
 
+struct se_node_acl;
+
 /**
  * struct ha_recv_cmd - per-command wrapper used by ha_recv
  * @cookie:    STANDBY's se_cmd pointer, echoed in the response so
@@ -82,6 +84,12 @@ int  lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
  * TCP link drops.
  */
 void lio_ha_recv_session_destroy(u64 session_id);
+
+/*
+ * Remove every session built on @nacl, which is being deleted, waiting
+ * for its commands.  Called through the nacl_release hook; may sleep.
+ */
+void lio_ha_recv_nacl_release(struct se_node_acl *nacl);
 
 /**
  * lio_ha_recv_data_rx - receive WRITE data from STANDBY on ACTIVE
