@@ -19,6 +19,7 @@
 #include <linux/pagemap.h>
 #include <linux/compat.h>
 #include <linux/iversion.h>
+#include <linux/posix_acl.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
@@ -165,6 +166,59 @@ void generic_fill_statx_atomic_writes(struct kstat *stat,
 }
 EXPORT_SYMBOL_GPL(generic_fill_statx_atomic_writes);
 
+#ifdef CONFIG_TRUENAS
+/*
+ * Whether the inode has a POSIX ACL of @type, 1 or 0, from the ACL the
+ * inode caches. The first ask of a cold inode reads it once.
+ */
+static int posix_acl_kept(struct inode *inode, int type)
+{
+	struct posix_acl *acl = get_inode_acl(inode, type);
+	int kept;
+
+	if (IS_ERR(acl))
+		return PTR_ERR(acl);
+	kept = acl != NULL;
+	posix_acl_release(acl);
+	return kept;
+}
+
+/*
+ * The POSIX ACLs a file has, for STATX_ACL, so a file server answers a
+ * file with none from its mode, as nfsd answers from the same cache. A
+ * file system keeps no access ACL that the mode already says all of
+ * (posix_acl_update_mode), so one that exists is beyond the mode. On an
+ * error STATX_ACL is left out of the result, and the caller reads the
+ * ACL itself.
+ */
+static void statx_posix_acls(struct inode *inode, struct kstat *stat)
+{
+	int access, dflt = 0;
+
+	/*
+	 * With no dentry, get_inode_acl caches no ACL on a file system that
+	 * reads its ACLs through ->get_acl alone, which getfacl would then
+	 * show. Such a file system answers without STATX_ACL.
+	 */
+	if (inode->i_op->get_acl && !inode->i_op->get_inode_acl)
+		return;
+
+	access = posix_acl_kept(inode, ACL_TYPE_ACCESS);
+	if (access >= 0 && S_ISDIR(inode->i_mode))
+		dflt = posix_acl_kept(inode, ACL_TYPE_DEFAULT);
+	if (access < 0 || dflt < 0)
+		return;
+
+	if (access)
+		stat->attributes |= STATX_ATTR_ACL_ACCESS;
+	if (dflt)
+		stat->attributes |= STATX_ATTR_ACL_DEFAULT;
+	stat->attributes_mask |= (STATX_ATTR_ACL_ACCESS |
+				  STATX_ATTR_ACL_DEFAULT);
+	stat->result_mask |= STATX_ACL;
+}
+#endif
+
 /**
  * vfs_getattr_nosec - getattr without security checks
  * @path: file to get attributes from
@@ -232,6 +286,11 @@ int vfs_getattr_nosec(const struct path *path, struct kstat *stat,
 	} else {
 		generic_fillattr(idmap, request_mask, inode, stat);
 	}
+
+#ifdef CONFIG_TRUENAS
+	if ((request_mask & STATX_ACL) && IS_POSIXACL(inode))
+		statx_posix_acls(inode, stat);
+#endif
 
 	/*
 	 * If this is a block device inode, override the filesystem attributes
