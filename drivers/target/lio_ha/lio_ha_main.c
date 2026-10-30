@@ -92,6 +92,12 @@ struct lio_ha_pr_entry {
 	u64              res_key;
 	u8               res_holder;  /* 1 if this entry holds the reservation */
 	u8               res_type;    /* reservation type (valid when res_holder) */
+	/*
+	 * Port of the registration that holds it (valid when res_holder):
+	 * for ALL_TG_PT, the entry stands for registrations on several ports,
+	 * and the reservation may have been taken through any of them.
+	 */
+	u16              holder_tag;
 	struct list_head list;
 };
 
@@ -215,26 +221,27 @@ static struct lio_ha_pr_entry *ha_pr_list_find(struct list_head *list,
 }
 
 /*
- * True if @nx is one of the ALL_TG_PT sibling registrations LIO creates
- * without a discriminator on the other ports of a registrant that has one.
- * The registrant's own entry already stands for it, and failover recreates
- * it with the registrant's discriminator, so it gets no entry of its own.
+ * If @nx is one of the ALL_TG_PT sibling registrations LIO creates without
+ * a discriminator on the other ports of a registrant that has one, return
+ * the registrant's entry, else NULL.  That entry already stands for @nx,
+ * and failover recreates it with the registrant's discriminator, so it
+ * gets no entry of its own.
  */
-static bool ha_pr_list_has_registrant(struct list_head *list,
-				      const struct lio_ha_pr_entry *nx)
+static struct lio_ha_pr_entry *
+ha_pr_list_registrant(struct list_head *list, const struct lio_ha_pr_entry *nx)
 {
 	struct lio_ha_pr_entry *e;
 
 	if (!nx->all_tg_pt || nx->initiator_sid[0])
-		return false;
+		return NULL;
 
 	list_for_each_entry(e, list, list) {
 		if (e->all_tg_pt && e->initiator_sid[0] &&
 		    !strncmp(e->initiator_name, nx->initiator_name,
 			     LIO_HA_INITIATOR_NAME_LEN))
-			return true;
+			return e;
 	}
-	return false;
+	return NULL;
 }
 
 /*
@@ -299,7 +306,8 @@ static bool ha_pr_parse_line(char *line, struct lio_ha_pr_entry *e,
  *
  * The registrations are merged as failover expects: one entry per
  * ALL_TG_PT registrant, which also stands for its registrations on the
- * other ports, and the reservation on the entry for the holder's nexus.
+ * other ports, and the reservation on the entry for the holder's nexus,
+ * with the port of the registration that holds it.
  */
 void lio_ha_pr_replace_device(const char *dev_name, const char *text,
 			      size_t len)
@@ -309,6 +317,7 @@ void lio_ha_pr_replace_device(const char *dev_name, const char *text,
 	LIST_HEAD(new_list);
 	LIST_HEAD(old_list);
 	u8 holder_type = 0;
+	u16 holder_tag = 0;
 	char *linebuf;
 
 	linebuf = kmalloc(HA_PR_LINE_MAX, GFP_KERNEL);
@@ -318,6 +327,7 @@ void lio_ha_pr_replace_device(const char *dev_name, const char *text,
 	while (line < text_end) {
 		size_t line_len;
 		bool is_holder;
+		u16 tag;
 		u8 type;
 
 		end = memchr(line, '\n', text_end - line);
@@ -340,23 +350,30 @@ void lio_ha_pr_replace_device(const char *dev_name, const char *text,
 		if (!ha_pr_parse_line(linebuf, cand, &is_holder, &type))
 			goto next;
 		strscpy(cand->dev_name, dev_name, LIO_HA_DEV_NAME_LEN);
+		tag = cand->tpg_tag;
 
 		e = ha_pr_list_find(&new_list, cand);
 		if (e) {
 			e->res_key = cand->res_key;
-		} else if (!ha_pr_list_has_registrant(&new_list, cand)) {
-			list_add_tail(&cand->list, &new_list);
-			e = cand;
-			cand = NULL;
+		} else {
+			e = ha_pr_list_registrant(&new_list, cand);
+			if (!e) {
+				list_add_tail(&cand->list, &new_list);
+				e = cand;
+				cand = NULL;
+			}
 		}
 		/*
 		 * LIO flags only the one registration that holds the
 		 * reservation, also for an all registrants type.  If it is
-		 * merged into another entry, that entry holds it.
+		 * merged into another entry, that entry holds it, and keeps
+		 * this registration's port so that failover puts the
+		 * reservation back on the same port.
 		 */
-		if (is_holder && e) {
+		if (is_holder) {
 			holder = e;
 			holder_type = type;
+			holder_tag = tag;
 		}
 next:
 		line = end ? end + 1 : text_end;
@@ -364,6 +381,7 @@ next:
 	if (holder) {
 		holder->res_holder = 1;
 		holder->res_type   = holder_type;
+		holder->holder_tag = holder_tag;
 	}
 
 	spin_lock(&lio_ha_pr_lock);
@@ -847,7 +865,13 @@ struct failover_reg_ctx {
 	/* If set, mappings on this TPG are skipped (already restored). */
 	struct se_portal_group *skip_tpg;
 	u64               sa_res_key;
+	/*
+	 * The entry holds the reservation: it goes on the registration on
+	 * port @holder_tag, which sets @holder_restored.
+	 */
 	int               res_holder;
+	u16               holder_tag;
+	bool              holder_restored;
 	u8                res_type;
 	int               errors;
 };
@@ -860,6 +884,7 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 	struct failover_reg_ctx *ctx = data;
 	u16 port_tag = ctx->port_tag;
 	u16 port_rtpi = ctx->port_rtpi;
+	bool holder;
 	int ret;
 
 	if (ctx->skip_tpg && nacl->se_tpg == ctx->skip_tpg)
@@ -871,12 +896,15 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 		port_rtpi = lun->lun_tpg->tpg_rtpi;
 	}
 
+	holder = ctx->res_holder && port_tag == ctx->holder_tag;
 	ret = target_ha_pr_add_reg(ctx->dev, nacl, lun, mapped_lun,
 				   ctx->isid, port_tag, port_rtpi,
 				   ctx->all_tg_pt,
 				   ctx->sa_res_key,
-				   ctx->res_holder,
+				   holder,
 				   ctx->res_type);
+	if (!ret && holder)
+		ctx->holder_restored = true;
 	if (!ret && ctx->all_tg_pt) {
 		/*
 		 * An ALL_TG_PT initiator port is registered on the paired
@@ -889,11 +917,16 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 
 		if (target_ha_tpg_rtpi(tfo->fabric_name,
 				       tfo->tpg_get_wwn(nacl->se_tpg),
-				       mate_tag, &mate_rtpi))
+				       mate_tag, &mate_rtpi)) {
+			holder = ctx->res_holder && mate_tag == ctx->holder_tag;
 			ret = target_ha_pr_add_reg(ctx->dev, nacl, lun,
 						   mapped_lun, ctx->isid,
 						   mate_tag, mate_rtpi,
-						   true, ctx->sa_res_key, 0, 0);
+						   true, ctx->sa_res_key,
+						   holder, ctx->res_type);
+			if (!ret && holder)
+				ctx->holder_restored = true;
+		}
 	}
 	lio_ha_dbg(3, "failover PR reg: initiator=%s key=%016llx holder=%d type=%u ret=%d\n",
 		   nacl->initiatorname, (unsigned long long)ctx->sa_res_key,
@@ -916,13 +949,15 @@ struct pr_snap_entry {
 	u64  sa_res_key;
 	u8   res_holder;
 	u8   res_type;
+	u16  holder_tag;
 };
 
 /*
  * Restore one snapshot entry: the registration for the physical port it was
  * made through, and for ALL_TG_PT the same initiator port's registrations on
  * the initiator's other ports.  The reservation, if the entry holds it, goes
- * on the entry's own registration only.
+ * on the registration for the port it was taken through, or on the entry's
+ * own registration if this node has no registration on that port.
  *
  * The entry's tag names a physical port.  That port is either one of this
  * node's real TPGs, which carries the initiator's static node_acl, or the
@@ -941,6 +976,7 @@ static void ha_main_failover_restore_entry(struct se_device *dev,
 		.port_tag   = pe->tpg_tag,
 		.sa_res_key = pe->sa_res_key,
 		.res_holder = pe->res_holder,
+		.holder_tag = pe->holder_tag,
 		.res_type   = pe->res_type,
 	};
 	struct se_portal_group *tpg;
@@ -985,10 +1021,25 @@ static void ha_main_failover_restore_entry(struct se_device *dev,
 	if (pe->all_tg_pt) {
 		ctx.sibling    = true;
 		ctx.skip_tpg   = tpg;
-		ctx.res_holder = 0;
 		target_ha_foreach_nacl_dev(pe->fabric_name, pe->initiator_name,
 					   dev, ha_main_failover_add_reg_cb,
 					   &ctx);
+	}
+	if (pe->res_holder && !ctx.holder_restored) {
+		/*
+		 * The holder's port has no registration here.  Rather than
+		 * lose the reservation, put it on the entry's own one, which
+		 * target_ha_pr_add_reg() finds and updates.
+		 */
+		pr_warn_ratelimited("lio_ha: failover: no registration for %s on holder port %u; reservation restored on port %u\n",
+				    pe->initiator_name, pe->holder_tag,
+				    pe->tpg_tag);
+		ctx.sibling    = false;
+		ctx.skip_tpg   = NULL;
+		ctx.holder_tag = pe->tpg_tag;
+		target_ha_foreach_tpg_nacl_dev(tpg, pe->initiator_name, dev,
+					       ha_main_failover_add_reg_cb,
+					       &ctx);
 	}
 	target_ha_put_tpg(tpg);
 }
@@ -1021,6 +1072,7 @@ static int ha_main_failover_snapshot(const char *dev_name,
 			snap[n].sa_res_key = e->res_key;
 			snap[n].res_holder = e->res_holder;
 			snap[n].res_type   = e->res_type;
+			snap[n].holder_tag = e->holder_tag;
 		}
 		n++;
 	}
