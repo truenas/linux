@@ -141,6 +141,18 @@ void target_ha_session_destroy(struct se_session *sess)
 	srcu_read_unlock(&ha_ops_srcu, idx);
 }
 EXPORT_SYMBOL(target_ha_session_destroy);
+
+void target_ha_nacl_release(struct se_node_acl *nacl)
+{
+	const struct lio_ha_ops *ops;
+	int idx;
+
+	idx = srcu_read_lock(&ha_ops_srcu);
+	ops = srcu_dereference(ha_ops, &ha_ops_srcu);
+	if (ops && ops->nacl_release)
+		ops->nacl_release(nacl);
+	srcu_read_unlock(&ha_ops_srcu, idx);
+}
 #endif /* CONFIG_TRUENAS */
 
 static void transport_complete_task_attr(struct se_cmd *cmd);
