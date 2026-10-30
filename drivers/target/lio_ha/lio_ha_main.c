@@ -517,6 +517,7 @@ static const struct lio_ha_ops ha_ops = {
 	.forward_tmr     = lio_ha_forward_tmr,
 	.session_create  = ha_main_session_create,
 	.session_destroy = ha_main_session_destroy,
+	.nacl_release    = lio_ha_recv_nacl_release,
 };
 
 /* ------------------------------------------------------------------ */

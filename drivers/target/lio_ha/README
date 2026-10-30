@@ -45,6 +45,15 @@ Static initiator ACLs required
   Dynamic ACL mode (generate_node_acls=1, "demo mode") is therefore
   incompatible with ALUA HA: ACTIVE will not have nacls for initiators
   that have only connected to STANDBY, so SESSION_CONNECT is refused.
+  A demo-mode nacl that does exist on ACTIVE is refused too: LIO core
+  frees it at TPG removal without waiting for its references.
+
+  Deleting an ACL on ACTIVE removes the synthetic sessions built on it
+  first (the nacl_release hook), waiting for their commands, so the
+  deletion does not wait for the initiator to log out of STANDBY.
+  Commands STANDBY forwards for such a session afterwards get
+  SAM_STAT_BUSY.  A TPG's explicit ACLs are deleted before the TPG, so
+  this also covers removing a target.
 
 Identical LIO configuration on both nodes
   LUN mappings, initiator ACLs, CHAP credentials, and portal groups must
@@ -593,6 +602,7 @@ All additions in the core files are gated on #ifdef CONFIG_TRUENAS.
       wrappers around the ha_ops session hooks, exported so fabric
       drivers that do not go through target_setup_session() /
       target_remove_session() can fire the hooks directly.
+    - target_ha_nacl_release(): fires the nacl_release hook.
     - EXPORT_SYMBOL(target_complete_tmr).
 
   drivers/target/target_core_iblock.c
@@ -621,6 +631,9 @@ All additions in the core files are gated on #ifdef CONFIG_TRUENAS.
     - target_ha_pr_add_reg(): install one PR registration at failover.
 
   drivers/target/target_core_tpg.c
+    - target_ha_nacl_release() call in core_tpg_del_initiator_node_acl()
+      after the fabric's own sessions are shut down and before the wait
+      for the last nacl reference.
     - target_ha_get_tpg() / target_ha_put_tpg(): find a TPG by fabric
       name, target name and TPG tag, and pin it on tpg_pr_ref_count;
       target_ha_tpg_rtpi(): just its relative target port id.
