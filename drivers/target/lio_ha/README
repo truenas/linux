@@ -427,6 +427,9 @@ sequence is:
             If the TPG cannot be resolved the registration is skipped
             with a warning.  Non-holders are restored first; the holder
             last so the reservation is set after all registrants exist.
+            An ALL_TG_PT registrant may have reserved through any of
+            its ports; LUN_SYNC records which, and the reservation is
+            put back on that port's registration.
 
         iii.target_ha_reopen_backend() calls configure_device() on
             the iblock or fileio backend to open the block device
