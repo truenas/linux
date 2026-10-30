@@ -467,12 +467,16 @@ Path: /sys/kernel/config/lio_ha/
 
   forward_active (rw)
                      0 or 1.
-                     Write "1" at STANDBY startup: sets
-                     lio_ha_forward_active so backends defer open()
-                     and all commands are forwarded to ACTIVE.
+                     Set to 1 only at load, by the module parameter
+                     default_forward_active=1 (STANDBY startup):
+                     backends defer open() and all commands are
+                     forwarded to ACTIVE.
                      Write "0" at failover: restores replicated PR
                      state, opens all backends, clears forwarding.
-                     Both writes are idempotent.
+                     Idempotent.
+                     Write "1" is a no-op while forwarding and fails
+                     with EPERM once it has been cleared: to become
+                     STANDBY again, reload lio_ha.
 
 
 FILE MAP
