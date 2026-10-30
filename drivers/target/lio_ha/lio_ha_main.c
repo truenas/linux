@@ -1252,10 +1252,18 @@ CONFIGFS_ATTR_RO(lio_ha_, ha_state);
 /*
  * forward_active -- the primary control knob written by middleware.
  *
- * Write "1" (STANDBY startup, before storage objects are configured):
- *   Sets lio_ha_forward_active in LIO core so that iblock/fileio backends
- *   defer their open() and all commands are forwarded to ACTIVE.  Takes a
- *   module self-reference preventing unload while forwarding is active.
+ * Forwarding is set only at load, by default_forward_active=1 (STANDBY
+ *   startup, before storage objects are configured): lio_ha_forward_active
+ *   is set in LIO core so that iblock/fileio backends defer their open()
+ *   and all commands are forwarded to ACTIVE, and a module self-reference
+ *   prevents unload while forwarding is active.
+ *
+ * Write "1": accepted only while forwarding is still active, as a no-op.
+ *   Once forwarding has been cleared, this node has restored PR state and
+ *   opened its backends; setting it again would forward their commands
+ *   away while they stay open here, and a second 1->0 would restore PR
+ *   state onto devices already in use.  A node that is to become STANDBY
+ *   again reloads lio_ha.
  *
  * Write "0" (failover -- pool has been imported and is ready):
  *   Clears lio_ha_forward_active in LIO core; BUSY stops; all LUNs execute
@@ -1264,7 +1272,7 @@ CONFIGFS_ATTR_RO(lio_ha_, ha_state);
  *   ha_main_failover_device() for each se_device -- see that function for
  *   the per-device sequence.
  *
- * Both writes are idempotent.
+ * Both writes are idempotent where accepted.
  */
 static ssize_t lio_ha_forward_active_show(struct config_item *item, char *page)
 {
@@ -1295,9 +1303,9 @@ static ssize_t lio_ha_forward_active_store(struct config_item *item,
 	if (val == 1) {
 		if (atomic_read(&lio_ha_forward_active))
 			goto out;   /* already set -- idempotent */
-		__module_get(THIS_MODULE);
-		atomic_set(&lio_ha_forward_active, 1);
-		lio_ha_dbg(1, "forward_active set: STANDBY forwarding mode active\n");
+		mutex_unlock(&lio_ha_forward_active_mutex);
+		pr_warn("lio_ha: forward_active cannot be set again once cleared; reload lio_ha with default_forward_active=1\n");
+		return -EPERM;
 	} else {
 		if (!atomic_read(&lio_ha_forward_active))
 			goto out;   /* already clear -- idempotent */
