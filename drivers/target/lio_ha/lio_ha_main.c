@@ -504,6 +504,18 @@ static void ha_main_session_create(struct se_session *sess)
 		   sess->se_node_acl->initiatorname, wwn,
 		   tpg->se_tpg_tfo->fabric_name);
 	mutex_lock(&ha_main_sess_mutex);
+	/*
+	 * Failover may have cleared forwarding since the check above.  It
+	 * clears the flag before ha_main_sess_list_flush() takes this mutex,
+	 * so once the flush is past, this sees 0: the entry would never be
+	 * removed (the destroy hook returns early without forwarding), and
+	 * the SESSION_CONNECT would go to the old ACTIVE.
+	 */
+	if (!atomic_read(&lio_ha_forward_active)) {
+		mutex_unlock(&ha_main_sess_mutex);
+		kfree(se);
+		return;
+	}
 	if (se)
 		list_add_tail(&se->list, &ha_main_sess_list);
 	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
