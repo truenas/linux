@@ -170,7 +170,8 @@ static bool ha_tcp_disconnecting;
 
 /*
  * Connection generation: incremented under ha_tcp_lock each time a new
- * connection is installed, so it names one connection.  A sender that
+ * connection is installed, so it names one connection, and when the
+ * senders bound to it are retired (lio_ha_tcp_retire_generation()).  A sender that
  * must not reach a later connection than the one it started on captures
  * it with lio_ha_tcp_generation() and sends with lio_ha_tcp_send_gen().
  * It starts at 1, so 0 is never a generation; lio_ha_tcp_send() passes
@@ -976,6 +977,14 @@ backoff:
 u64 lio_ha_tcp_generation(void)
 {
 	return atomic64_read(&ha_conn_gen);
+}
+
+void lio_ha_tcp_retire_generation(void)
+{
+	/* Under ha_tcp_lock, as the check in __ha_tcp_send(). */
+	mutex_lock(&ha_tcp_lock);
+	atomic64_inc(&ha_conn_gen);
+	mutex_unlock(&ha_tcp_lock);
 }
 
 int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len)

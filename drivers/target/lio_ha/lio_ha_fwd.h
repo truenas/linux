@@ -42,4 +42,15 @@ void lio_ha_forward_cmd(struct se_cmd *cmd);
  */
 void lio_ha_forward_tmr(struct se_cmd *cmd);
 
+/**
+ * lio_ha_fwd_drain - complete every forwarded command and TMR now
+ *
+ * Commands complete with SAM_STAT_BUSY and TMRs with TMR_FUNCTION_REJECTED;
+ * buffered READ data is freed.  Called on link loss, and at failover
+ * (forward_active 1->0), when the old ACTIVE's responses are no longer
+ * awaited.  A forward still between its sends stops sending: the
+ * connection generation it captured is retired first.
+ */
+void lio_ha_fwd_drain(void);
+
 #endif /* _LIO_HA_FWD_H */

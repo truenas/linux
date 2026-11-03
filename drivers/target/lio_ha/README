@@ -492,9 +492,21 @@ sequence is:
   3. Middleware sets all ALUA target port groups to ACTIVE-OPTIMIZED.
      Initiators resume I/O against the new ACTIVE.
 
-Writing "0" to forward_active is idempotent.  Any device whose
-backend fails to open returns NOT READY; retrying the write re-runs
-failover for all devices and skips those already open.
+Before any backend is opened, every command still forwarded to the
+old ACTIVE is completed with BUSY and every forwarded TMR rejected, as
+on link loss: an old ACTIVE whose storage is stalled keeps the link up,
+and its commands would otherwise hold up local TMRs.  The initiators
+retry them here.  A response the old ACTIVE sends later finds no
+command and is dropped.
+
+The write of "0" always succeeds.  A backend can fail to open only
+if its storage is locked.  It is logged and left closed: the device
+answers every command with LOGICAL UNIT COMMUNICATION FAILURE, and its
+storage object's "opened" attribute (iblock or fileio) reads 0.  Its
+PR state was restored all the same.  Once the storage is unlocked,
+writing 1 to "opened" opens it through target_ha_reopen_backend(),
+which also sets block_size and the other attributes left 0 on STANDBY;
+writing 1 to an open backend does nothing.
 
 
 CONFIGFS ATTRIBUTES
@@ -525,8 +537,11 @@ Path: /sys/kernel/config/lio_ha/
                      default_forward_active=1 (STANDBY startup):
                      backends defer open() and all commands are
                      forwarded to ACTIVE.
-                     Write "0" at failover: restores replicated PR
-                     state, opens all backends, clears forwarding.
+                     Write "0" at failover: clears forwarding,
+                     completes commands still forwarded with BUSY,
+                     restores replicated PR state, opens all backends.
+                     Always succeeds; a backend that did not open is
+                     opened later through its "opened" attribute.
                      Idempotent.
                      Write "1" is a no-op while forwarding and fails
                      with EPERM once it has been cleared: to become

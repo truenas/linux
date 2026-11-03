@@ -63,6 +63,15 @@ int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len);
 u64 lio_ha_tcp_generation(void);
 
 /**
+ * lio_ha_tcp_retire_generation - refuse sends bound to the current generation
+ *
+ * Advances the generation without a new connection, so every later
+ * lio_ha_tcp_send_gen() with a generation captured before this call
+ * fails with -ENOTCONN.  Sends not bound to a generation are unaffected.
+ */
+void lio_ha_tcp_retire_generation(void);
+
+/**
  * lio_ha_tcp_send_gen - send only on the connection of generation @gen
  * @gen: from lio_ha_tcp_generation(), or 0 for whichever is up
  *

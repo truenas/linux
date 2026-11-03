@@ -1143,12 +1143,15 @@ static int ha_main_failover_device(struct se_device *dev, void *data)
 open_backend:
 	/*
 	 * Open the backend now that lio_ha_forward_active has been cleared
-	 * by the caller.  Best-effort: log and continue on error.
+	 * by the caller.  Best-effort: log and continue on error.  The
+	 * backend stays closed, failing every command, until "1" is written
+	 * to its "opened" attribute.
 	 */
 	lio_ha_dbg(1, "failover: %s: opening backend (%d registrant(s) restored)\n",
 		   dev_name, nsnap);
 	if (target_ha_reopen_backend(dev))
-		pr_warn("lio_ha: failed to open backend for %s\n", dev_name);
+		pr_warn("lio_ha: failed to open backend for %s; write 1 to its opened attribute to retry\n",
+			dev_name);
 	else
 		lio_ha_dbg(1, "failover: %s: backend opened ok\n", dev_name);
 
@@ -1266,11 +1269,16 @@ CONFIGFS_ATTR_RO(lio_ha_, ha_state);
  *   again reloads lio_ha.
  *
  * Write "0" (failover -- pool has been imported and is ready):
- *   Clears lio_ha_forward_active in LIO core; BUSY stops; all LUNs execute
+ *   Clears lio_ha_forward_active in LIO core, completes every command
+ *   still forwarded to the old ACTIVE with BUSY, and has all LUNs execute
  *   locally.  Also responsible for restoring replicated PR state to each
  *   iblock/fileio backend before opening it.  Calls
  *   ha_main_failover_device() for each se_device -- see that function for
  *   the per-device sequence.
+ *
+ * The write of "0" always succeeds.  A backend that does not open (its
+ *   storage is locked) is logged and left closed; writing 1 to its
+ *   "opened" attribute opens it later.
  *
  * Both writes are idempotent where accepted.
  */
@@ -1328,6 +1336,14 @@ static ssize_t lio_ha_forward_active_store(struct config_item *item,
 		 */
 		atomic_set(&lio_ha_forward_active, 0);
 		lio_ha_dbg(1, "forward_active cleared: starting failover\n");
+		/*
+		 * Commands still forwarded to the old ACTIVE complete only on
+		 * its response or on link loss, and an old ACTIVE whose storage
+		 * is stalled keeps the link up.  Complete them now with BUSY,
+		 * before any backend opens, so the initiators retry them here
+		 * and local TMRs do not wait on them.
+		 */
+		lio_ha_fwd_drain();
 		/*
 		 * Shadow list is no longer needed: forward_active=0 means we
 		 * are becoming ACTIVE and will never replay SESSION_CONNECTs.

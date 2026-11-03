@@ -223,6 +223,17 @@ void lio_ha_forward_cmd(struct se_cmd *cmd)
 	hash_add(ha_fwd_ht, &e->node, cookie);
 	spin_unlock(&ha_fwd_lock);
 
+	/*
+	 * Failover may have cleared forwarding since this command was sent
+	 * here, and drained the table before this entry was added.  Nothing
+	 * would complete it then: fail it now.  An entry added before the
+	 * drain was completed by it, and send_fail sees that.
+	 */
+	if (!atomic_read(&lio_ha_forward_active)) {
+		ret = -ENOTCONN;
+		goto send_fail;
+	}
+
 	lio_ha_dbg(2, "forward cmd: cookie=%016llx opcode=0x%02x len=%u\n",
 		   (unsigned long long)cookie,
 		   cmd->t_task_cdb[0],
@@ -346,6 +357,12 @@ void lio_ha_forward_tmr(struct se_cmd *cmd)
 	spin_lock(&ha_fwd_tmr_lock);
 	hash_add(ha_fwd_tmr_ht, &e->node, cookie);
 	spin_unlock(&ha_fwd_tmr_lock);
+
+	/* As in lio_ha_forward_cmd(). */
+	if (!atomic_read(&lio_ha_forward_active)) {
+		ret = -ENOTCONN;
+		goto send_fail;
+	}
 
 	fwd.hdr.type   = cpu_to_be32(LIO_HA_MSG_TMR_FORWARD);
 	fwd.session_id = cpu_to_be64(cmd->se_sess ? (u64)cmd->se_sess : 0);
@@ -698,18 +715,20 @@ static void ha_fwd_data_handler(u64 cookie, void *data, u32 data_len)
 /* Disconnect handler                                                  */
 /* ------------------------------------------------------------------ */
 
-/*
- * Called by the TCP layer on link drop (not during module exit).
- * Completes all in-flight commands with SAM_STAT_BUSY so initiators retry.
- */
-static void ha_fwd_disconnect_handler(void)
+void lio_ha_fwd_drain(void)
 {
 	struct ha_fwd_entry *e;
 	struct ha_fwd_data_entry *de;
 	struct ha_fwd_tmr_entry *te;
 	int bkt;
 
-	lio_ha_dbg(1, "link dropped: draining in-flight command tables\n");
+	lio_ha_dbg(1, "draining in-flight command tables\n");
+
+	/*
+	 * Stop forwards that are between sends: their entries are about to
+	 * be completed here, and the rest of them must not reach the peer.
+	 */
+	lio_ha_tcp_retire_generation();
 
 	/*
 	 * Drain the in-flight table one entry at a time, taking each out
@@ -774,6 +793,16 @@ static void ha_fwd_disconnect_handler(void)
 		tcmd->se_tmr_req->response = TMR_FUNCTION_REJECTED;
 		target_complete_tmr(tcmd);
 	}
+}
+
+/*
+ * Called by the TCP layer on link drop (not during module exit).
+ * Completes all in-flight commands with SAM_STAT_BUSY so initiators retry.
+ */
+static void ha_fwd_disconnect_handler(void)
+{
+	lio_ha_dbg(1, "link dropped\n");
+	lio_ha_fwd_drain();
 }
 
 /* ------------------------------------------------------------------ */
