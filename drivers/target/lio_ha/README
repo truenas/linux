@@ -259,7 +259,9 @@ SESSION_DISCONNECT (S->A)
 CMD_FORWARD (S->A)
   One per SCSI command.  Carries session_id, cmd_cookie (STANDBY's
   se_cmd pointer, echoed back in CMD_RESPONSE), LUN, data direction,
-  expected transfer length, and the full CDB (up to 32 bytes).
+  expected transfer length, the initiator's task tag (the iSCSI ITT),
+  and the full CDB (up to 32 bytes).  ACTIVE submits the command with
+  that tag, so that a forwarded ABORT TASK can find it.
 
   For WRITE commands: write data is sent on the DATA channel BEFORE
   CMD_FORWARD.  ACTIVE buffers the data keyed by cmd_cookie; it is
@@ -275,8 +277,8 @@ CMD_RESPONSE (A->S)
 
 TMR_FORWARD (S->A)
   One per Task Management Request.  Carries session_id, cmd_cookie
-  for the TMR se_cmd, ref_cookie (the command to abort for ABORT TASK),
-  the TMR function code, and LUN.
+  for the TMR se_cmd, ref_cookie (for ABORT TASK, the initiator's task
+  tag of the command to abort), the TMR function code, and LUN.
 
 TMR_RESPONSE (A->S)
   Returns the TMR response code: TMR_FUNCTION_COMPLETE or

@@ -187,6 +187,7 @@ struct lio_ha_msg_cmd_forward {
 	__be64 data_length;                  /* expected transfer length */
 	__be32 lun;                          /* target LUN number */
 	__be32 data_dir;    /* enum dma_data_direction: TO_DEVICE=1 FROM_DEVICE=2 NONE=3 */
+	__be64 task_tag;    /* fabric task tag (iSCSI ITT), for ABORT TASK */
 	u8     cdb[LIO_HA_CDB_LEN];          /* SCSI CDB, zero-padded */
 };
 
@@ -216,7 +217,7 @@ struct lio_ha_msg_tmr_forward {
 	struct lio_ha_msg_hdr hdr;    /* type = LIO_HA_MSG_TMR_FORWARD */
 	__be64 session_id;
 	__be64 cmd_cookie;            /* STANDBY's se_cmd ptr for this TMR */
-	__be64 ref_cookie;            /* for ABORT TASK: cookie of cmd to abort */
+	__be64 ref_cookie;            /* for ABORT TASK: initiator task tag of cmd to abort */
 	__be32 function;              /* LIO TMR function code (TMR_ABORT_TASK etc.) */
 	__be32 lun;                   /* target LUN for the TMR */
 };

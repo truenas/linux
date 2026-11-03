@@ -173,6 +173,8 @@ static int ha_fwd_send_cmd_forward(struct se_cmd *cmd, u64 cookie)
 	fwd.data_length = cpu_to_be64(cmd->data_length);
 	fwd.lun         = cpu_to_be32((u32)cmd->orig_fe_lun);
 	fwd.data_dir    = cpu_to_be32((u32)cmd->data_direction);
+	/* ABORT TASK names a command by this tag; see ha_recv_submit_tmr(). */
+	fwd.task_tag    = cpu_to_be64(cmd->tag);
 	/*
 	 * t_task_cdb points to __t_task_cdb[TCM_MAX_COMMAND_SIZE] (32 bytes)
 	 * for standard CDBs.  LIO_HA_CDB_LEN == TCM_MAX_COMMAND_SIZE == 32.

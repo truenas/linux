@@ -116,12 +116,14 @@ void lio_ha_recv_data_rx(u64 cookie, const void *data, u32 len);
  * @lun:        target LUN
  * @data_length: expected transfer length
  * @data_dir:   DMA_FROM_DEVICE / DMA_TO_DEVICE / DMA_NONE
+ * @task_tag:   the initiator's task tag on STANDBY, which ABORT TASK uses
  *
  * Allocates ha_recv_cmd, populates se_cmd, and calls target_submit_cmd().
  * queue_data_in / queue_status send the response back to STANDBY via
  * TCP, echoing @cookie so STANDBY can complete the original initiator cmd.
  */
 void lio_ha_recv_submit_cmd(u64 session_id, const void *cdb, size_t cdb_len,
-			    u64 cookie, u32 lun, u32 data_length, u8 data_dir);
+			    u64 cookie, u32 lun, u32 data_length, u8 data_dir,
+			    u64 task_tag);
 
 #endif /* _LIO_HA_RECV_H */

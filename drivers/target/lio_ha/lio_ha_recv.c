@@ -464,7 +464,8 @@ static void ha_recv_cmd_forward_handler(const void *buf, size_t len)
 			       be64_to_cpu(fwd->cmd_cookie),
 			       be32_to_cpu(fwd->lun),
 			       (u32)be64_to_cpu(fwd->data_length),
-			       (u8)be32_to_cpu(fwd->data_dir));
+			       (u8)be32_to_cpu(fwd->data_dir),
+			       be64_to_cpu(fwd->task_tag));
 	mutex_unlock(&ha_recv_sess_mutex);
 }
 
@@ -520,11 +521,10 @@ static void ha_recv_submit_tmr(u64 session_id, u64 cmd_cookie,
 	 * LIO core.  On completion, queue_tm_rsp() is called; ha_recv
 	 * sends TMR_RESPONSE back to STANDBY.
 	 *
-	 * For ABORT_TASK: ref_cookie is STANDBY's cookie of the target
-	 * command; passed as ref_task_tag so LIO can look it up.  Since
-	 * ha_recv commands are submitted with tag=0 (no explicit task tag),
-	 * ABORT_TASK may return TMR_FUNCTION_FAILED; LUN_RESET/TARGET_RESET
-	 * work normally.
+	 * For ABORT_TASK: ref_cookie carries the initiator's tag of the
+	 * command to abort (tmr->ref_task_tag on STANDBY).  Every forwarded
+	 * command is submitted with its initiator tag (task_tag in
+	 * CMD_FORWARD), so core_tmr_abort_task() finds it in this session.
 	 */
 	ret = target_submit_tmr(&hcmd->se_cmd, se_sess, hcmd->sense_buf,
 				(u64)lun, NULL, (unsigned char)function,
@@ -947,7 +947,8 @@ void lio_ha_recv_data_rx(u64 cookie, const void *data, u32 len)
 }
 
 void lio_ha_recv_submit_cmd(u64 session_id, const void *cdb, size_t cdb_len,
-			    u64 cookie, u32 lun, u32 data_length, u8 data_dir)
+			    u64 cookie, u32 lun, u32 data_length, u8 data_dir,
+			    u64 task_tag)
 {
 	struct ha_recv_sess_entry *e;
 	struct se_session *se_sess = NULL;
@@ -994,6 +995,12 @@ void lio_ha_recv_submit_cmd(u64 session_id, const void *cdb, size_t cdb_len,
 		return;
 	}
 	hcmd->cookie = cookie;
+	/*
+	 * The initiator's tag, so that a forwarded ABORT TASK, which names
+	 * the command by it, finds this one.  The synthetic session mirrors
+	 * one STANDBY session, so the tag is unique within it as there.
+	 */
+	hcmd->se_cmd.tag = task_tag;
 
 	lio_ha_dbg(2, "submit cmd: session=%llu cookie=%016llx opcode=0x%02x lun=%u len=%u\n",
 		   (unsigned long long)session_id,
