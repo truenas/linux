@@ -136,6 +136,16 @@ static atomic_t ha_tcp_stopping = ATOMIC_INIT(0);
 static bool ha_tcp_disconnecting;
 
 /*
+ * Connection generation: incremented under ha_tcp_lock each time a new
+ * connection is installed, so it names one connection.  A sender that
+ * must not reach a later connection than the one it started on captures
+ * it with lio_ha_tcp_generation() and sends with lio_ha_tcp_send_gen().
+ * It starts at 1, so 0 is never a generation; lio_ha_tcp_send() passes
+ * 0 for "any".
+ */
+static atomic64_t ha_conn_gen = ATOMIC64_INIT(1);
+
+/*
  * CTL-channel dispatch table.  Indexed by enum lio_ha_msg_type.
  * Protected by module load ordering: handlers are registered at init
  * time, before any messages can arrive.
@@ -368,6 +378,7 @@ static void ha_tcp_on_connected(struct socket *sock)
 	get_task_struct(rx);
 	ha_rx_task   = rx;
 	ha_conn_sock = sock;
+	atomic64_inc(&ha_conn_gen);
 	wake_up_process(rx);
 
 	spin_lock(&lio_ha_cfg.lock);
@@ -765,7 +776,18 @@ backoff:
 /* Public API                                                          */
 /* ------------------------------------------------------------------ */
 
+u64 lio_ha_tcp_generation(void)
+{
+	return atomic64_read(&ha_conn_gen);
+}
+
 int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len)
+{
+	return lio_ha_tcp_send_gen(chan, payload, len, 0);
+}
+
+int lio_ha_tcp_send_gen(enum lio_ha_channel chan, const void *payload,
+			u32 len, u64 gen)
 {
 	struct lio_ha_wire_hdr hdr = {
 		.magic   = cpu_to_be32(LIO_HA_WIRE_MAGIC),
@@ -786,6 +808,9 @@ int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len)
 	mutex_lock(&ha_send_lock);
 	mutex_lock(&ha_tcp_lock);
 	sock = ha_conn_sock;
+	/* A later connection than the caller's: refuse, as if down. */
+	if (gen && gen != atomic64_read(&ha_conn_gen))
+		sock = NULL;
 	mutex_unlock(&ha_tcp_lock);
 
 	if (sock) {

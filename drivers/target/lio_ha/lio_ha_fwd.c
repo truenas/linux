@@ -137,7 +137,7 @@ static struct ha_fwd_entry *ha_fwd_entry_alloc(u64 cookie, struct se_cmd *cmd)
  * Send WRITE data (DMA_TO_DEVICE) on the DATA channel before CMD_FORWARD.
  * ACTIVE buffers this by cookie; ha_recv_write_pending() picks it up.
  */
-static int ha_fwd_send_write_data(struct se_cmd *cmd, u64 cookie)
+static int ha_fwd_send_write_data(struct se_cmd *cmd, u64 cookie, u64 gen)
 {
 	size_t data_len = cmd->data_length;
 	size_t buf_len  = sizeof(struct lio_ha_data_hdr) + data_len;
@@ -157,13 +157,13 @@ static int ha_fwd_send_write_data(struct se_cmd *cmd, u64 cookie)
 
 	lio_ha_dbg(3, "fwd write data: cookie=%016llx len=%zu\n",
 		   (unsigned long long)cookie, data_len);
-	ret = lio_ha_tcp_send(LIO_HA_CHAN_DATA, buf, (u32)buf_len);
+	ret = lio_ha_tcp_send_gen(LIO_HA_CHAN_DATA, buf, (u32)buf_len, gen);
 	kvfree(buf);
 	return ret;
 }
 
 /* Build and send CMD_FORWARD on the CTL channel. */
-static int ha_fwd_send_cmd_forward(struct se_cmd *cmd, u64 cookie)
+static int ha_fwd_send_cmd_forward(struct se_cmd *cmd, u64 cookie, u64 gen)
 {
 	struct lio_ha_msg_cmd_forward fwd = {};
 
@@ -181,7 +181,7 @@ static int ha_fwd_send_cmd_forward(struct se_cmd *cmd, u64 cookie)
 	 */
 	memcpy(fwd.cdb, cmd->t_task_cdb, LIO_HA_CDB_LEN);
 
-	return lio_ha_tcp_send(LIO_HA_CHAN_CTL, &fwd, sizeof(fwd));
+	return lio_ha_tcp_send_gen(LIO_HA_CHAN_CTL, &fwd, sizeof(fwd), gen);
 }
 
 /* ------------------------------------------------------------------ */
@@ -193,6 +193,7 @@ void lio_ha_forward_cmd(struct se_cmd *cmd)
 	u64 cookie = (u64)cmd;
 	struct ha_fwd_entry *e;
 	bool still_in_hash;
+	u64 gen;
 	int ret;
 
 	/*
@@ -212,6 +213,15 @@ void lio_ha_forward_cmd(struct se_cmd *cmd)
 		return;
 	}
 
+	/*
+	 * Once the entry is in the table the disconnect handler may complete
+	 * the command at any moment.  Bind every send for it to the
+	 * connection that is up now, so that if the link drops and comes
+	 * back while this thread is between sends, nothing for an already
+	 * completed command reaches the new connection.
+	 */
+	gen = lio_ha_tcp_generation();
+
 	/* Add to in-flight table (hash holds ref 1; caller holds ref 2). */
 	spin_lock(&ha_fwd_lock);
 	hash_add(ha_fwd_ht, &e->node, cookie);
@@ -227,12 +237,12 @@ void lio_ha_forward_cmd(struct se_cmd *cmd)
 	 * ACTIVE sees the data before CMD_FORWARD on the same connection.
 	 */
 	if (cmd->data_direction == DMA_TO_DEVICE && cmd->data_length > 0) {
-		ret = ha_fwd_send_write_data(cmd, cookie);
+		ret = ha_fwd_send_write_data(cmd, cookie, gen);
 		if (ret)
 			goto send_fail;
 	}
 
-	ret = ha_fwd_send_cmd_forward(cmd, cookie);
+	ret = ha_fwd_send_cmd_forward(cmd, cookie, gen);
 	if (ret)
 		goto send_fail;
 
@@ -320,6 +330,7 @@ void lio_ha_forward_tmr(struct se_cmd *cmd)
 	struct lio_ha_msg_tmr_forward fwd = {};
 	struct ha_fwd_tmr_entry *e;
 	bool still_in_hash;
+	u64 gen;
 	int ret;
 
 	e = ha_fwd_tmr_entry_alloc(cookie, cmd);
@@ -329,6 +340,12 @@ void lio_ha_forward_tmr(struct se_cmd *cmd)
 		target_complete_tmr(cmd);
 		return;
 	}
+
+	/*
+	 * As in lio_ha_forward_cmd(): a TMR the disconnect handler has
+	 * already rejected must not run on the ACTIVE after a reconnect.
+	 */
+	gen = lio_ha_tcp_generation();
 
 	spin_lock(&ha_fwd_tmr_lock);
 	hash_add(ha_fwd_tmr_ht, &e->node, cookie);
@@ -345,7 +362,7 @@ void lio_ha_forward_tmr(struct se_cmd *cmd)
 		   (unsigned long long)cookie, tmr->function,
 		   (unsigned int)cmd->orig_fe_lun);
 
-	ret = lio_ha_tcp_send(LIO_HA_CHAN_CTL, &fwd, sizeof(fwd));
+	ret = lio_ha_tcp_send_gen(LIO_HA_CHAN_CTL, &fwd, sizeof(fwd), gen);
 	if (ret)
 		goto send_fail;
 

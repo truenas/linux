@@ -53,6 +53,27 @@ void lio_ha_tcp_exit(void);
 int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len);
 
 /**
+ * lio_ha_tcp_generation - the current connection generation
+ *
+ * Names the connection that is up, or the last one if none is.  It
+ * changes when a new connection is installed, never otherwise.
+ */
+u64 lio_ha_tcp_generation(void);
+
+/**
+ * lio_ha_tcp_send_gen - send only on the connection of generation @gen
+ * @gen: from lio_ha_tcp_generation(), or 0 for whichever is up
+ *
+ * As lio_ha_tcp_send(), but returns -ENOTCONN, sending nothing, if a
+ * connection after @gen has been installed.  A sender whose message
+ * belongs to an in-flight entry captures @gen before it adds the entry,
+ * so that once the link has dropped (and the disconnect handler has
+ * completed the entry), nothing for it reaches the next connection.
+ */
+int lio_ha_tcp_send_gen(enum lio_ha_channel chan, const void *payload,
+			u32 len, u64 gen);
+
+/**
  * lio_ha_tcp_register_data_handler - register the DATA-channel handler
  *
  * Called once at init time; not safe to call concurrently with
