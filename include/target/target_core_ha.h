@@ -130,7 +130,7 @@
  *         fileio check this flag inside configure_device(), so it must
  *         be clear before any backend is opened.
  *
- *      b. target_for_each_device() calls lio_ha_failover_device() for
+ *      b. target_for_each_device() calls ha_main_failover_device() for
  *         every configured se_device.  Per device:
  *
  *         i.  The replicated PR table is scanned for entries matching
