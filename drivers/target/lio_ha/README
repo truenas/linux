@@ -414,9 +414,12 @@ nodes maintain the same three states, but the triggers differ:
     immediately with SAM_STAT_BUSY.
 
   CONNECTED (1)
-    TCP link is up.  ACTIVE is sending LUN_SYNC messages to STANDBY.
-    STANDBY stores the incoming PR state but does not yet forward
-    initiator commands.
+    TCP link is up.  ACTIVE is sending LUN_SYNC messages to STANDBY,
+    which stores the incoming PR state.  STANDBY forwards initiator
+    commands already: forwarding depends only on forward_active, and
+    the ACTIVE's PR state, not STANDBY's copy, decides every forwarded
+    command.  What the sync gates is failover, and middleware's ALUA
+    state for the STANDBY group (TRANSITIONING until SYNCED).
 
   SYNCED (2)
     PR state transfer is complete.
@@ -510,6 +513,26 @@ PR state was restored all the same.  Once the storage is unlocked,
 writing 1 to "opened" opens it through target_ha_reopen_backend(),
 which also sets block_size and the other attributes left 0 on STANDBY;
 writing 1 to an open backend does nothing.
+
+
+MODULE PARAMETERS
+=================
+
+  default_forward_active (int, read-only after load)
+                     1 loads lio_ha as STANDBY: forwarding is set
+                     before the TCP threads start, and holds a module
+                     reference until failover.  The only way to set
+                     forward_active; middleware passes it on a BACKUP
+                     node.  Default 0.
+  default_local_addr (string, read-only after load)
+                     This node's HA address; local_addr in configfs
+                     overrides it.
+  default_peer_addr  (string, read-only after load)
+                     The peer's HA address; peer_addr in configfs
+                     overrides it.
+  lio_ha_debug       (int, writable)
+                     Trace level: 0 off, 1 state, 2 commands,
+                     3 verbose.
 
 
 CONFIGFS ATTRIBUTES
@@ -718,9 +741,10 @@ All additions in the core files are gated on #ifdef CONFIG_TRUENAS.
       target_ha_tpg_rtpi(): just its relative target port id.
     - target_ha_foreach_nacl_dev(): iterate nacl+lun mappings for an
       initiator/device pair across all registered TPGs.
-    - ha_tpg_reg_list: list of TPGs maintained by
-      target_ha_register_tpg() / target_ha_unregister_tpg(), hooked
-      into core_tpg_register() / core_tpg_deregister().
+    - ha_tpg_reg_list: the TPGs the HA lookups search, maintained
+      inline: core_tpg_register() adds a TPG last, once it is set up,
+      and core_tpg_deregister() removes it before waiting on
+      tpg_pr_ref_count for the lookups that pinned it.
 
   drivers/target/target_core_device.c
     - target_for_each_device(): iterate all configured se_devices.
