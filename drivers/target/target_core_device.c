@@ -983,6 +983,15 @@ int target_ha_reopen_backend(struct se_device *dev)
 	if (!target_dev_configured(dev))
 		return -ENODEV;
 
+	/*
+	 * Already open: a retried failover, or opened=1 written again.
+	 * Opening again would take a second reference on the backing store.
+	 */
+	if (dev->transport->backend_is_ready &&
+	    dev->transport->backend_is_ready(dev) &&
+	    dev->dev_attrib.block_size)
+		return 0;
+
 	ret = dev->transport->configure_device(dev);
 	if (ret)
 		return ret;
@@ -996,14 +1005,26 @@ int target_ha_reopen_backend(struct se_device *dev)
 		dev->dev_attrib.emulate_tpu = 1;
 	}
 
-	dev->dev_attrib.block_size  = dev->dev_attrib.hw_block_size;
-	dev->dev_attrib.queue_depth = dev->dev_attrib.hw_queue_depth;
-
+	/*
+	 * target_configure_device() left these 0, the backend being closed
+	 * then.  Fill them from the backend, keeping any value set since.
+	 * block_size goes last: target_cmd_parse_cdb() treats the device as
+	 * open only once it is set.
+	 */
+	if (!dev->dev_attrib.queue_depth)
+		dev->dev_attrib.queue_depth = dev->dev_attrib.hw_queue_depth;
 	if (dev->dev_attrib.hw_block_size) {
 		dev->dev_attrib.hw_max_sectors =
 			se_dev_align_max_sectors(dev->dev_attrib.hw_max_sectors,
 						 dev->dev_attrib.hw_block_size);
-		dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
+		if (!dev->dev_attrib.optimal_sectors)
+			dev->dev_attrib.optimal_sectors =
+				dev->dev_attrib.hw_max_sectors;
+	}
+	if (!dev->dev_attrib.block_size) {
+		/* Pairs with smp_load_acquire() in target_cmd_parse_cdb(). */
+		smp_store_release(&dev->dev_attrib.block_size,
+				  dev->dev_attrib.hw_block_size);
 	}
 
 	return 0;

@@ -995,7 +995,8 @@ static ssize_t fd_opened_store(struct config_item *item,
 	if (val != 1)
 		return -EINVAL;
 
-	ret = fd_configure_device(dev);
+	/* As iblock_opened_store(). */
+	ret = target_ha_reopen_backend(dev);
 	if (ret)
 		return ret;
 

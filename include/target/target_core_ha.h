@@ -146,9 +146,11 @@
  *   3. Middleware sets all ALUA target port groups to ACTIVE-OPTIMIZED.
  *      Initiators resume I/O against the new ACTIVE node.
  *
- * Writing "0" to forward_active is idempotent.  Devices whose backend
- * fails to open return NOT READY; the operator retries by writing "0"
- * again.
+ * The write of "0" always succeeds.  A device whose backend did not open
+ * (its storage is locked) fails every command with LOGICAL UNIT
+ * COMMUNICATION FAILURE, and its "opened" attribute reads 0, until "1" is
+ * written to that attribute, which opens it through
+ * target_ha_reopen_backend().
  */
 #ifndef _TARGET_CORE_HA_H
 #define _TARGET_CORE_HA_H
@@ -281,9 +283,10 @@ int target_for_each_device(int (*fn)(struct se_device *dev, void *data),
  * @dev: the se_device whose backend was opened with lio_ha_forward_active=1
  *
  * Retries dev->transport->configure_device() after lio_ha_forward_active is
- * cleared, then refreshes block_size/queue_depth from the hw_ attributes that
- * are now populated by the backend.  Idempotent: iblock/fileio skip if already
- * open (ibd_bdev_file != NULL / fd_file != NULL).
+ * cleared, then fills block_size, queue_depth and optimal_sectors from the
+ * hw_ attributes now populated by the backend, where still 0.  block_size is
+ * set last; target_cmd_parse_cdb() treats the device as open once it is.
+ * Returns 0 without reopening if the backend is already open.
  *
  * Returns 0 on success, negative errno if the backend fails to open.
  */

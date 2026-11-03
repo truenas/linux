@@ -1254,7 +1254,11 @@ static ssize_t iblock_opened_store(struct config_item *item,
 	if (val != 1)
 		return -EINVAL;
 
-	ret = iblock_configure_device(dev);
+	/*
+	 * As at failover: opens the backend and fills block_size and the
+	 * other attributes target_configure_device() left 0 on STANDBY.
+	 */
+	ret = target_ha_reopen_backend(dev);
 	if (ret)
 		return ret;
 

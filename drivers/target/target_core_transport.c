@@ -1771,9 +1771,18 @@ target_cmd_parse_cdb(struct se_cmd *cmd)
 	 * Fail every command with the NOT READY that __target_execute_cmd()
 	 * would give it instead.
 	 */
-	if (dev->transport->backend_is_ready &&
-	    !dev->transport->backend_is_ready(dev))
-		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+	if (dev->transport->backend_is_ready) {
+		/*
+		 * configure_device() publishes the backend before
+		 * target_ha_reopen_backend() fills in the attributes, the
+		 * last being block_size with smp_store_release(): once it is
+		 * seen here, so are the backend and the other attributes.
+		 */
+		u32 block_size = smp_load_acquire(&dev->dev_attrib.block_size);
+
+		if (!block_size || !dev->transport->backend_is_ready(dev))
+			return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+	}
 #endif /* CONFIG_TRUENAS */
 
 	ret = dev->transport->parse_cdb(cmd);
