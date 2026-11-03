@@ -154,6 +154,7 @@ void target_ha_foreach_tpg_nacl_dev(struct se_portal_group *tpg,
 	if (!nacl)
 		return;
 
+	/* @fn is called inside: it must not sleep (target_ha_nacl_fn_t). */
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
 		struct se_device *mapped_dev;
@@ -231,6 +232,7 @@ void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_n
 		if (!nacl)
 			continue;
 
+		/* @fn must not sleep in here (target_ha_nacl_fn_t). */
 		rcu_read_lock();
 		hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
 			struct se_device *mapped_dev;

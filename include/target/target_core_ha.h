@@ -307,7 +307,12 @@ void target_ha_put_tpg(struct se_portal_group *tpg);
 bool target_ha_tpg_rtpi(const char *fabric_name, const char *target_name,
 			u16 tpg_tag, u16 *rtpi);
 
-/* Callback type for target_ha_foreach_nacl_dev(). */
+/*
+ * Callback type for target_ha_foreach_nacl_dev() and
+ * target_ha_foreach_tpg_nacl_dev().  Called under rcu_read_lock(): it must
+ * not sleep (allocate with GFP_ATOMIC, take spinlocks only), and @nacl,
+ * @lun and the mapping are valid only for the call.
+ */
 typedef void (*target_ha_nacl_fn_t)(struct se_node_acl *nacl, struct se_lun *lun,
 				    u64 mapped_lun, void *data);
 
@@ -344,8 +349,9 @@ void target_ha_foreach_tpg_nacl_dev(struct se_portal_group *tpg,
  *
  * Called by lio_ha.ko at failover to recreate the registrations that an
  * ALL_TG_PT=1 REGISTER creates on the other ports.  Called from process
- * context; @fn must not sleep for long and must not call
- * target_ha_foreach_nacl_dev() recursively.
+ * context.  @fn is called under rcu_read_lock() and must not sleep (see
+ * target_ha_nacl_fn_t), nor call target_ha_foreach_nacl_dev()
+ * recursively.
  */
 void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_name,
 				struct se_device *dev, target_ha_nacl_fn_t fn, void *data);
