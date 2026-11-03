@@ -75,6 +75,25 @@ void lio_ha_unregister_pr_notifier(void)
 	synchronize_rcu();
 }
 EXPORT_SYMBOL(lio_ha_unregister_pr_notifier);
+
+/*
+ * Tell lio_ha.ko that @dev's PR state may have changed.  pr_change()
+ * queues a send of the device's whole PR state to STANDBY and returns at
+ * once; it does not sleep.  Called after a successful PR OUT, when the
+ * core drops an initiator's registrations on a LUN unmap or ACL removal,
+ * and when a device is configured, so that STANDBY replaces what it held
+ * under the device's name with what the device has now.
+ */
+void target_ha_pr_changed(struct se_device *dev)
+{
+	const struct lio_ha_pr_notifier *n;
+
+	rcu_read_lock();
+	n = rcu_dereference(pr_notifier);
+	if (n)
+		n->pr_change(dev);
+	rcu_read_unlock();
+}
 #endif /* CONFIG_TRUENAS */
 
 enum register_type {
@@ -1671,6 +1690,10 @@ void core_scsi3_free_pr_reg_from_nacl(
 		__core_scsi3_free_registration(dev, pr_reg, NULL, 0);
 	}
 	spin_unlock(&pr_tmpl->registration_lock);
+#ifdef CONFIG_TRUENAS
+	/* No PR OUT did this, so tell STANDBY here. */
+	target_ha_pr_changed(dev);
+#endif
 }
 
 void core_scsi3_free_all_registrations(
@@ -4095,23 +4118,13 @@ done:
 #ifdef CONFIG_TRUENAS
 		/*
 		 * Tell lio_ha.ko that this device's PR state changed, before
-		 * completing the command.  pr_change() queues a send of the
-		 * device's whole PR state to STANDBY (fire-and-forget) and
-		 * returns at once.  Sending the state rather than the change
-		 * keeps STANDBY's copy exactly what this node has, whatever
-		 * the service action did: SPEC_I_PT and ALL_TG_PT
-		 * registrations, REGISTER AND MOVE, or a reservation passed on
-		 * or dropped.
+		 * completing the command (fire-and-forget).  Sending the state
+		 * rather than the change keeps STANDBY's copy exactly what this
+		 * node has, whatever the service action did: SPEC_I_PT and
+		 * ALL_TG_PT registrations, REGISTER AND MOVE, or a reservation
+		 * passed on or dropped.
 		 */
-		{
-			const struct lio_ha_pr_notifier *n;
-
-			rcu_read_lock();
-			n = rcu_dereference(pr_notifier);
-			if (n)
-				n->pr_change(dev);
-			rcu_read_unlock();
-		}
+		target_ha_pr_changed(dev);
 #endif /* CONFIG_TRUENAS */
 		target_complete_cmd(cmd, SAM_STAT_GOOD);
 	}

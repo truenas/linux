@@ -1108,6 +1108,15 @@ int target_configure_device(struct se_device *dev)
 
 	dev->dev_flags |= DF_CONFIGURED;
 
+#ifdef CONFIG_TRUENAS
+	/*
+	 * A new device has no PR state.  Have it sent, so that STANDBY drops
+	 * whatever it still holds under this name from a device deleted and
+	 * created again; nothing else would replace that before a PR OUT.
+	 */
+	target_ha_pr_changed(dev);
+#endif
+
 	return 0;
 
 out_destroy_device:
