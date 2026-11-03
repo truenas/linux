@@ -119,9 +119,24 @@ struct ha_main_pr_dirty {
 static LIST_HEAD(ha_main_pr_dirty_list);
 static DEFINE_SPINLOCK(ha_main_pr_dirty_lock);
 static bool ha_main_pr_dirty_all;
+/*
+ * A full sync is wanted: every device's LUN_SYNC, then LUN_SYNC_DONE.
+ * Requested on link up and at failover; done by the work item below, so
+ * that no two run at once and none runs in the requester's context.
+ */
+static bool ha_main_full_sync_pending;
+/* Set at module exit, under the lock: nothing may queue the work after. */
+static bool ha_main_pr_stopping;
+
+/*
+ * A LUN_SYNC that failed for lack of memory is retried after this long; a
+ * full sync that could not send a device (too large) after the longer.
+ */
+#define HA_MAIN_PR_RETRY_DELAY		HZ
+#define HA_MAIN_PR_TOO_LARGE_DELAY	(60 * HZ)
 
 static void ha_main_pr_sync_work_fn(struct work_struct *work);
-static DECLARE_WORK(ha_main_pr_sync_work, ha_main_pr_sync_work_fn);
+static DECLARE_DELAYED_WORK(ha_main_pr_sync_work, ha_main_pr_sync_work_fn);
 static struct workqueue_struct *lio_ha_pr_wq;
 
 /*
@@ -571,6 +586,10 @@ static void ha_main_pr_change(struct se_device *dev)
 	lio_ha_dbg(2, "PR change: dev=%s\n", dev_name);
 
 	spin_lock(&ha_main_pr_dirty_lock);
+	if (ha_main_pr_stopping) {
+		spin_unlock(&ha_main_pr_dirty_lock);
+		return;
+	}
 	list_for_each_entry(d, &ha_main_pr_dirty_list, list) {
 		if (!strncmp(d->dev_name, dev_name, LIO_HA_DEV_NAME_LEN)) {
 			found = true;
@@ -586,9 +605,32 @@ static void ha_main_pr_change(struct se_device *dev)
 			ha_main_pr_dirty_all = true;
 		}
 	}
+	/* Now, even if a retry is pending later. */
+	mod_delayed_work(lio_ha_pr_wq, &ha_main_pr_sync_work, 0);
 	spin_unlock(&ha_main_pr_dirty_lock);
+}
 
-	queue_work(lio_ha_pr_wq, &ha_main_pr_sync_work);
+/* Queue the sync work after @delay, unless it is due sooner already. */
+static void ha_main_pr_sync_queue(unsigned long delay)
+{
+	spin_lock(&ha_main_pr_dirty_lock);
+	if (!ha_main_pr_stopping)
+		queue_delayed_work(lio_ha_pr_wq, &ha_main_pr_sync_work, delay);
+	spin_unlock(&ha_main_pr_dirty_lock);
+}
+
+/*
+ * Ask for a full sync now.  It runs in the work item, not here: callers
+ * are the connect handler and the forward_active store, which must not
+ * send themselves.
+ */
+static void ha_main_request_full_sync(void)
+{
+	spin_lock(&ha_main_pr_dirty_lock);
+	ha_main_full_sync_pending = true;
+	if (!ha_main_pr_stopping)
+		mod_delayed_work(lio_ha_pr_wq, &ha_main_pr_sync_work, 0);
+	spin_unlock(&ha_main_pr_dirty_lock);
 }
 
 static const struct lio_ha_pr_notifier pr_notifier = {
@@ -597,29 +639,32 @@ static const struct lio_ha_pr_notifier pr_notifier = {
 };
 
 /* ------------------------------------------------------------------ */
-/* LUN_SYNC -- bulk PR state export to STANDBY on TCP link up         */
+/* LUN_SYNC -- PR state export to STANDBY                              */
 /*                                                                      */
-/* Called only on ACTIVE (forward_active == 0) from ha_main_on_connect */
-/* when the HA TCP connection is established.  Iterates all configured  */
-/* se_devices, sends one LIO_HA_MSG_LUN_SYNC per device (even those    */
-/* with no registrations -- STANDBY clears stale state on receipt),   */
-/* then sends LIO_HA_MSG_LUN_SYNC_DONE.  On successful send, ACTIVE   */
-/* advances its own ha_state to SYNCED; STANDBY advances on receipt.  */
+/* ACTIVE only (forward_active == 0).  Everything is sent from          */
+/* ha_main_pr_sync_work, one thing at a time: the LUN_SYNC of each      */
+/* device marked dirty by a PR change, and the full sync (every         */
+/* device, then LUN_SYNC_DONE) requested on link up and at failover.    */
+/* A device with no registrations is sent too: STANDBY then drops what  */
+/* it had for it.  ACTIVE advances its ha_state to SYNCED once          */
+/* LUN_SYNC_DONE is sent; STANDBY advances on receipt.                  */
 /* ------------------------------------------------------------------ */
 
 /*
- * Per-device callback for target_for_each_device().
- * Exports the device's live PR state as APTPL text and sends it as a
- * LUN_SYNC CTL message.  The snapshot and the send are made under
+ * Send one device's PR state as a LUN_SYNC on the connection of
+ * generation @gen (0: whichever is up).  Returns 0, -ENOMEM if its state
+ * could not be read (try again later), -E2BIG if it can never fit in a
+ * LUN_SYNC, or the send error.  The snapshot and the send are made under
  * ha_main_pr_sync_mutex, so two LUN_SYNCs for one device cannot be sent
  * in the opposite order to their snapshots.
  */
-static int ha_main_send_lun_sync_for_device(struct se_device *dev, void *data)
+static int ha_main_send_lun_sync(struct se_device *dev, u64 gen)
 {
 	const size_t hdr_size = sizeof(struct lio_ha_msg_lun_sync);
 	struct lio_ha_msg_lun_sync *msg;
 	size_t aptpl_len;
 	void *full_buf;
+	int ret = 0;
 
 	/* We are ACTIVE: skip if forward_active has been set since we started. */
 	if (atomic_read(&lio_ha_forward_active))
@@ -628,10 +673,12 @@ static int ha_main_send_lun_sync_for_device(struct se_device *dev, void *data)
 	mutex_lock(&ha_main_pr_sync_mutex);
 	full_buf = target_ha_pr_export(dev, hdr_size, &aptpl_len);
 	if (IS_ERR(full_buf)) {
-		pr_warn_ratelimited("lio_ha: cannot read PR state of %s/%s: %ld\n",
+		ret = PTR_ERR(full_buf);
+		pr_warn_ratelimited("lio_ha: cannot read PR state of %s/%s: %d; will retry\n",
 				    config_item_name(&dev->se_hba->hba_group.cg_item),
 				    config_item_name(&dev->dev_group.cg_item),
-				    PTR_ERR(full_buf));
+				    ret);
+		ret = -ENOMEM;
 		goto out;
 	}
 
@@ -646,54 +693,154 @@ static int ha_main_send_lun_sync_for_device(struct se_device *dev, void *data)
 
 	/* Partial PR state is worse than none: STANDBY keeps the last. */
 	if (hdr_size + aptpl_len > LIO_HA_MAX_CTL_PAYLOAD) {
-		pr_warn_ratelimited("lio_ha: PR state of %s (%zu bytes) too large for LUN_SYNC, not sent\n",
-				    msg->dev_name, aptpl_len);
+		pr_err_ratelimited("lio_ha: PR state of %s (%zu bytes) too large for LUN_SYNC; STANDBY's copy is stale\n",
+				   msg->dev_name, aptpl_len);
+		ret = -E2BIG;
 		goto free;
 	}
 
 	lio_ha_dbg(3, "LUN_SYNC: %s (%zu bytes APTPL)\n", msg->dev_name, aptpl_len);
-	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, full_buf,
-			    (u32)(hdr_size + aptpl_len)))
-		pr_debug("lio_ha: LUN_SYNC send failed for %s\n", msg->dev_name);
+	ret = lio_ha_tcp_send_gen(LIO_HA_CHAN_CTL, full_buf,
+				  (u32)(hdr_size + aptpl_len), gen);
+	if (ret)
+		pr_debug("lio_ha: LUN_SYNC send failed for %s: %d\n",
+			 msg->dev_name, ret);
 free:
 	kvfree(full_buf);
 out:
 	mutex_unlock(&ha_main_pr_sync_mutex);
-	return 0;
+	return ret;
 }
 
-/* target_for_each_device() callback: send the device named @data. */
-static int ha_main_send_lun_sync_if_named(struct se_device *dev, void *data)
-{
-	char dev_name[LIO_HA_DEV_NAME_LEN];
+/* Context of a pass over the devices with target_for_each_device(). */
+struct ha_main_sync_ctx {
+	const char *name;      /* only the device of this name; NULL: all */
+	u64         gen;       /* as for ha_main_send_lun_sync() */
+	bool        found;     /* a device of that name was found */
+	bool        enomem;    /* some device failed with -ENOMEM */
+	bool        too_large; /* some device failed with -E2BIG */
+	bool        send_err;  /* some send failed */
+};
 
-	snprintf(dev_name, LIO_HA_DEV_NAME_LEN, "%s/%s",
-		 config_item_name(&dev->se_hba->hba_group.cg_item),
-		 config_item_name(&dev->dev_group.cg_item));
-	if (strncmp(dev_name, data, LIO_HA_DEV_NAME_LEN))
-		return 0;
-	ha_main_send_lun_sync_for_device(dev, NULL);
-	return 1;	/* found: stop iterating */
+static void ha_main_sync_ctx_note(struct ha_main_sync_ctx *ctx, int ret)
+{
+	if (ret == -ENOMEM)
+		ctx->enomem = true;
+	else if (ret == -E2BIG)
+		ctx->too_large = true;
+	else if (ret)
+		ctx->send_err = true;
+}
+
+/* target_for_each_device() callback: send the device(s) @data selects. */
+static int ha_main_sync_device_cb(struct se_device *dev, void *data)
+{
+	struct ha_main_sync_ctx *ctx = data;
+
+	if (ctx->name) {
+		char dev_name[LIO_HA_DEV_NAME_LEN];
+
+		snprintf(dev_name, LIO_HA_DEV_NAME_LEN, "%s/%s",
+			 config_item_name(&dev->se_hba->hba_group.cg_item),
+			 config_item_name(&dev->dev_group.cg_item));
+		if (strncmp(dev_name, ctx->name, LIO_HA_DEV_NAME_LEN))
+			return 0;
+		ctx->found = true;
+	}
+	ha_main_sync_ctx_note(ctx, ha_main_send_lun_sync(dev, ctx->gen));
+	/* With a send error the link is going down: stop. */
+	return ctx->name || ctx->send_err;
+}
+
+/* Lower SYNCED to CONNECTED: STANDBY's copy of some device is stale. */
+static void ha_main_unsync(void)
+{
+	spin_lock(&lio_ha_cfg.lock);
+	if (lio_ha_cfg.ha_state == LIO_HA_SYNCED)
+		lio_ha_cfg.ha_state = LIO_HA_CONNECTED;
+	spin_unlock(&lio_ha_cfg.lock);
 }
 
 /*
- * Send each device ha_main_pr_change() marked, taking it off the list
- * first: a change after that marks it again.  A device that has been
- * removed meanwhile is not found and needs nothing.  If the link is down
- * the sends fail; the LUN_SYNC of every device when it comes back covers
- * them.
+ * Full sync: every device's LUN_SYNC, then LUN_SYNC_DONE, all on the
+ * connection that is up when it starts.  If the link drops and comes
+ * back meanwhile, the rest is refused, and the full sync the new
+ * connection requested runs next: a LUN_SYNC_DONE from this pass cannot
+ * reach STANDBY after a device it did not send.  LUN_SYNC_DONE is held
+ * back while any device could not be sent.  Returns 0, or the delay after
+ * which the full sync is to be tried again.
+ */
+static unsigned long ha_main_full_sync(void)
+{
+	struct lio_ha_msg_lun_sync_done done = {};
+	struct ha_main_sync_ctx ctx = {};
+	enum lio_ha_state state;
+
+	spin_lock(&lio_ha_cfg.lock);
+	state = lio_ha_cfg.ha_state;
+	spin_unlock(&lio_ha_cfg.lock);
+	if (state != LIO_HA_CONNECTED || atomic_read(&lio_ha_forward_active))
+		return 0;
+
+	ctx.gen = lio_ha_tcp_generation();
+	lio_ha_dbg(1, "ACTIVE: sending LUN_SYNC for all devices\n");
+	target_for_each_device(ha_main_sync_device_cb, &ctx);
+
+	if (ctx.send_err)
+		return 0;	/* the next connection's full sync covers it */
+	if (ctx.enomem || ctx.too_large) {
+		pr_warn("lio_ha: LUN_SYNC not complete; ha_state stays connected, retrying\n");
+		return ctx.too_large ? HA_MAIN_PR_TOO_LARGE_DELAY :
+				       HA_MAIN_PR_RETRY_DELAY;
+	}
+
+	done.hdr.type     = cpu_to_be32(LIO_HA_MSG_LUN_SYNC_DONE);
+	done.hdr.reserved = 0;
+	if (lio_ha_tcp_send_gen(LIO_HA_CHAN_CTL, &done, sizeof(done), ctx.gen)) {
+		pr_debug("lio_ha: LUN_SYNC_DONE send failed\n");
+		return 0;
+	}
+	/* Not if the link has dropped, or been replaced, since. */
+	spin_lock(&lio_ha_cfg.lock);
+	if (lio_ha_cfg.ha_state == LIO_HA_CONNECTED &&
+	    lio_ha_tcp_generation() == ctx.gen)
+		lio_ha_cfg.ha_state = LIO_HA_SYNCED;
+	spin_unlock(&lio_ha_cfg.lock);
+	pr_info("lio_ha: LUN_SYNC complete -- ha_state = synced\n");
+	return 0;
+}
+
+/*
+ * Send what is pending: a full sync if one was asked for, else each
+ * device ha_main_pr_change() marked, taking it off the list first (a
+ * change after that marks it again).  A device that has been removed
+ * meanwhile is not found and needs nothing.  A device whose state could
+ * not be read is marked again and retried after a delay.  One that can
+ * never fit lowers ha_state to CONNECTED, as STANDBY's copy is now stale,
+ * and asks for a full sync later.  A failed send needs nothing: the full
+ * sync of the next connection covers it.
  */
 static void ha_main_pr_sync_work_fn(struct work_struct *work)
 {
-	struct ha_main_pr_dirty *d, *tmp;
+	struct ha_main_pr_dirty *d, *x, *tmp;
+	unsigned long retry_full = 0, retry = 0;
 	LIST_HEAD(all_list);
-	bool all;
+	LIST_HEAD(retry_list);
+	bool all, full, retry_all = false;
 
+	/*
+	 * Retries are only noted here and asked for once the work is done:
+	 * asked for at once, this loop would pick them up again at once.
+	 */
 	for (;;) {
+		struct ha_main_sync_ctx ctx = {};
+
 		spin_lock(&ha_main_pr_dirty_lock);
+		full = ha_main_full_sync_pending;
+		ha_main_full_sync_pending = false;
 		all = ha_main_pr_dirty_all;
 		ha_main_pr_dirty_all = false;
-		if (all)
+		if (all || full)
 			list_splice_init(&ha_main_pr_dirty_list, &all_list);
 		d = list_first_entry_or_null(&ha_main_pr_dirty_list,
 					     struct ha_main_pr_dirty, list);
@@ -701,24 +848,58 @@ static void ha_main_pr_sync_work_fn(struct work_struct *work)
 			list_del(&d->list);
 		spin_unlock(&ha_main_pr_dirty_lock);
 
-		if (all) {
-			list_for_each_entry_safe(d, tmp, &all_list, list) {
-				list_del(&d->list);
-				kfree(d);
-			}
-			target_for_each_device(ha_main_send_lun_sync_for_device,
-					       NULL);
+		/*
+		 * A full sync, or a pass over all devices, covers the list.
+		 * Not iterated with d: list_for_each_entry_safe() sets its
+		 * cursor even when the list is empty.
+		 */
+		list_for_each_entry_safe(x, tmp, &all_list, list) {
+			list_del(&x->list);
+			kfree(x);
+		}
+		if (full) {
+			retry_full = max(retry_full, ha_main_full_sync());
 			continue;
 		}
-		if (!d)
+		if (all) {
+			target_for_each_device(ha_main_sync_device_cb, &ctx);
+			if (ctx.enomem)
+				retry_all = true;
+		} else if (d) {
+			ctx.name = d->dev_name;
+			target_for_each_device(ha_main_sync_device_cb, &ctx);
+			if (ctx.found && ctx.enomem)
+				list_add_tail(&d->list, &retry_list);
+			else
+				kfree(d);
+		} else {
 			break;
-		target_for_each_device(ha_main_send_lun_sync_if_named,
-				       d->dev_name);
-		kfree(d);
+		}
+		if (ctx.too_large) {
+			ha_main_unsync();
+			retry_full = max_t(unsigned long, retry_full,
+					   HA_MAIN_PR_TOO_LARGE_DELAY);
+		}
 	}
+
+	if (retry_all || !list_empty(&retry_list))
+		retry = HA_MAIN_PR_RETRY_DELAY;
+	if (retry_full && (!retry || retry_full < retry))
+		retry = retry_full;
+	if (!retry)
+		return;
+	spin_lock(&ha_main_pr_dirty_lock);
+	if (retry_all)
+		ha_main_pr_dirty_all = true;
+	if (retry_full)
+		ha_main_full_sync_pending = true;
+	list_splice_tail(&retry_list, &ha_main_pr_dirty_list);
+	spin_unlock(&ha_main_pr_dirty_lock);
+	/* Once, with the shortest delay: a later queueing cannot shorten it. */
+	ha_main_pr_sync_queue(retry);
 }
 
-/* Free the dirty list.  Called at module exit, after the work is flushed. */
+/* Free the dirty list.  Called at module exit, after the work is stopped. */
 static void ha_main_pr_dirty_flush(void)
 {
 	struct ha_main_pr_dirty *d, *tmp;
@@ -728,56 +909,17 @@ static void ha_main_pr_dirty_flush(void)
 		kfree(d);
 	}
 	ha_main_pr_dirty_all = false;
-}
-
-/*
- * ACTIVE-side bulk LUN_SYNC: send LUN_SYNC for every device, then a
- * LUN_SYNC_DONE; on successful send, advance our own ha_state to SYNCED.
- *
- * Two callers fire this:
- *   1. ha_main_on_connect() -- wire just came up while we are PRIMARY.
- *   2. lio_ha_forward_active_store(0) -- we just became PRIMARY while
- *      the wire was already up (delayed failover).
- *
- * Self-gated on ha_state so both callers can invoke unconditionally:
- *   DISCONNECTED -> no-op (the connect handler will fire when wire returns).
- *   CONNECTED    -> send LUN_SYNC + LUN_SYNC_DONE; flip to SYNCED on success.
- *   SYNCED       -> no-op (already done; idempotent).
- */
-static void ha_main_send_lun_sync_all(void)
-{
-	struct lio_ha_msg_lun_sync_done done = {};
-	enum lio_ha_state state;
-
-	spin_lock(&lio_ha_cfg.lock);
-	state = lio_ha_cfg.ha_state;
-	spin_unlock(&lio_ha_cfg.lock);
-
-	if (state != LIO_HA_CONNECTED)
-		return;
-
-	lio_ha_dbg(1, "ACTIVE: sending LUN_SYNC for all devices\n");
-	target_for_each_device(ha_main_send_lun_sync_for_device, NULL);
-
-	done.hdr.type     = cpu_to_be32(LIO_HA_MSG_LUN_SYNC_DONE);
-	done.hdr.reserved = 0;
-	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &done, sizeof(done))) {
-		pr_debug("lio_ha: LUN_SYNC_DONE send failed\n");
-		return;
-	}
-	spin_lock(&lio_ha_cfg.lock);
-	lio_ha_cfg.ha_state = LIO_HA_SYNCED;
-	spin_unlock(&lio_ha_cfg.lock);
-	pr_info("lio_ha: LUN_SYNC complete -- ha_state = synced\n");
+	ha_main_full_sync_pending = false;
 }
 
 /*
  * TCP connect handler -- registered with lio_ha_tcp_register_connect_handler().
  * Called on both ACTIVE and STANDBY whenever the HA TCP link comes up.
  *
- * ACTIVE (forward_active == 0): sends bulk PR state (LUN_SYNC per device,
- * then LUN_SYNC_DONE).  On successful send, ACTIVE advances ha_state to
- * SYNCED; STANDBY advances to SYNCED on receipt of LUN_SYNC_DONE.
+ * ACTIVE (forward_active == 0): asks for a full sync (LUN_SYNC per device,
+ * then LUN_SYNC_DONE), which ha_main_pr_sync_work sends.  On successful
+ * send, ACTIVE advances ha_state to SYNCED; STANDBY advances to SYNCED on
+ * receipt of LUN_SYNC_DONE.
  *
  * STANDBY (forward_active == 1): replays SESSION_CONNECT for every live
  * initiator session tracked in ha_main_sess_list.  ACTIVE dropped all of
@@ -824,8 +966,8 @@ static void ha_main_on_connect(void)
 		return;
 	}
 
-	/* ACTIVE: send bulk PR state. */
-	ha_main_send_lun_sync_all();
+	/* ACTIVE: send the PR state of every device, from the work item. */
+	ha_main_request_full_sync();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1367,11 +1509,12 @@ static ssize_t lio_ha_forward_active_store(struct config_item *item,
 		 * delayed failover -- the new SECONDARY came back online
 		 * before middleware wrote forward_active=0 here), the
 		 * connect-handler trigger already fired with us still in
-		 * STANDBY mode and did NOT send LUN_SYNC.  Fire it now.
-		 * Idempotent with the connect-handler path: the helper
-		 * self-gates on ha_state and only sends when CONNECTED.
+		 * STANDBY mode and did NOT send LUN_SYNC.  Ask for it now.
+		 * The work item sends it, not this writer: a signal to the
+		 * writer would fail a blocking send and drop the link.  It
+		 * gates on ha_state and only sends when CONNECTED.
 		 */
-		ha_main_send_lun_sync_all();
+		ha_main_request_full_sync();
 
 		module_put(THIS_MODULE);
 	}
@@ -1489,6 +1632,8 @@ out_recv:
 	lio_ha_recv_exit();
 out_ops:
 	lio_ha_unregister_pr_notifier();
+	/* A connection made before the failure may have queued it. */
+	cancel_delayed_work_sync(&ha_main_pr_sync_work);
 	destroy_workqueue(lio_ha_pr_wq);
 	lio_ha_pr_wq = NULL;
 	lio_ha_unregister_ops();
@@ -1502,8 +1647,10 @@ static void __exit lio_ha_exit(void)
 	 * the module is torn down.  Then the PR notifier:
 	 * lio_ha_unregister_pr_notifier() calls synchronize_rcu(),
 	 * guaranteeing that no pr_change() call is in progress and no new
-	 * ones will start.  Flush and destroy the workqueue next so all
-	 * LUN_SYNC sends complete before TCP exits.
+	 * ones will start.  Then stop the sync work, which the connect
+	 * handler can still ask for until TCP exits: no queueing after
+	 * ha_main_pr_stopping is set, and the work, pending, delayed or
+	 * running, is cancelled or waited for before the workqueue goes.
 	 *
 	 * lio_ha_forward_active is 0 by the time __exit runs (the module
 	 * self-reference taken when forward_active is set to 1 prevents
@@ -1511,7 +1658,10 @@ static void __exit lio_ha_exit(void)
 	 */
 	configfs_unregister_subsystem(&lio_ha_subsys);
 	lio_ha_unregister_pr_notifier();
-	flush_workqueue(lio_ha_pr_wq);
+	spin_lock(&ha_main_pr_dirty_lock);
+	ha_main_pr_stopping = true;
+	spin_unlock(&ha_main_pr_dirty_lock);
+	cancel_delayed_work_sync(&ha_main_pr_sync_work);
 	destroy_workqueue(lio_ha_pr_wq);
 	lio_ha_pr_wq = NULL;
 	ha_main_pr_dirty_flush();

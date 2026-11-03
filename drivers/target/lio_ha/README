@@ -319,14 +319,17 @@ PERS_ACTION (A->S), type 7
 
 LUN_SYNC (A->S)
   The full PR state of one storage object.  Sent by ACTIVE when the
-  TCP link comes up, once per storage object, and after PR OUT
-  commands change an object.  Payload: a fixed header (dev_name +
+  TCP link comes up and at failover, once per storage object, and for
+  an object whose PR state changed: after a PR OUT, when the core drops
+  an initiator's registrations on a LUN unmap or ACL removal, and when
+  the object is created (it has no PR state then, so STANDBY drops
+  anything it still held under that name).  Payload: a fixed header (dev_name +
   aptpl_buf_len) followed by aptpl_buf_len bytes of APTPL-format text,
   one line per registration (target_ha_pr_export()), up to the 4 MiB
   CTL limit.  STANDBY replaces the object's entries in its in-memory PR
   table with these in one step (lio_ha_pr_replace_device()).
 
-  After a PR OUT, the notifier only marks the object; a work item sends
+  The notifier only marks the object; one work item sends everything,
   each marked object once, so a burst of PR OUT costs one LUN_SYNC.
   The snapshot and its send are made under one mutex, so the LUN_SYNCs
   for an object reach STANDBY in snapshot order and the last one is
@@ -334,9 +337,25 @@ LUN_SYNC (A->S)
   text is written after they are dropped.  Fire-and-forget: the PR OUT
   completes without waiting for STANDBY.
 
+  The full sync on link up and at failover (every object, then
+  LUN_SYNC_DONE) is only requested by the connect handler and the
+  forward_active store; the same work item sends it, so two never
+  overlap and none runs in the requester's context.  It is bound to the
+  connection that is up when it starts (lio_ha_tcp_send_gen()): if the
+  link flaps meanwhile, its remaining sends, LUN_SYNC_DONE included,
+  are refused, and the full sync the new connection requested follows.
+
+  An object whose state cannot be read (no memory) is marked again and
+  retried after a second.  One whose state can never fit in a LUN_SYNC
+  (thousands of registrations) is logged as an error, and STANDBY's
+  copy of it is stale: ACTIVE does not send LUN_SYNC_DONE, or drops
+  from SYNCED back to CONNECTED, and retries the full sync every minute.
+  Middleware then shows STANDBY's ALUA group as TRANSITIONING.
+
 LUN_SYNC_DONE (A->S)
-  Sent after all LUN_SYNC messages for the current sync cycle.  On
-  receipt STANDBY advances ha_state from CONNECTED to SYNCED.
+  Sent after all LUN_SYNC messages of a full sync, only if every one
+  of them was sent.  On receipt STANDBY advances ha_state from
+  CONNECTED to SYNCED.
 
 
 COMMAND FORWARDING FLOW
@@ -380,7 +399,7 @@ PR commands (PR IN, PR OUT) go through target_execute_cmd() on
 STANDBY and are forwarded using the same CMD_FORWARD/CMD_RESPONSE
 path as data I/O.  A successful PR OUT on ACTIVE additionally marks
 the storage object for a LUN_SYNC to STANDBY so the replicated PR
-table stays current.
+table stays current (see LUN_SYNC for the other triggers).
 
 
 IN-FLIGHT COMMAND TRACKING
@@ -446,6 +465,8 @@ Transitions:
   DISCONNECTED -> CONNECTED       TCP connection established (both nodes)
   CONNECTED -> SYNCED             LUN_SYNC_DONE sent (ACTIVE) /
                                   LUN_SYNC_DONE received (STANDBY)
+  SYNCED -> CONNECTED             ACTIVE only: an object's PR state no
+                                  longer fits in a LUN_SYNC
   CONNECTED/SYNCED -> DISCONNECTED  TCP link lost or closed (both nodes)
 
 
