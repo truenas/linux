@@ -477,7 +477,10 @@ sequence is:
             target_ha_pr_add_reg() installs the PR registration, with
             its ISID, directly into LIO core.  For ALL_TG_PT
             registrations target_ha_foreach_nacl_dev() also recreates
-            the sibling registrations on the initiator's other ports.
+            the sibling registrations on the initiator's other ports,
+            as the core creates them: without the ISID, so they match
+            any session of the initiator there.  Only the registration
+            itself and its mate on the other node keep the ISID.
             If the TPG cannot be resolved the registration is skipped
             with a warning.  Non-holders are restored first; the holder
             last so the reservation is set after all registrants exist.

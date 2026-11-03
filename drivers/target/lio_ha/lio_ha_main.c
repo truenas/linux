@@ -224,8 +224,8 @@ static struct lio_ha_pr_entry *ha_pr_list_find(struct list_head *list,
  * If @nx is one of the ALL_TG_PT sibling registrations LIO creates without
  * a discriminator on the other ports of a registrant that has one, return
  * the registrant's entry, else NULL.  That entry already stands for @nx,
- * and failover recreates it with the registrant's discriminator, so it
- * gets no entry of its own.
+ * and failover recreates it, without a discriminator as here, so it gets
+ * no entry of its own.
  */
 static struct lio_ha_pr_entry *
 ha_pr_list_registrant(struct list_head *list, const struct lio_ha_pr_entry *nx)
@@ -884,6 +884,7 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 	struct failover_reg_ctx *ctx = data;
 	u16 port_tag = ctx->port_tag;
 	u16 port_rtpi = ctx->port_rtpi;
+	const char *isid = ctx->isid;
 	bool holder;
 	int ret;
 
@@ -894,11 +895,18 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 	if (ctx->sibling) {
 		port_tag  = nacl->se_tpg->se_tpg_tfo->tpg_get_tag(nacl->se_tpg);
 		port_rtpi = lun->lun_tpg->tpg_rtpi;
+		/*
+		 * As the core creates them: an ALL_TG_PT registration's
+		 * siblings on the other ports have no discriminator, and
+		 * match any session of the initiator there; their mates copy
+		 * that.  Only the registration itself and its mate keep it.
+		 */
+		isid = NULL;
 	}
 
 	holder = ctx->res_holder && port_tag == ctx->holder_tag;
 	ret = target_ha_pr_add_reg(ctx->dev, nacl, lun, mapped_lun,
-				   ctx->isid, port_tag, port_rtpi,
+				   isid, port_tag, port_rtpi,
 				   ctx->all_tg_pt,
 				   ctx->sa_res_key,
 				   holder,
@@ -920,7 +928,7 @@ static void ha_main_failover_add_reg_cb(struct se_node_acl *nacl,
 				       mate_tag, &mate_rtpi)) {
 			holder = ctx->res_holder && mate_tag == ctx->holder_tag;
 			ret = target_ha_pr_add_reg(ctx->dev, nacl, lun,
-						   mapped_lun, ctx->isid,
+						   mapped_lun, isid,
 						   mate_tag, mate_rtpi,
 						   true, ctx->sa_res_key,
 						   holder, ctx->res_type);
