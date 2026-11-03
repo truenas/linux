@@ -1446,14 +1446,19 @@ static int __init lio_ha_init(void)
 	if (ret)
 		goto out_recv;
 
-	ret = lio_ha_tcp_init();
-	if (ret)
-		goto out_fwd;
-
+	/*
+	 * Set before the TCP threads start: a connection accepted or made
+	 * before it is set would run the connect handler as ACTIVE, sending
+	 * the peer a LUN_SYNC_DONE that marks it synced with nothing sent.
+	 */
 	if (default_forward_active) {
 		__module_get(THIS_MODULE);
 		atomic_set(&lio_ha_forward_active, 1);
 	}
+
+	ret = lio_ha_tcp_init();
+	if (ret)
+		goto out_forward;
 
 	/*
 	 * Last: once registered, middleware can write forward_active, and
@@ -1464,10 +1469,6 @@ static int __init lio_ha_init(void)
 	ret = configfs_register_subsystem(&lio_ha_subsys);
 	if (ret) {
 		pr_err("lio_ha: configfs_register_subsystem failed: %d\n", ret);
-		if (default_forward_active) {
-			atomic_set(&lio_ha_forward_active, 0);
-			module_put(THIS_MODULE);
-		}
 		goto out_tcp;
 	}
 
@@ -1477,7 +1478,12 @@ static int __init lio_ha_init(void)
 
 out_tcp:
 	lio_ha_tcp_exit();
-out_fwd:
+out_forward:
+	/* Before lio_ha_unregister_ops(), which expects forwarding off. */
+	if (default_forward_active) {
+		atomic_set(&lio_ha_forward_active, 0);
+		module_put(THIS_MODULE);
+	}
 	lio_ha_fwd_exit();
 out_recv:
 	lio_ha_recv_exit();
