@@ -94,7 +94,7 @@ void lio_ha_recv_nacl_release(struct se_node_acl *nacl);
 /**
  * lio_ha_recv_data_rx - receive WRITE data from STANDBY on ACTIVE
  * @cookie:   cmd_cookie from the DATA channel header (= STANDBY se_cmd ptr)
- * @data:     raw SCSI write data
+ * @data:     raw SCSI write data, kvmalloc'd; this function takes it
  * @len:      data length in bytes
  *
  * Buffers the data in the primary-side write-data table keyed by cookie.
@@ -104,7 +104,7 @@ void lio_ha_recv_nacl_release(struct se_node_acl *nacl);
  * Called by ha_fwd_data_handler() when the DATA channel message cookie
  * is not found in the STANDBY in-flight table.
  */
-void lio_ha_recv_data_rx(u64 cookie, const void *data, u32 len);
+void lio_ha_recv_data_rx(u64 cookie, void *data, u32 len);
 
 /**
  * lio_ha_recv_submit_cmd - submit a forwarded command to LIO core on ACTIVE

@@ -81,6 +81,8 @@
 #include <linux/atomic.h>
 #include <linux/spinlock.h>
 #include <linux/vmalloc.h>    /* kvmalloc / kvfree */
+#include <linux/hashtable.h>
+#include <linux/scatterlist.h>
 
 #include <target/target_core_ha.h>
 
@@ -123,6 +125,37 @@ static struct socket      *ha_connecting_sock; /* socket mid-kernel_connect() */
 static struct task_struct *ha_listen_task;
 static struct task_struct *ha_connect_task;
 static struct task_struct *ha_rx_task;
+static struct ha_tcp_rx   *ha_rx_state;  /* ha_rx_task's argument */
+
+/*
+ * One per rx thread, owned by it: allocated with the thread, freed by the
+ * thread on its way out (or by lio_ha_tcp_exit() if the thread was stopped
+ * before it ran).  The assembly table is touched only by the thread, so it
+ * needs no lock, and a later connection's thread has a table of its own.
+ */
+struct ha_tcp_rx {
+	struct socket *sock;
+	DECLARE_HASHTABLE(asm_ht, 6);
+	void          *drain;    /* HA_TCP_DRAIN_LEN scratch */
+};
+
+/* A DATA transfer being assembled from its chunks. */
+struct ha_tcp_asm {
+	u64               cookie;
+	u32               total;
+	u32               received;   /* == offset of the next chunk */
+	void             *buf;        /* kvmalloc(total) */
+	struct hlist_node node;
+};
+
+#define HA_TCP_DRAIN_LEN	(64 * 1024)
+
+/*
+ * Bounce buffer for lio_ha_tcp_send_data(), used and cleared under
+ * ha_send_lock: senders on the ACTIVE's completion path can still run
+ * after lio_ha_tcp_exit(), and must then see NULL, not freed memory.
+ */
+static void *ha_send_bounce;
 
 static atomic_t ha_tcp_stopping = ATOMIC_INIT(0);
 
@@ -156,7 +189,7 @@ static void (*ctl_handlers[_LIO_HA_MSG_MAX])(const void *buf, size_t len);
  * DATA-channel handler: registered by lio_ha_fwd.c at init time.
  * Called with (cookie, raw_data_ptr, raw_data_len) for each DATA message.
  */
-static void (*data_handler_fn)(u64 cookie, const void *data, u32 data_len);
+static void (*data_handler_fn)(u64 cookie, void *data, u32 data_len);
 
 /*
  * Disconnect handlers: called when the TCP link drops (not at module exit).
@@ -281,21 +314,175 @@ static int ha_tcp_dispatch_ctl(const void *payload, size_t len)
 	return 0;
 }
 
-static void ha_tcp_dispatch_data(const void *payload, u32 plen)
-{
-	const struct lio_ha_data_hdr *dhdr = payload;
+/* ------------------------------------------------------------------ */
+/* DATA-channel assembly                                               */
+/* ------------------------------------------------------------------ */
 
-	if (plen < sizeof(*dhdr)) {
-		pr_warn("ha_tcp: DATA payload too short (%u bytes)\n", plen);
-		return;
+static struct ha_tcp_rx *ha_tcp_rx_alloc(struct socket *sock)
+{
+	struct ha_tcp_rx *rx = kzalloc(sizeof(*rx), GFP_KERNEL);
+
+	if (!rx)
+		return NULL;
+	rx->drain = kvmalloc(HA_TCP_DRAIN_LEN, GFP_KERNEL);
+	if (!rx->drain) {
+		kfree(rx);
+		return NULL;
 	}
-	if (!data_handler_fn) {
-		pr_debug("ha_tcp: DATA channel: no handler registered\n");
-		return;
+	rx->sock = sock;
+	hash_init(rx->asm_ht);
+	return rx;
+}
+
+static void ha_tcp_asm_free(struct ha_tcp_asm *a)
+{
+	hash_del(&a->node);
+	kvfree(a->buf);
+	kfree(a);
+}
+
+/* Free @rx and every transfer it was still assembling. */
+static void ha_tcp_rx_free(struct ha_tcp_rx *rx)
+{
+	struct ha_tcp_asm *a;
+	struct hlist_node *tmp;
+	int bkt;
+
+	hash_for_each_safe(rx->asm_ht, bkt, tmp, a, node)
+		ha_tcp_asm_free(a);
+	kvfree(rx->drain);
+	kfree(rx);
+}
+
+static struct ha_tcp_asm *ha_tcp_asm_find(struct ha_tcp_rx *rx, u64 cookie)
+{
+	struct ha_tcp_asm *a;
+
+	hash_for_each_possible(rx->asm_ht, a, node, cookie)
+		if (a->cookie == cookie)
+			return a;
+	return NULL;
+}
+
+/*
+ * Start assembling a transfer.  NULL means the transfer is dropped: its
+ * chunks are read and discarded, and the command it belongs to gets BUSY
+ * (or, if larger than any command may be, was already refused).  Neither
+ * case is the peer's fault, so neither closes the link.
+ */
+static struct ha_tcp_asm *ha_tcp_asm_start(struct ha_tcp_rx *rx, u64 cookie,
+					   u32 total)
+{
+	struct ha_tcp_asm *a;
+
+	if (total > LIO_HA_MAX_DATA_TOTAL) {
+		pr_warn_ratelimited("ha_tcp: DATA transfer of %u bytes for cookie %016llx too large, dropped\n",
+				    total, (unsigned long long)cookie);
+		return NULL;
 	}
-	data_handler_fn(be64_to_cpu(dhdr->cmd_cookie),
-			(const u8 *)payload + sizeof(*dhdr),
-			plen - (u32)sizeof(*dhdr));
+	a = kzalloc(sizeof(*a), GFP_KERNEL);
+	if (!a)
+		goto nomem;
+	/*
+	 * kvmalloc() does not take __GFP_NORETRY.  It does not reclaim for
+	 * the contiguous attempt at this size; its vmalloc fallback may.
+	 */
+	a->buf = kvmalloc(total, GFP_KERNEL | __GFP_NOWARN);
+	if (!a->buf) {
+		kfree(a);
+		goto nomem;
+	}
+	a->cookie = cookie;
+	a->total  = total;
+	hash_add(rx->asm_ht, &a->node, cookie);
+	return a;
+
+nomem:
+	pr_warn_ratelimited("ha_tcp: no memory for a DATA transfer of %u bytes, dropped\n",
+			    total);
+	return NULL;
+}
+
+/* Read and discard @len bytes. */
+static int ha_tcp_drain(struct ha_tcp_rx *rx, u32 len)
+{
+	while (len) {
+		u32 n = min_t(u32, len, HA_TCP_DRAIN_LEN);
+		int ret = ha_tcp_recv_full(rx->sock, rx->drain, n);
+
+		if (ret)
+			return ret;
+		len -= n;
+	}
+	return 0;
+}
+
+/*
+ * Receive one DATA message of @plen bytes, the wire header already read.
+ * Returns an error only for a broken connection or a chunk no matching
+ * peer sends; both close the link.
+ */
+static int ha_tcp_rx_data(struct ha_tcp_rx *rx, u32 plen)
+{
+	struct lio_ha_data_hdr dhdr;
+	struct ha_tcp_asm *a;
+	u32 clen, total, off;
+	u64 cookie;
+	int ret;
+
+	if (plen <= sizeof(dhdr) ||
+	    plen - sizeof(dhdr) > LIO_HA_MAX_DATA_CHUNK) {
+		pr_err("ha_tcp: DATA message of %u bytes, closing the connection\n",
+		       plen);
+		return -EPROTO;
+	}
+	ret = ha_tcp_recv_full(rx->sock, &dhdr, sizeof(dhdr));
+	if (ret)
+		return ret;
+	clen   = plen - sizeof(dhdr);
+	cookie = be64_to_cpu(dhdr.cmd_cookie);
+	total  = be32_to_cpu(dhdr.total_len);
+	off    = be32_to_cpu(dhdr.offset);
+	if (off > total || clen > total - off) {
+		pr_err("ha_tcp: DATA chunk %u+%u past the end of %u, closing the connection\n",
+		       off, clen, total);
+		return -EPROTO;
+	}
+
+	a = ha_tcp_asm_find(rx, cookie);
+	if (off == 0) {
+		/*
+		 * Offset 0 starts a transfer.  Cookies are se_cmd pointers and
+		 * are reused, so a partial transfer under the same cookie is a
+		 * dropped one: discard it.
+		 */
+		if (a)
+			ha_tcp_asm_free(a);
+		a = ha_tcp_asm_start(rx, cookie, total);
+	} else if (a && (a->total != total || a->received != off)) {
+		pr_warn_ratelimited("ha_tcp: DATA chunk out of sequence for cookie %016llx, dropped\n",
+				    (unsigned long long)cookie);
+		ha_tcp_asm_free(a);
+		a = NULL;
+	}
+	if (!a)
+		return ha_tcp_drain(rx, clen);
+
+	ret = ha_tcp_recv_full(rx->sock, (u8 *)a->buf + off, clen);
+	if (ret)
+		return ret;
+	a->received += clen;
+	if (a->received == a->total) {
+		void *buf = a->buf;
+
+		hash_del(&a->node);
+		kfree(a);
+		if (data_handler_fn)
+			data_handler_fn(cookie, buf, total);
+		else
+			kvfree(buf);
+	}
+	return 0;
 }
 
 /* Forward declarations for functions used before their definitions. */
@@ -314,6 +501,7 @@ static void ha_tcp_on_disconnected(struct socket *sock);
 static void ha_tcp_on_connected(struct socket *sock)
 {
 	struct task_struct *rx;
+	struct ha_tcp_rx *rxs;
 
 	mutex_lock(&ha_tcp_lock);
 
@@ -365,18 +553,28 @@ static void ha_tcp_on_connected(struct socket *sock)
 	if (ha_rx_task) {
 		kthread_stop(ha_rx_task);
 		put_task_struct(ha_rx_task);
-		ha_rx_task = NULL;
+		ha_rx_task  = NULL;
+		ha_rx_state = NULL;	/* freed by the thread */
 	}
 
-	rx = kthread_create(ha_tcp_rx_fn, sock, "lio_ha_rx");
+	rxs = ha_tcp_rx_alloc(sock);
+	if (!rxs) {
+		pr_err("ha_tcp: no memory for the rx thread's state\n");
+		mutex_unlock(&ha_tcp_lock);
+		sock_release(sock);
+		return;
+	}
+	rx = kthread_create(ha_tcp_rx_fn, rxs, "lio_ha_rx");
 	if (IS_ERR(rx)) {
 		pr_err("ha_tcp: failed to start rx thread: %ld\n", PTR_ERR(rx));
+		ha_tcp_rx_free(rxs);
 		mutex_unlock(&ha_tcp_lock);
 		sock_release(sock);
 		return;
 	}
 	get_task_struct(rx);
 	ha_rx_task   = rx;
+	ha_rx_state  = rxs;
 	ha_conn_sock = sock;
 	atomic64_inc(&ha_conn_gen);
 	wake_up_process(rx);
@@ -461,7 +659,8 @@ done:
 
 static int ha_tcp_rx_fn(void *arg)
 {
-	struct socket *sock = arg;
+	struct ha_tcp_rx *rx = arg;
+	struct socket *sock = rx->sock;
 	struct lio_ha_wire_hdr hdr;
 	void *payload;
 	u32 channel, plen;
@@ -496,15 +695,15 @@ static int ha_tcp_rx_fn(void *arg)
 			ret = -EPROTO;
 			goto out;
 		}
-		if (channel == LIO_HA_CHAN_CTL &&
-		    plen > LIO_HA_MAX_CTL_PAYLOAD) {
-			pr_err("ha_tcp: CTL payload (%u bytes) too large, dropping\n", plen);
-			ret = -EMSGSIZE;
-			goto out;
+		if (channel == LIO_HA_CHAN_DATA) {
+			/* Read straight into the transfer's buffer. */
+			ret = ha_tcp_rx_data(rx, plen);
+			if (ret)
+				goto out;
+			continue;
 		}
-		if (channel == LIO_HA_CHAN_DATA &&
-		    plen > LIO_HA_MAX_DATA_PAYLOAD) {
-			pr_err("ha_tcp: DATA payload (%u bytes) too large, dropping\n", plen);
+		if (plen > LIO_HA_MAX_CTL_PAYLOAD) {
+			pr_err("ha_tcp: CTL payload (%u bytes) too large, dropping\n", plen);
 			ret = -EMSGSIZE;
 			goto out;
 		}
@@ -522,11 +721,7 @@ static int ha_tcp_rx_fn(void *arg)
 			goto out;
 		}
 
-		if (channel == LIO_HA_CHAN_CTL)
-			ret = ha_tcp_dispatch_ctl(payload, plen);
-		else
-			ha_tcp_dispatch_data(payload, plen);
-
+		ret = ha_tcp_dispatch_ctl(payload, plen);
 		kvfree(payload);
 		if (ret)
 			goto out;
@@ -537,6 +732,8 @@ out:
 		pr_debug("ha_tcp: rx error %d\n", ret);
 
 	ha_tcp_on_disconnected(sock);
+	/* Partial transfers go with the connection. */
+	ha_tcp_rx_free(rx);
 	return 0;
 }
 
@@ -786,26 +983,32 @@ int lio_ha_tcp_send(enum lio_ha_channel chan, const void *payload, u32 len)
 	return lio_ha_tcp_send_gen(chan, payload, len, 0);
 }
 
-int lio_ha_tcp_send_gen(enum lio_ha_channel chan, const void *payload,
-			u32 len, u64 gen)
+/*
+ * Send one message whose payload is @p1 followed by @p2 (either may be
+ * empty), on the connection of generation @gen (0: whichever is up).
+ * Called with ha_send_lock held.
+ */
+static int __ha_tcp_send(enum lio_ha_channel chan, const void *p1, u32 l1,
+			 const void *p2, u32 l2, u64 gen)
 {
 	struct lio_ha_wire_hdr hdr = {
 		.magic   = cpu_to_be32(LIO_HA_WIRE_MAGIC),
 		.version = cpu_to_be16(LIO_HA_WIRE_VERSION),
 		.channel = cpu_to_be16(chan),
-		.length  = cpu_to_be32(len),
+		.length  = cpu_to_be32(l1 + l2),
 	};
 	struct socket *sock;
 	int ret = -ENOTCONN;
+
+	lockdep_assert_held(&ha_send_lock);
 
 	/*
 	 * Read ha_conn_sock with ha_send_lock held.  The socket may be
 	 * disconnected after we drop ha_tcp_lock, but whoever clears
 	 * ha_conn_sock waits for ha_send_lock before sock_release() (see
-	 * ha_tcp_on_disconnected), so the pointer stays valid until we drop
-	 * ha_send_lock.
+	 * ha_tcp_on_disconnected), so the pointer stays valid until our
+	 * caller drops ha_send_lock.
 	 */
-	mutex_lock(&ha_send_lock);
 	mutex_lock(&ha_tcp_lock);
 	sock = ha_conn_sock;
 	/* A later connection than the caller's: refuse, as if down. */
@@ -815,8 +1018,10 @@ int lio_ha_tcp_send_gen(enum lio_ha_channel chan, const void *payload,
 
 	if (sock) {
 		ret = ha_tcp_send_full(sock, &hdr, sizeof(hdr));
-		if (!ret && len > 0)
-			ret = ha_tcp_send_full(sock, payload, len);
+		if (!ret && l1)
+			ret = ha_tcp_send_full(sock, p1, l1);
+		if (!ret && l2)
+			ret = ha_tcp_send_full(sock, p2, l2);
 		/*
 		 * A failed send may have written part of the message, and
 		 * the stream can no longer be framed: close the connection.
@@ -828,12 +1033,61 @@ int lio_ha_tcp_send_gen(enum lio_ha_channel chan, const void *payload,
 			kernel_sock_shutdown(sock, SHUT_RDWR);
 		}
 	}
-	mutex_unlock(&ha_send_lock);
-
 	return ret;
 }
 
-void lio_ha_tcp_register_data_handler(void (*handler)(u64 cookie, const void *data, u32 data_len))
+int lio_ha_tcp_send_gen(enum lio_ha_channel chan, const void *payload,
+			u32 len, u64 gen)
+{
+	int ret;
+
+	mutex_lock(&ha_send_lock);
+	ret = __ha_tcp_send(chan, payload, len, NULL, 0, gen);
+	mutex_unlock(&ha_send_lock);
+	return ret;
+}
+
+int lio_ha_tcp_send_data(u64 cookie, struct scatterlist *sg,
+			 unsigned int nents, u32 total, u64 gen)
+{
+	u32 off = 0;
+
+	while (off < total) {
+		u32 n = min_t(u32, LIO_HA_DATA_CHUNK, total - off);
+		struct lio_ha_data_hdr dhdr = {
+			.cmd_cookie = cpu_to_be64(cookie),
+			.total_len  = cpu_to_be32(total),
+			.offset     = cpu_to_be32(off),
+		};
+		int ret;
+
+		/*
+		 * The lock is taken per chunk, so other messages can go out
+		 * between the chunks of a large transfer.
+		 */
+		mutex_lock(&ha_send_lock);
+		/* Cleared under ha_send_lock by lio_ha_tcp_exit(). */
+		if (!ha_send_bounce) {
+			mutex_unlock(&ha_send_lock);
+			return -ENOTCONN;
+		}
+		if (sg_pcopy_to_buffer(sg, nents, ha_send_bounce, n, off) != n) {
+			/* Nothing of this chunk was sent: the stream is fine. */
+			mutex_unlock(&ha_send_lock);
+			WARN_ONCE(1, "ha_tcp: data shorter than %u bytes\n", total);
+			return -EIO;
+		}
+		ret = __ha_tcp_send(LIO_HA_CHAN_DATA, &dhdr, sizeof(dhdr),
+				    ha_send_bounce, n, gen);
+		mutex_unlock(&ha_send_lock);
+		if (ret)
+			return ret;
+		off += n;
+	}
+	return 0;
+}
+
+void lio_ha_tcp_register_data_handler(void (*handler)(u64 cookie, void *data, u32 data_len))
 {
 	data_handler_fn = handler;
 }
@@ -866,6 +1120,10 @@ void lio_ha_tcp_register_ctl_handler(u32 msg_type,
 
 int lio_ha_tcp_init(void)
 {
+	ha_send_bounce = kvmalloc(LIO_HA_DATA_CHUNK, GFP_KERNEL);
+	if (!ha_send_bounce)
+		return -ENOMEM;
+
 	/*
 	 * Each channel thread can return on its own, e.g. when bind() or
 	 * listen() fails, and a kthread that has returned is freed unless
@@ -883,6 +1141,8 @@ int lio_ha_tcp_init(void)
 
 		pr_err("ha_tcp: failed to start listen thread: %d\n", err);
 		ha_listen_task = NULL;
+		kvfree(ha_send_bounce);
+		ha_send_bounce = NULL;
 		return err;
 	}
 	get_task_struct(ha_listen_task);
@@ -897,6 +1157,8 @@ int lio_ha_tcp_init(void)
 		kthread_stop(ha_listen_task);
 		put_task_struct(ha_listen_task);
 		ha_listen_task = NULL;
+		kvfree(ha_send_bounce);
+		ha_send_bounce = NULL;
 		return err;
 	}
 	get_task_struct(ha_connect_task);
@@ -909,7 +1171,9 @@ int lio_ha_tcp_init(void)
 void lio_ha_tcp_exit(void)
 {
 	struct task_struct *task;
+	struct ha_tcp_rx *rxs;
 	struct socket *sock;
+	void *bounce;
 
 	atomic_set(&ha_tcp_stopping, 1);
 
@@ -951,10 +1215,14 @@ void lio_ha_tcp_exit(void)
 	 */
 	mutex_lock(&ha_tcp_lock);
 	task = ha_rx_task;
-	ha_rx_task = NULL;
+	rxs  = ha_rx_state;
+	ha_rx_task  = NULL;
+	ha_rx_state = NULL;
 	mutex_unlock(&ha_tcp_lock);
 	if (task) {
-		kthread_stop(task);
+		/* -EINTR: stopped before it ran, so it did not free its state. */
+		if (kthread_stop(task) == -EINTR)
+			ha_tcp_rx_free(rxs);
 		put_task_struct(task);
 	}
 
@@ -968,6 +1236,12 @@ void lio_ha_tcp_exit(void)
 		mutex_unlock(&ha_send_lock);
 		sock_release(sock);
 	}
+
+	mutex_lock(&ha_send_lock);
+	bounce = ha_send_bounce;
+	ha_send_bounce = NULL;
+	mutex_unlock(&ha_send_lock);
+	kvfree(bounce);
 
 	atomic_set(&ha_tcp_stopping, 0);
 	pr_debug("ha_tcp: channel stopped\n");

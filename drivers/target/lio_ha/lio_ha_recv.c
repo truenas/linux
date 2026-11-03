@@ -224,27 +224,18 @@ static void ha_recv_send_cmd_response(struct se_cmd *cmd, u64 cookie,
 /* Send DATA (READ response), then CMD_RESPONSE. */
 static void ha_recv_send_cmd_response_with_data(struct se_cmd *cmd, u64 cookie)
 {
-	size_t data_len = cmd->data_length;
-	size_t buf_len  = sizeof(struct lio_ha_data_hdr) + data_len;
-	struct lio_ha_data_hdr *dhdr;
-	bool data_lost = true;
-	u8 *buf;
+	bool data_lost = false;
 
-	buf = kvmalloc(buf_len, GFP_KERNEL);
-	if (buf) {
-		dhdr = (struct lio_ha_data_hdr *)buf;
-		dhdr->cmd_cookie = cpu_to_be64(cookie);
-		sg_copy_to_buffer(cmd->t_data_sg, cmd->t_data_nents,
-				  buf + sizeof(*dhdr), data_len);
-		if (lio_ha_tcp_send(LIO_HA_CHAN_DATA, buf, (u32)buf_len))
-			pr_debug("ha_recv: DATA send failed cookie=%llu\n",
-				 (unsigned long long)cookie);
-		else
-			data_lost = false;
-		kvfree(buf);
-	} else {
-		pr_warn_ratelimited("ha_recv: no memory for %zu bytes of READ data; BUSY\n",
-				    data_len);
+	/*
+	 * No generation needed: on link loss the disconnect handler waits
+	 * for this command before a new connection is accepted, so a send
+	 * after the drop fails rather than reaching the next connection.
+	 */
+	if (lio_ha_tcp_send_data(cookie, cmd->t_data_sg, cmd->t_data_nents,
+				 cmd->data_length, 0)) {
+		pr_debug("ha_recv: DATA send failed cookie=%llu\n",
+			 (unsigned long long)cookie);
+		data_lost = true;
 	}
 
 	ha_recv_send_cmd_response(cmd, cookie, data_lost);
@@ -317,7 +308,14 @@ static int ha_recv_write_pending(struct se_cmd *cmd)
 	}
 	spin_unlock(&ha_recv_data_lock);
 
-	if (de) {
+	/*
+	 * The data can be longer than this command's data_length: STANDBY
+	 * does not parse the CDB and sends the initiator's whole expected
+	 * transfer, which LIO here may have cut to the CDB's length.  The
+	 * copy is bounded by t_data_sg.  Shorter would execute a WRITE with
+	 * part of its data missing.
+	 */
+	if (de && de->len >= cmd->data_length) {
 		lio_ha_dbg(3, "write_pending: cookie=%016llx len=%u\n",
 			   (unsigned long long)hcmd->cookie, de->len);
 		sg_copy_from_buffer(cmd->t_data_sg, cmd->t_data_nents,
@@ -328,9 +326,16 @@ static int ha_recv_write_pending(struct se_cmd *cmd)
 		return 0;
 	}
 
-	/* Shouldn't happen on an ordered TCP stream; fail gracefully. */
-	WARN_ONCE(1, "ha_recv: write_pending: no data for cookie %llu\n",
-		  (unsigned long long)hcmd->cookie);
+	/*
+	 * The data did not arrive whole: the rx thread dropped the transfer
+	 * (no memory, or out of sequence).  The initiator retries on BUSY.
+	 */
+	pr_warn_ratelimited("ha_recv: write_pending: %s data for cookie %llu; BUSY\n",
+			    de ? "short" : "no", (unsigned long long)hcmd->cookie);
+	if (de) {
+		kvfree(de->data);
+		kfree(de);
+	}
 	target_complete_cmd(cmd, SAM_STAT_BUSY);
 	return 0;
 }
@@ -425,6 +430,24 @@ static const struct target_core_fabric_ops ha_recv_ops = {
 /* ------------------------------------------------------------------ */
 
 /*
+ * Answer a CMD_FORWARD that is not submitted with CHECK CONDITION,
+ * ILLEGAL REQUEST, INVALID FIELD IN CDB.  @cookie is as on the wire.
+ */
+static void ha_recv_reject_cmd(__be64 cookie)
+{
+	u8 buf[sizeof(struct lio_ha_msg_cmd_response) + 18] = {};
+	struct lio_ha_msg_cmd_response *resp = (void *)buf;
+
+	resp->hdr.type    = cpu_to_be32(LIO_HA_MSG_CMD_RESPONSE);
+	resp->cmd_cookie  = cookie;
+	resp->scsi_status = SAM_STAT_CHECK_CONDITION;
+	resp->sense_len   = 18;
+	scsi_build_sense_buffer(0, buf + sizeof(*resp),
+				ILLEGAL_REQUEST, 0x24, 0x00);
+	lio_ha_tcp_send(LIO_HA_CHAN_CTL, buf, sizeof(buf));
+}
+
+/*
  * Decode CMD_FORWARD and dispatch to lio_ha_recv_submit_cmd().
  * Registered with the TCP layer in lio_ha_recv_init().
  */
@@ -443,18 +466,17 @@ static void ha_recv_cmd_forward_handler(const void *buf, size_t len)
 	 * forward a longer CDB, so this is a misbehaving peer.
 	 */
 	if (scsi_command_size(fwd->cdb) > LIO_HA_CDB_LEN) {
-		u8 buf[sizeof(struct lio_ha_msg_cmd_response) + 18] = {};
-		struct lio_ha_msg_cmd_response *resp = (void *)buf;
-
 		pr_warn_ratelimited("ha_recv: CMD_FORWARD CDB 0x%02x longer than %d bytes\n",
 				    fwd->cdb[0], LIO_HA_CDB_LEN);
-		resp->hdr.type    = cpu_to_be32(LIO_HA_MSG_CMD_RESPONSE);
-		resp->cmd_cookie  = fwd->cmd_cookie;
-		resp->scsi_status = SAM_STAT_CHECK_CONDITION;
-		resp->sense_len   = 18;
-		scsi_build_sense_buffer(0, buf + sizeof(*resp),
-					ILLEGAL_REQUEST, 0x24, 0x00);
-		lio_ha_tcp_send(LIO_HA_CHAN_CTL, buf, sizeof(buf));
+		ha_recv_reject_cmd(fwd->cmd_cookie);
+		return;
+	}
+	/* STANDBY refuses these too; its data was not assembled. */
+	if (be64_to_cpu(fwd->data_length) > LIO_HA_MAX_DATA_TOTAL) {
+		pr_warn_ratelimited("ha_recv: CMD_FORWARD transfer of %llu bytes too large\n",
+				    (unsigned long long)be64_to_cpu(fwd->data_length));
+		ha_recv_flush_data(be64_to_cpu(fwd->cmd_cookie));
+		ha_recv_reject_cmd(fwd->cmd_cookie);
 		return;
 	}
 
@@ -922,20 +944,18 @@ void lio_ha_recv_session_destroy(u64 session_id)
 		(unsigned long long)session_id);
 }
 
-void lio_ha_recv_data_rx(u64 cookie, const void *data, u32 len)
+void lio_ha_recv_data_rx(u64 cookie, void *data, u32 len)
 {
 	struct ha_recv_data_entry *de;
 
+	/* Dropped: write_pending() then completes the command with BUSY. */
 	de = kzalloc(sizeof(*de), GFP_KERNEL);
-	if (!de)
-		return;
-	de->cmd_cookie = cookie;
-	de->data = kvmalloc(len, GFP_KERNEL);
-	if (!de->data) {
-		kfree(de);
+	if (!de) {
+		kvfree(data);
 		return;
 	}
-	memcpy(de->data, data, len);
+	de->cmd_cookie = cookie;
+	de->data = data;
 	de->len = len;
 
 	spin_lock(&ha_recv_data_lock);

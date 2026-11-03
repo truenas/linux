@@ -139,27 +139,10 @@ static struct ha_fwd_entry *ha_fwd_entry_alloc(u64 cookie, struct se_cmd *cmd)
  */
 static int ha_fwd_send_write_data(struct se_cmd *cmd, u64 cookie, u64 gen)
 {
-	size_t data_len = cmd->data_length;
-	size_t buf_len  = sizeof(struct lio_ha_data_hdr) + data_len;
-	struct lio_ha_data_hdr *dhdr;
-	u8 *buf;
-	int ret;
-
-	buf = kvmalloc(buf_len, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	dhdr = (struct lio_ha_data_hdr *)buf;
-	dhdr->cmd_cookie = cpu_to_be64(cookie);
-
-	sg_copy_to_buffer(cmd->t_data_sg, cmd->t_data_nents,
-			  buf + sizeof(*dhdr), data_len);
-
-	lio_ha_dbg(3, "fwd write data: cookie=%016llx len=%zu\n",
-		   (unsigned long long)cookie, data_len);
-	ret = lio_ha_tcp_send_gen(LIO_HA_CHAN_DATA, buf, (u32)buf_len, gen);
-	kvfree(buf);
-	return ret;
+	lio_ha_dbg(3, "fwd write data: cookie=%016llx len=%u\n",
+		   (unsigned long long)cookie, cmd->data_length);
+	return lio_ha_tcp_send_data(cookie, cmd->t_data_sg, cmd->t_data_nents,
+				    cmd->data_length, gen);
 }
 
 /* Build and send CMD_FORWARD on the CTL channel. */
@@ -201,6 +184,19 @@ void lio_ha_forward_cmd(struct se_cmd *cmd)
 	 * length CDB would reach ACTIVE cut short, so refuse it here.
 	 */
 	if (scsi_command_size(cmd->t_task_cdb) > LIO_HA_CDB_LEN) {
+		target_complete_cmd_with_sense(cmd, SAM_STAT_CHECK_CONDITION,
+					       TCM_INVALID_CDB_FIELD);
+		return;
+	}
+	/*
+	 * Neither node assembles a transfer above LIO_HA_MAX_DATA_TOTAL.
+	 * No initiator that honours the advertised maximum transfer length
+	 * asks for one; refuse it here rather than send data the ACTIVE
+	 * would drop.
+	 */
+	if (cmd->data_length > LIO_HA_MAX_DATA_TOTAL) {
+		pr_warn_ratelimited("ha_fwd: transfer of %u bytes too large to forward\n",
+				    cmd->data_length);
 		target_complete_cmd_with_sense(cmd, SAM_STAT_CHECK_CONDITION,
 					       TCM_INVALID_CDB_FIELD);
 		return;
@@ -637,7 +633,8 @@ static void ha_fwd_tmr_response_handler(const void *buf, size_t len)
 /* ------------------------------------------------------------------ */
 
 /*
- * Called by the TCP rx kthread for each DATA-channel message.
+ * Called by the TCP rx kthread with each assembled DATA transfer, which
+ * it hands over: @data is kvmalloc'd and this function keeps or frees it.
  *
  * READ response (A->S): cookie matches an entry in ha_fwd_ht -> buffer the
  * data until the CMD_RESPONSE arrives.
@@ -645,7 +642,7 @@ static void ha_fwd_tmr_response_handler(const void *buf, size_t len)
  * WRITE data (S->A): cookie not in ha_fwd_ht -> forward to lio_ha_recv_data_rx()
  * on the ACTIVE side (both roles run in the same module).
  */
-static void ha_fwd_data_handler(u64 cookie, const void *data, u32 data_len)
+static void ha_fwd_data_handler(u64 cookie, void *data, u32 data_len)
 {
 	struct ha_fwd_entry *e = NULL;
 
@@ -665,16 +662,13 @@ static void ha_fwd_data_handler(u64 cookie, const void *data, u32 data_len)
 		struct ha_fwd_data_entry *de = kzalloc(sizeof(*de), GFP_KERNEL);
 
 		/* Dropped: the CMD_RESPONSE handler then completes with BUSY. */
-		if (!de)
-			return;
-		de->cookie = cookie;
-		de->data   = kvmalloc(data_len, GFP_KERNEL);
-		if (!de->data) {
-			kfree(de);
+		if (!de) {
+			kvfree(data);
 			return;
 		}
-		memcpy(de->data, data, data_len);
-		de->len = data_len;
+		de->cookie = cookie;
+		de->data   = data;
+		de->len    = data_len;
 
 		spin_lock(&ha_fwd_data_lock);
 		hash_add(ha_fwd_data_ht, &de->node, cookie);
@@ -687,6 +681,7 @@ static void ha_fwd_data_handler(u64 cookie, const void *data, u32 data_len)
 		 */
 		pr_warn_ratelimited("ha_fwd: DATA for unknown cookie %016llx, dropped\n",
 				    (unsigned long long)cookie);
+		kvfree(data);
 	} else {
 		lio_ha_dbg(3, "data rx: WRITE data cookie=%016llx len=%u\n",
 			   (unsigned long long)cookie, data_len);

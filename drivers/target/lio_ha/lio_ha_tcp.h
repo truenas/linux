@@ -25,11 +25,13 @@
 #include <linux/types.h>
 #include "lio_ha_wire.h"
 
+struct scatterlist;
+
 /*
  * Maximum CTL-channel payload size (enforced by the rx loop).  The largest
  * CTL message is a LUN_SYNC, which carries all of one device's PR
  * registrations: 4 MiB holds several thousand even with the longest names.
- * DATA-channel payloads have their own limit, LIO_HA_MAX_DATA_PAYLOAD.
+ * DATA-channel messages carry at most LIO_HA_MAX_DATA_CHUNK of data.
  */
 #define LIO_HA_MAX_CTL_PAYLOAD    (4 * 1024 * 1024)   /* 4 MiB */
 
@@ -74,20 +76,36 @@ int lio_ha_tcp_send_gen(enum lio_ha_channel chan, const void *payload,
 			u32 len, u64 gen);
 
 /**
+ * lio_ha_tcp_send_data - send a command's data on the DATA channel
+ * @cookie: the command's cmd_cookie
+ * @sg:     the data
+ * @nents:  entries in @sg
+ * @total:  bytes to send from the start of @sg; 0 sends nothing
+ * @gen:    as for lio_ha_tcp_send_gen()
+ *
+ * Sends the data in chunks of LIO_HA_DATA_CHUNK, each a DATA message of
+ * its own, so other messages can go out between them.  Returns 0, or the
+ * first error; after a send error the connection is already shut down.
+ */
+int lio_ha_tcp_send_data(u64 cookie, struct scatterlist *sg,
+			 unsigned int nents, u32 total, u64 gen);
+
+/**
  * lio_ha_tcp_register_data_handler - register the DATA-channel handler
  *
  * Called once at init time; not safe to call concurrently with
  * lio_ha_tcp_exit().
  *
- * @handler: called from the rx kthread for each DATA-channel message.
+ * @handler: called from the rx kthread once all of a transfer's chunks
+ *   have arrived.
  *   @cookie:    cmd_cookie from lio_ha_data_hdr
- *   @data:      raw SCSI data (within the rx payload buffer, valid only
- *               for the duration of the call -- copy if needed)
- *   @data_len:  length of raw SCSI data (excludes lio_ha_data_hdr)
+ *   @data:      the whole transfer, kvmalloc'd; the handler takes it and
+ *               must kvfree() it or keep it
+ *   @data_len:  its length
  *
  * The handler must not sleep for long.
  */
-void lio_ha_tcp_register_data_handler(void (*handler)(u64 cookie, const void *data, u32 data_len));
+void lio_ha_tcp_register_data_handler(void (*handler)(u64 cookie, void *data, u32 data_len));
 
 /**
  * lio_ha_tcp_register_connect_handler - register a TCP connect callback

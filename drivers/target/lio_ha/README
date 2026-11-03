@@ -148,10 +148,12 @@ Every message is framed as:
     __be16 channel   0 = CTL, 1 = DATA
     __be32 length    payload bytes, NOT including this header
 
-  [lio_ha_data_hdr (8 bytes) -- DATA channel only, immediately after
+  [lio_ha_data_hdr (16 bytes) -- DATA channel only, immediately after
    the wire header]
     __be64 cmd_cookie   ties this DATA message to a CMD_FORWARD or
                         CMD_RESPONSE
+    __be32 total_len    bytes in the whole transfer
+    __be32 offset       of this chunk within the transfer
 
   payload
 
@@ -172,9 +174,27 @@ Channel 0 (CTL)
 
 Channel 1 (DATA)
   Carries raw SCSI data for forwarded commands.  Each DATA payload
-  is preceded by an 8-byte lio_ha_data_hdr containing a cmd_cookie
-  that ties the data to its CMD_FORWARD (WRITE, S->A) or CMD_RESPONSE
-  (READ, A->S).  No lio_ha_msg_hdr on this channel.
+  is preceded by a 16-byte lio_ha_data_hdr whose cmd_cookie ties the
+  data to its CMD_FORWARD (WRITE, S->A) or CMD_RESPONSE (READ, A->S).
+  No lio_ha_msg_hdr on this channel.
+
+  A command's data is sent in chunks of LIO_HA_DATA_CHUNK (256 KiB),
+  each its own DATA message, in ascending offset order; the send lock
+  is taken per chunk, so other messages, of either channel, go out
+  between the chunks of a large transfer.  A zero-length transfer
+  sends no DATA message.  The receiving rx thread reads each chunk
+  straight into the transfer's buffer and hands the whole buffer over
+  once the last chunk is in.
+
+  Limits: a chunk is at most LIO_HA_MAX_DATA_CHUNK (1 MiB) and a
+  transfer at most LIO_HA_MAX_DATA_TOTAL (64 MiB), above a zvol's
+  16 MiB maximum transfer length.  Both nodes refuse a command asking
+  for more with INVALID FIELD IN CDB.  A chunk that a matching peer
+  never sends (too large, empty, past the end of its transfer) closes
+  the connection.  Anything that can happen with matching code costs
+  one command at most: a transfer the receiver cannot allocate, or
+  whose chunks arrive out of sequence, is dropped and its chunks read
+  and discarded, and the command completes with BUSY.
 
 
 MESSAGE TYPES
@@ -265,7 +285,15 @@ CMD_FORWARD (S->A)
 
   For WRITE commands: write data is sent on the DATA channel BEFORE
   CMD_FORWARD.  ACTIVE buffers the data keyed by cmd_cookie; it is
-  ready when CMD_FORWARD arrives and triggers backend submission.
+  ready when CMD_FORWARD arrives and triggers backend submission.  If
+  it is missing or short (a dropped transfer), the command completes
+  with BUSY.
+
+  Every send for a forwarded command, and for a forwarded TMR, is
+  bound to the connection that was up when the command was entered in
+  STANDBY's in-flight table (lio_ha_tcp_send_gen()).  If the link drops
+  and comes back meanwhile, the rest is not sent: the disconnect
+  handler has already completed the command.
 
   For READ and NONE: no DATA message precedes CMD_FORWARD.
 

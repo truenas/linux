@@ -129,17 +129,35 @@ struct lio_ha_msg_hdr {
 /* Maximum CDB length (SPC-4 table 1: 32 bytes for variable-length CDBs) */
 #define LIO_HA_CDB_LEN  32
 
-/* Maximum DATA-channel payload (raw SCSI data, one forwarded command).   */
-#define LIO_HA_MAX_DATA_PAYLOAD   (4 * 1024 * 1024)   /* 4 MiB           */
-
 /*
- * DATA-channel payload header (8 bytes, immediately before raw SCSI data).
- * Wire format: lio_ha_wire_hdr + lio_ha_data_hdr + <raw SCSI data>.
+ * DATA-channel payload header (16 bytes, immediately before a chunk of raw
+ * SCSI data).  Wire format: lio_ha_wire_hdr + lio_ha_data_hdr + <chunk>.
  * Used for both WRITE data (S->A) and READ response data (A->S).
+ *
+ * A transfer of total_len bytes for cmd_cookie is sent as one or more
+ * chunks in ascending offset order, the last ending at total_len; chunk
+ * length = wire header length - sizeof(this).  Chunks of different
+ * cookies may interleave on the stream; chunks of one cookie do not.  A
+ * zero-length transfer sends no DATA message.
  */
 struct lio_ha_data_hdr {
 	__be64 cmd_cookie;   /* identifies the CMD_FORWARD / CMD_RESPONSE */
+	__be32 total_len;    /* bytes in the whole transfer */
+	__be32 offset;       /* of this chunk within the transfer */
 };
+
+/* Sender: bytes of SCSI data per DATA message. */
+#define LIO_HA_DATA_CHUNK       (256 * 1024)
+
+/* Receiver: the largest chunk it accepts; a larger one is a peer bug. */
+#define LIO_HA_MAX_DATA_CHUNK   (1024 * 1024)
+
+/*
+ * The largest transfer either node forwards or assembles: above a zvol's
+ * 16 MiB maximum transfer length and ESXi's 32 MB Disk.DiskMaxIOSize.  A
+ * command asking for more is refused with INVALID FIELD IN CDB.
+ */
+#define LIO_HA_MAX_DATA_TOTAL   (64 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* SESSION_CONNECT (S->A)                                              */
