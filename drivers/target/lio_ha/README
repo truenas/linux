@@ -63,6 +63,29 @@ Identical LIO configuration on both nodes
   LUN lookup failures or incorrect PR I_T nexus attribution.
 
 
+LIMITATIONS
+===========
+
+SPC-2 reservations are not replicated
+  Only persistent reservations (SPC-3/4) are replicated: LUN_SYNC
+  carries the registration list and the persistent reservation, not
+  dev->reservation_holder.  An initiator that holds a RESERVE(6) or
+  RESERVE(10) reservation loses it at failover, and PR OUT commands,
+  which LIO refuses while an SPC-2 reservation is held, become possible
+  again on the new ACTIVE.  Use persistent reservations with HA.
+
+APTPL is not supported
+  An initiator that registers with APTPL=1 (Windows failover
+  clustering, fence_scsi) is told its registration persists across a
+  power loss.  LIO writes the APTPL file under /var/target/pr/ on every
+  REGISTER, but TrueNAS never loads it back (res_aptpl_metadata is not
+  written), so after both nodes restart the registrations are gone.
+  Across the failure of one node the replicated PR table is what
+  persists them.  The file also records the local port, not the peer's
+  port of a forwarded session, so it could not be loaded as written
+  anyway.
+
+
 ROLES
 =====
 
@@ -307,6 +330,16 @@ TMR_FORWARD (S->A)
   One per Task Management Request.  Carries session_id, cmd_cookie
   for the TMR se_cmd, ref_cookie (for ABORT TASK, the initiator's task
   tag of the command to abort), the TMR function code, and LUN.
+
+  ACTIVE runs the TMR on the synthetic session, so it has the scope it
+  would have on a direct session.  In particular a LUN RESET (or TARGET
+  RESET) from an initiator logged in to STANDBY resets the device on
+  ACTIVE for every initiator, those connected to ACTIVE directly
+  included, and they get the reset unit attention.  This is what SAM
+  requires of a logical unit with several I_T nexuses, but it is easy
+  to miss that an initiator on the non-preferred path can do it.  Under
+  a storage stall initiators escalate to LUN RESET when ABORT TASK does
+  not complete, so expect it then.
 
 TMR_RESPONSE (A->S)
   Returns the TMR response code: TMR_FUNCTION_COMPLETE or
