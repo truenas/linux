@@ -385,6 +385,19 @@ static int vfs_statx_path(const struct path *path, int flags, struct kstat *stat
 	if (path_mounted(path))
 		stat->attributes |= STATX_ATTR_MOUNT_ROOT;
 	stat->attributes_mask |= STATX_ATTR_MOUNT_ROOT;
+
+#ifdef CONFIG_TRUENAS
+	/*
+	 * Whether a write would meet a read-only mount or superblock, which a
+	 * file server in userspace answers as nfsd answers a read-only export
+	 * (nfsd_permission in fs/nfsd/vfs.c). ZFS sets its superblock read
+	 * only for readonly=on with no remount (readonly_changed_cb in
+	 * zfs_vfsops.c), and mounts a snapshot read only.
+	 */
+	if (__mnt_is_readonly(path->mnt))
+		stat->attributes |= STATX_ATTR_RDONLY;
+	stat->attributes_mask |= STATX_ATTR_RDONLY;
+#endif
 	return 0;
 }
 
