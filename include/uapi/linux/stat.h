@@ -286,4 +286,10 @@ struct statx {
 #define STATX_ATTR_ACL_ACCESS		0x0400000000000000 /* File has an access ACL */
 #define STATX_ATTR_ACL_DEFAULT		0x0800000000000000 /* Directory has a default ACL */
 
+/*
+ * The file is on a read-only mount, as the mount or its superblock is read
+ * only, such as a ZFS dataset with readonly=on or a snapshot.
+ */
+#define STATX_ATTR_RDONLY		0x1000000000000000 /* The file is on a read-only mount */
+
 #endif /* _UAPI_LINUX_STAT_H */
