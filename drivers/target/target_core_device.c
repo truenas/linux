@@ -974,14 +974,32 @@ EXPORT_SYMBOL(target_for_each_device);
  *   2. Refresh the block_size / queue_depth / hw_max_sectors attributes from the
  *      now-populated hw_ values.
  *
- * Returns 0 on success.  On error the device stays NOT READY (ibd_bd == NULL).
+ * Serialised by target_ha_reopen_mutex: the failover store and a write of
+ * 1 to a device's "opened" attribute may run at once, and two opens would
+ * leak a reference on the backing store.
+ *
+ * Returns 0 on success, -EPERM while forwarding is active (the backend would
+ * not be opened).  On error the device stays NOT READY (ibd_bd == NULL).
  */
+static DEFINE_MUTEX(target_ha_reopen_mutex);
+
 int target_ha_reopen_backend(struct se_device *dev)
 {
-	int ret;
+	int ret = 0;
 
 	if (!target_dev_configured(dev))
 		return -ENODEV;
+
+	mutex_lock(&target_ha_reopen_mutex);
+
+	/*
+	 * On STANDBY configure_device() returns 0 without opening anything;
+	 * only the failover store, after clearing the flag, opens backends.
+	 */
+	if (atomic_read(&lio_ha_forward_active)) {
+		ret = -EPERM;
+		goto out;
+	}
 
 	/*
 	 * Already open: a retried failover, or opened=1 written again.
@@ -990,11 +1008,11 @@ int target_ha_reopen_backend(struct se_device *dev)
 	if (dev->transport->backend_is_ready &&
 	    dev->transport->backend_is_ready(dev) &&
 	    dev->dev_attrib.block_size)
-		return 0;
+		goto out;
 
 	ret = dev->transport->configure_device(dev);
 	if (ret)
-		return ret;
+		goto out;
 
 	if (dev->transport->configure_unmap &&
 	    dev->transport->configure_unmap(dev)) {
@@ -1026,8 +1044,9 @@ int target_ha_reopen_backend(struct se_device *dev)
 		smp_store_release(&dev->dev_attrib.block_size,
 				  dev->dev_attrib.hw_block_size);
 	}
-
-	return 0;
+out:
+	mutex_unlock(&target_ha_reopen_mutex);
+	return ret;
 }
 EXPORT_SYMBOL(target_ha_reopen_backend);
 #endif /* CONFIG_TRUENAS */

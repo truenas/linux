@@ -286,9 +286,12 @@ int target_for_each_device(int (*fn)(struct se_device *dev, void *data),
  * cleared, then fills block_size, queue_depth and optimal_sectors from the
  * hw_ attributes now populated by the backend, where still 0.  block_size is
  * set last; target_cmd_parse_cdb() treats the device as open once it is.
- * Returns 0 without reopening if the backend is already open.
+ * Returns 0 without reopening if the backend is already open.  Serialised
+ * against itself, so the failover store and a write to "opened" cannot both
+ * open the backend.
  *
- * Returns 0 on success, negative errno if the backend fails to open.
+ * Returns 0 on success, -EPERM while lio_ha_forward_active is set, negative
+ * errno if the backend fails to open.
  */
 int target_ha_reopen_backend(struct se_device *dev);
 
