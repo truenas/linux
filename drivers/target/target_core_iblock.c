@@ -700,7 +700,10 @@ static ssize_t iblock_set_configfs_dev_params(struct se_device *dev,
 			 * iblock_get_blocks() always reads the backing
 			 * bdev's current size live, so there is nothing to
 			 * refresh here -- just tell every attached I_T nexus
-			 * to re-check capacity on its next command.
+			 * to re-check capacity on its next command.  The
+			 * caller must resize the backing device (the zvol)
+			 * before writing rescan=1, or initiators re-read
+			 * the old capacity.
 			 */
 			target_dev_ua_allocate(dev, 0x2A,
 					       ASCQ_2AH_CAPACITY_DATA_HAS_CHANGED);

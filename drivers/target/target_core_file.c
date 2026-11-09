@@ -820,11 +820,15 @@ static ssize_t fd_set_configfs_dev_params(struct se_device *dev,
 				goto out;
 			}
 			/*
-			 * fd_get_blocks() always reads the current inode
-			 * size live for a block-backed file, so there is
-			 * nothing to refresh here -- just tell every
+			 * Nothing to refresh here -- just tell every
 			 * attached I_T nexus to re-check capacity on its
-			 * next command.
+			 * next command.  fd_get_blocks() reads a
+			 * block-backed file's size live, but a regular
+			 * file's from fd_dev_size: the caller must resize
+			 * the backing store, and for a regular file set
+			 * fd_dev_size (earlier in the same write, or
+			 * before it), before rescan=1, or initiators
+			 * re-read the old capacity.
 			 */
 			target_dev_ua_allocate(dev, 0x2A,
 					       ASCQ_2AH_CAPACITY_DATA_HAS_CHANGED);
