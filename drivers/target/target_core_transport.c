@@ -1786,6 +1786,12 @@ target_cmd_parse_cdb(struct se_cmd *cmd)
 		 * fabric's limit as sbc_parse_cdb() would, with the rest as an
 		 * underflow residual.  lio_ha forwards the initiator's full
 		 * length, and ACTIVE cuts it to the same limit.
+		 *
+		 * block_size is 0 here (the backend is not open) and the cut
+		 * divides by it to rescale prot_length.  That is safe only
+		 * because prot_length is set by sbc_check_prot(), which this
+		 * branch skips; if STANDBY ever parses the CDB, guard the
+		 * division or run the cut after the backend is open.
 		 */
 		return target_check_max_data_sg_nents(cmd, dev,
 						      cmd->data_length);
