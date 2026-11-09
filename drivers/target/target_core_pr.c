@@ -4114,20 +4114,21 @@ target_scsi3_emulate_pr_out(struct se_cmd *cmd)
 	}
 
 done:
-	if (!ret) {
 #ifdef CONFIG_TRUENAS
-		/*
-		 * Tell lio_ha.ko that this device's PR state changed, before
-		 * completing the command (fire-and-forget).  Sending the state
-		 * rather than the change keeps STANDBY's copy exactly what this
-		 * node has, whatever the service action did: SPEC_I_PT and
-		 * ALL_TG_PT registrations, REGISTER AND MOVE, or a reservation
-		 * passed on or dropped.
-		 */
-		target_ha_pr_changed(dev);
+	/*
+	 * Tell lio_ha.ko that this device's PR state may have changed, before
+	 * completing the command (fire-and-forget).  Sending the state rather
+	 * than the change keeps STANDBY's copy exactly what this node has,
+	 * whatever the service action did: SPEC_I_PT and ALL_TG_PT
+	 * registrations, REGISTER AND MOVE, or a reservation passed on or
+	 * dropped.  Also on failure: a service action can change the lists
+	 * and then fail, as when writing the APTPL file fails, and resending
+	 * an unchanged state is harmless.
+	 */
+	target_ha_pr_changed(dev);
 #endif /* CONFIG_TRUENAS */
+	if (!ret)
 		target_complete_cmd(cmd, SAM_STAT_GOOD);
-	}
 	return ret;
 }
 
