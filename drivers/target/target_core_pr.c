@@ -1911,7 +1911,17 @@ core_scsi3_decode_spec_i_port(
 			 * SCSI Intiatior TransportID w/ ISIDs is enforced
 			 * for fabric modules (iSCSI) requiring them.
 			 */
+#ifdef CONFIG_TRUENAS
+			/*
+			 * Ask the fabric of the port the TransportID names, not
+			 * the receiving one: a PR OUT forwarded by lio_ha arrives
+			 * on ha_recv, which reports ISIDs for iSCSI, and would
+			 * refuse an FC TransportID, which never has one.
+			 */
+			if (tmp_tpg->se_tpg_tfo->sess_get_initiator_sid &&
+#else
 			if (tpg->se_tpg_tfo->sess_get_initiator_sid &&
+#endif
 			    dev->dev_attrib.enforce_pr_isids &&
 			    !iport_ptr) {
 				pr_warn("SPC-PR: enforce_pr_isids is set but a isid has not been sent in the SPEC_I_PT data for %s.",
