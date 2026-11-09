@@ -418,6 +418,12 @@ struct t10_reservation {
 	struct se_node_acl *pr_res_holder;
 	struct list_head registration_list;
 	struct list_head aptpl_reg_list;
+	/*
+	 * Bumped under registration_lock whenever registration_list changes;
+	 * tags the per-nexus answers cached in se_session_deve->pr_reg_cache.
+	 * 31 bits, never 0 once bumped.
+	 */
+	u32 pr_reg_list_gen;
 };
 
 struct se_tmr_req {
@@ -755,6 +761,13 @@ struct se_session_deve {
 	 * a dead entry, and se_sess may already be freed.
 	 */
 	bool			dead;
+	/*
+	 * Whether this nexus holds a registration on the LUN's device (bit 0),
+	 * and the t10_reservation pr_reg_list_gen that answer is for (bits
+	 * 31:1). One word, so a reader sees a matching pair without a lock.
+	 * Written under the device's registration_lock.
+	 */
+	u32			pr_reg_cache;
 
 	/* Position in se_deve->sess_list and se_sess->deve_list (both RCU) */
 	struct list_head	deve_link;

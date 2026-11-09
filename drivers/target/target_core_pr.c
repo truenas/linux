@@ -181,14 +181,49 @@ static bool core_scsi3_pr_match_nexus(struct t10_pr_registration *pr_reg,
 }
 
 /*
- * Return true if the I_T nexus of @sess holds a registration on @dev.
+ * Record a change to registration_list, so that every answer cached by
+ * core_scsi3_sess_is_registered() is computed again. 0 is the generation of
+ * a list that has never changed, and so is empty; skip it on wrap.
  */
-static bool core_scsi3_sess_is_registered(struct se_session *sess,
-					  struct se_device *dev)
+static void core_scsi3_pr_reg_list_changed(struct t10_reservation *pr_tmpl)
 {
-	struct t10_reservation *pr_tmpl = &dev->t10_pr;
+	u32 gen = (pr_tmpl->pr_reg_list_gen + 1) & 0x7fffffff;
+
+	lockdep_assert_held(&pr_tmpl->registration_lock);
+
+	WRITE_ONCE(pr_tmpl->pr_reg_list_gen, gen ? gen : 1);
+}
+
+/*
+ * Return true if the I_T nexus of @cmd holds a registration on its device.
+ *
+ * This runs for every command from a non-holder while a reservation is
+ * held, so the answer is cached in the nexus's se_session_deve for the
+ * LUN, tagged with the registration list generation it was computed from.
+ * Every change to the list bumps the generation, so only the first command
+ * after a change walks the list. A new entry starts at generation 0 with
+ * the answer "not registered", which is right until the list first
+ * changes. A command with no entry (no per-nexus state, e.g. XCOPY's
+ * internal session) always walks.
+ */
+static bool core_scsi3_sess_is_registered(struct se_cmd *cmd)
+{
+	struct t10_reservation *pr_tmpl = &cmd->se_dev->t10_pr;
+	struct se_session *sess = cmd->se_sess;
+	struct se_session_deve *sess_deve;
 	struct t10_pr_registration *pr_reg;
 	bool found = false;
+	u32 cache;
+
+	rcu_read_lock();
+	sess_deve = target_find_sess_deve(sess, cmd->orig_fe_lun);
+	if (sess_deve) {
+		cache = READ_ONCE(sess_deve->pr_reg_cache);
+		if (cache >> 1 == READ_ONCE(pr_tmpl->pr_reg_list_gen)) {
+			rcu_read_unlock();
+			return cache & 1;
+		}
+	}
 
 	spin_lock(&pr_tmpl->registration_lock);
 	list_for_each_entry(pr_reg, &pr_tmpl->registration_list, pr_reg_list) {
@@ -197,7 +232,11 @@ static bool core_scsi3_sess_is_registered(struct se_session *sess,
 			break;
 		}
 	}
+	if (sess_deve)
+		WRITE_ONCE(sess_deve->pr_reg_cache,
+			   pr_tmpl->pr_reg_list_gen << 1 | found);
 	spin_unlock(&pr_tmpl->registration_lock);
+	rcu_read_unlock();
 
 	return found;
 }
@@ -488,7 +527,7 @@ static int core_scsi3_pr_seq_non_holder(struct se_cmd *cmd, u32 pr_reg_type)
 	int legacy = 0; /* Act like a legacy device and return
 			 * RESERVATION CONFLICT on some CDBs */
 
-	registered_nexus = core_scsi3_sess_is_registered(se_sess, cmd->se_dev);
+	registered_nexus = core_scsi3_sess_is_registered(cmd);
 
 	switch (pr_reg_type) {
 	case PR_TYPE_WRITE_EXCLUSIVE:
@@ -1311,6 +1350,7 @@ static void __core_scsi3_add_registration(
 
 	spin_lock(&pr_tmpl->registration_lock);
 	list_add_tail(&pr_reg->pr_reg_list, &pr_tmpl->registration_list);
+	core_scsi3_pr_reg_list_changed(pr_tmpl);
 
 	__core_scsi3_dump_registration(tfo, dev, nacl, pr_reg, register_type);
 	spin_unlock(&pr_tmpl->registration_lock);
@@ -1334,6 +1374,7 @@ static void __core_scsi3_add_registration(
 		spin_lock(&pr_tmpl->registration_lock);
 		list_add_tail(&pr_reg_tmp->pr_reg_list,
 			      &pr_tmpl->registration_list);
+		core_scsi3_pr_reg_list_changed(pr_tmpl);
 
 		__core_scsi3_dump_registration(tfo, dev, nacl_tmp, pr_reg_tmp,
 					       register_type);
@@ -1601,8 +1642,10 @@ static void __core_scsi3_free_registration(
 
 	core_pr_dump_initiator_port(pr_reg, i_buf, PR_REG_ISID_ID_LEN);
 
-	if (!list_empty(&pr_reg->pr_reg_list))
+	if (!list_empty(&pr_reg->pr_reg_list)) {
 		list_del(&pr_reg->pr_reg_list);
+		core_scsi3_pr_reg_list_changed(pr_tmpl);
+	}
 	/*
 	 * Caller accessing *pr_reg using core_scsi3_locate_pr_reg(),
 	 * so call core_scsi3_put_pr_reg() to decrement our reference.
@@ -2826,6 +2869,7 @@ static void __core_scsi3_complete_pro_release(
 
 	spin_lock(&dev->t10_pr.registration_lock);
 	list_del_init(&pr_reg->pr_reg_list);
+	core_scsi3_pr_reg_list_changed(&dev->t10_pr);
 	/*
 	 * If the I_T nexus is a reservation holder, the persistent reservation
 	 * is of an all registrants type, and the I_T nexus is the last remaining

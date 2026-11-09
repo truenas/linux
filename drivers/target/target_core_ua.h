@@ -40,6 +40,8 @@ extern int target_setup_session_deve_entries(struct se_session *sess);
 extern void target_free_session_deve_entries(struct se_session *sess);
 extern int target_setup_deve_sess_entries(struct se_node_acl *nacl,
 					  struct se_dev_entry *deve);
+extern struct se_session_deve *target_find_sess_deve(struct se_session *sess,
+						     u64 mapped_lun);
 extern void target_move_deve_sess_entries(struct se_dev_entry *from,
 					  struct se_dev_entry *to);
 
