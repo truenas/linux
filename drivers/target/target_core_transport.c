@@ -569,17 +569,25 @@ EXPORT_SYMBOL(__transport_register_session);
  * ACL. LUNs mapped later get theirs when they are mapped. Takes
  * nacl->lun_entry_mutex and allocates with GFP_KERNEL, so it must be called
  * from process context and not under se_portal_group->session_lock.
- * transport_register_session() calls it; a fabric that calls
- * __transport_register_session() directly must call it first.
  *
- * On -ENOMEM the session still works for I/O, but gets no unit attentions
- * until it reconnects.
+ * Every fabric calls it before registering the session, and before handing
+ * the session to anything that would still hold it if the login failed.
+ * target_setup_session() calls it for the fabrics that use it. On failure
+ * the fabric must refuse the login and free the session with
+ * transport_free_session(): a session without its queues would work for
+ * I/O but never see a unit attention.
+ *
+ * Return: 0, or -ENOMEM.
  */
-void transport_setup_session_ua(struct se_session *se_sess)
+int transport_setup_session_ua(struct se_session *se_sess)
 {
-	if (target_setup_session_deve_entries(se_sess))
+	int rc;
+
+	rc = target_setup_session_deve_entries(se_sess);
+	if (rc)
 		pr_err("Unable to allocate per-nexus UA queues for %s\n",
 		       se_sess->se_node_acl->initiatorname);
+	return rc;
 }
 EXPORT_SYMBOL(transport_setup_session_ua);
 
@@ -590,8 +598,6 @@ void transport_register_session(
 	void *fabric_sess_ptr)
 {
 	unsigned long flags;
-
-	transport_setup_session_ua(se_sess);
 
 	spin_lock_irqsave(&se_tpg->session_lock, flags);
 	__transport_register_session(se_tpg, se_nacl, se_sess, fabric_sess_ptr);
@@ -635,6 +641,13 @@ target_setup_session(struct se_portal_group *tpg,
 		rc = -EACCES;
 		goto free_sess;
 	}
+	/*
+	 * Before the callback, which may publish the session to the fabric
+	 * where it could not be taken back if this failed afterwards.
+	 */
+	rc = transport_setup_session_ua(sess);
+	if (rc)
+		goto free_sess;
 	/*
 	 * Go ahead and perform any remaining fabric setup that is
 	 * required before transport_register_session().
