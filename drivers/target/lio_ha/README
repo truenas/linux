@@ -239,7 +239,8 @@ SESSION_CONNECT (S->A)
   se_session keyed by STANDBY's se_session pointer (session_id).
   The synthetic session points to the real node_acl so that LUN
   mappings and PR per-I_T nexus tracking are correct.  If no matching
-  TPG or ACL is found, session creation is refused; subsequent
+  TPG or ACL is found, or the session's per-LUN unit attention queues
+  cannot be allocated, session creation is refused; subsequent
   CMD_FORWARD messages for that session_id are answered with
   SAM_STAT_BUSY so STANDBY retries.
 

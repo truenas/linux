@@ -693,6 +693,16 @@ int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 		 * transfer cut use its fabric's limit, not ha_recv's (none).
 		 */
 		se_sess->sess_max_data_sg_nents = max_data_sg_nents;
+		/*
+		 * Refuse the session rather than run it without unit
+		 * attentions.  transport_free_session() drops the nacl
+		 * reference and the command counter.
+		 */
+		if (transport_setup_session_ua(se_sess)) {
+			transport_free_session(se_sess);
+			kfree(e);
+			return -ENOMEM;
+		}
 		transport_register_session(&ha_recv_tpg.se_tpg, real_nacl,
 					   se_sess, e);
 	} else {
