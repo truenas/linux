@@ -39,7 +39,7 @@ extern void iscsit_thread_get_cpumask(struct iscsit_conn *);
 extern int iscsi_target_tx_thread(void *);
 extern int iscsi_target_rx_thread(void *);
 extern int iscsit_close_connection(struct iscsit_conn *);
-extern int iscsit_close_session(struct iscsit_session *, bool can_sleep);
+extern int iscsit_close_session(struct iscsit_session *sess);
 extern void iscsit_stop_session(struct iscsit_session *, int, int);
 extern int iscsit_release_sessions_for_tpg(struct iscsi_portal_group *, int);
 
