@@ -780,7 +780,7 @@ void iscsit_time2retain_work(struct work_struct *work)
 	struct iscsit_session *sess = container_of(work, struct iscsit_session,
 						   time2retain_work);
 
-	iscsit_close_session(sess, true);
+	iscsit_close_session(sess);
 }
 
 void iscsit_start_time2retain_handler(struct iscsit_session *sess)
