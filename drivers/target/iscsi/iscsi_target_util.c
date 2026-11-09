@@ -718,22 +718,16 @@ void iscsit_free_cmd(struct iscsit_cmd *cmd, bool shutdown)
 }
 EXPORT_SYMBOL(iscsit_free_cmd);
 
-bool iscsit_check_session_usage_count(struct iscsit_session *sess,
-				      bool can_sleep)
+void iscsit_wait_for_session_usage(struct iscsit_session *sess)
 {
 	spin_lock_bh(&sess->session_usage_lock);
 	if (sess->session_usage_count != 0) {
 		sess->session_waiting_on_uc = 1;
 		spin_unlock_bh(&sess->session_usage_lock);
-		if (!can_sleep)
-			return true;
-
 		wait_for_completion(&sess->session_waiting_on_uc_comp);
-		return false;
+		return;
 	}
 	spin_unlock_bh(&sess->session_usage_lock);
-
-	return false;
 }
 
 void iscsit_dec_session_usage_count(struct iscsit_session *sess)
