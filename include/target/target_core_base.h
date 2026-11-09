@@ -680,6 +680,12 @@ struct se_session {
 	u16			sess_port_tag;
 	u16			sess_port_rtpi;
 	bool			sess_port_set;
+	/*
+	 * For such a session, the peer port's fabric's max_data_sg_nents
+	 * (qla2xxx: 1200), which applies in place of the session's own
+	 * fabric's; 0 for none.
+	 */
+	u32			sess_max_data_sg_nents;
 #endif
 };
 

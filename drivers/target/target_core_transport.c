@@ -1508,13 +1508,33 @@ transport_set_vpd_ident(struct t10_vpd *vpd, unsigned char *page_83)
 }
 EXPORT_SYMBOL(transport_set_vpd_ident);
 
+#ifdef CONFIG_TRUENAS
+/*
+ * The fabric's limit on scatterlist entries for this command.  A session
+ * lio_ha creates for an initiator logged in through the peer node's port
+ * carries that port's fabric's limit: the transfer crosses that port's HBA,
+ * and Block Limits must report the same maximum through either port.
+ */
+u32 target_max_data_sg_nents(struct se_cmd *cmd)
+{
+	if (cmd->se_sess && cmd->se_sess->sess_max_data_sg_nents)
+		return cmd->se_sess->sess_max_data_sg_nents;
+	return cmd->se_tfo->max_data_sg_nents;
+}
+#endif /* CONFIG_TRUENAS */
+
 static sense_reason_t
 target_check_max_data_sg_nents(struct se_cmd *cmd, struct se_device *dev,
 			       unsigned int size)
 {
 	u32 mtl;
+#ifdef CONFIG_TRUENAS
+	u32 max_data_sg_nents = target_max_data_sg_nents(cmd);
+#else
+	u32 max_data_sg_nents = cmd->se_tfo->max_data_sg_nents;
+#endif
 
-	if (!cmd->se_tfo->max_data_sg_nents)
+	if (!max_data_sg_nents)
 		return TCM_NO_SENSE;
 	/*
 	 * Check if fabric enforced maximum SGL entries per I/O descriptor
@@ -1522,7 +1542,7 @@ target_check_max_data_sg_nents(struct se_cmd *cmd, struct se_device *dev,
 	 * residual_count and reduce original cmd->data_length to maximum
 	 * length based on single PAGE_SIZE entry scatter-lists.
 	 */
-	mtl = (cmd->se_tfo->max_data_sg_nents * PAGE_SIZE);
+	mtl = (max_data_sg_nents * PAGE_SIZE);
 	if (cmd->data_length > mtl) {
 		/*
 		 * If an existing CDB overflow is present, calculate new residual
@@ -1761,7 +1781,14 @@ target_cmd_parse_cdb(struct se_cmd *cmd)
 	if (atomic_read(&lio_ha_forward_active)) {
 		cmd->se_cmd_flags |= SCF_SUPPORTED_SAM_OPCODE;
 		atomic_long_inc(&cmd->se_lun->lun_stats.cmd_pdus);
-		return 0;
+		/*
+		 * This node's HBA moves the data, so cut the transfer to its
+		 * fabric's limit as sbc_parse_cdb() would, with the rest as an
+		 * underflow residual.  lio_ha forwards the initiator's full
+		 * length, and ACTIVE cuts it to the same limit.
+		 */
+		return target_check_max_data_sg_nents(cmd, dev,
+						      cmd->data_length);
 	}
 	/*
 	 * After failover, until target_ha_reopen_backend() has opened this
