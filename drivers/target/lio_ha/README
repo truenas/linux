@@ -227,7 +227,13 @@ SESSION_CONNECT (S->A)
   Sent when an initiator connects to a STANDBY target.  Carries
   the initiator IQN/WWPN, the initiator's nexus discriminator (the
   iSCSI/iSER ISID; empty for fabrics without one), target IQN/WWPN,
-  fabric name, and TPG tag.
+  fabric name, TPG tag, and the fabric's limit on scatterlist entries
+  per command (max_data_sg_nents; qla2xxx: 1200, iSCSI: none).
+  The synthetic session uses that limit in place of ha_recv's, so
+  Block Limits reports the same MAXIMUM TRANSFER LENGTH through either
+  node's port.  STANDBY cuts a longer transfer to the limit, as a native
+  port does, with the rest as an underflow residual, and forwards the
+  initiator's full length; ACTIVE cuts it to the same limit.
   ACTIVE calls target_ha_get_tpg() to find the matching TPG,
   looks up the node_acl for initiator_name, and creates a synthetic
   se_session keyed by STANDBY's se_session pointer (session_id).

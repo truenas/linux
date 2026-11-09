@@ -145,6 +145,21 @@ static int ha_fwd_send_write_data(struct se_cmd *cmd, u64 cookie, u64 gen)
 				    cmd->data_length, gen);
 }
 
+/*
+ * The initiator's transfer length.  target_cmd_parse_cdb() may have cut
+ * data_length to this fabric's limit, the rest being an underflow residual;
+ * nothing else sets one on a forwarded command, which skips the backend's
+ * parse.  ACTIVE needs the full length, or its CDB size check refuses a cut
+ * WRITE; it cuts the transfer to the same limit, from SESSION_CONNECT.  The
+ * data itself is data_length long.
+ */
+static u64 ha_fwd_initiator_length(struct se_cmd *cmd)
+{
+	if (cmd->se_cmd_flags & SCF_UNDERFLOW_BIT)
+		return (u64)cmd->data_length + cmd->residual_count;
+	return cmd->data_length;
+}
+
 /* Build and send CMD_FORWARD on the CTL channel. */
 static int ha_fwd_send_cmd_forward(struct se_cmd *cmd, u64 cookie, u64 gen)
 {
@@ -153,7 +168,7 @@ static int ha_fwd_send_cmd_forward(struct se_cmd *cmd, u64 cookie, u64 gen)
 	fwd.hdr.type    = cpu_to_be32(LIO_HA_MSG_CMD_FORWARD);
 	fwd.session_id  = cpu_to_be64(cmd->se_sess ? (u64)cmd->se_sess : 0);
 	fwd.cmd_cookie  = cpu_to_be64(cookie);
-	fwd.data_length = cpu_to_be64(cmd->data_length);
+	fwd.data_length = cpu_to_be64(ha_fwd_initiator_length(cmd));
 	fwd.lun         = cpu_to_be32((u32)cmd->orig_fe_lun);
 	fwd.data_dir    = cpu_to_be32((u32)cmd->data_direction);
 	/* ABORT TASK names a command by this tag; see ha_recv_submit_tmr(). */

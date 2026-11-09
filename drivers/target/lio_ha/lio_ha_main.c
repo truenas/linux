@@ -161,6 +161,7 @@ static DEFINE_MUTEX(ha_main_pr_sync_mutex);
 struct ha_main_sess_entry {
 	u64  session_id;
 	u16  tpg_tag;
+	u32  max_data_sg_nents;
 	char initiator_name[LIO_HA_INITIATOR_NAME_LEN];
 	char target_name[LIO_HA_INITIATOR_NAME_LEN];
 	char initiator_sid[LIO_HA_ISID_LEN];
@@ -478,6 +479,7 @@ static void ha_main_session_create(struct se_session *sess)
 	if (se) {
 		se->session_id = (u64)(uintptr_t)sess;
 		se->tpg_tag    = tpg->se_tpg_tfo->tpg_get_tag(tpg);
+		se->max_data_sg_nents = tpg->se_tpg_tfo->max_data_sg_nents;
 		strscpy(se->initiator_name, sess->se_node_acl->initiatorname,
 			LIO_HA_INITIATOR_NAME_LEN);
 		strscpy(se->initiator_sid, isid_buf, LIO_HA_ISID_LEN);
@@ -492,7 +494,8 @@ static void ha_main_session_create(struct se_session *sess)
 	msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_CONNECT);
 	msg.session_id = cpu_to_be64((u64)(uintptr_t)sess);
 	msg.tpg_tag    = cpu_to_be16(tpg->se_tpg_tfo->tpg_get_tag(tpg));
-	/* pad[6] is zero from the initialiser */
+	/* pad[2] is zero from the initialiser */
+	msg.max_data_sg_nents = cpu_to_be32(tpg->se_tpg_tfo->max_data_sg_nents);
 	strscpy(msg.initiator_name, sess->se_node_acl->initiatorname,
 		LIO_HA_INITIATOR_NAME_LEN);
 	strscpy(msg.target_name, wwn, LIO_HA_INITIATOR_NAME_LEN);
@@ -958,6 +961,8 @@ static void ha_main_on_connect(void)
 			msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_CONNECT);
 			msg.session_id = cpu_to_be64(se->session_id);
 			msg.tpg_tag    = cpu_to_be16(se->tpg_tag);
+			msg.max_data_sg_nents =
+				cpu_to_be32(se->max_data_sg_nents);
 			strscpy(msg.initiator_name, se->initiator_name,
 				LIO_HA_INITIATOR_NAME_LEN);
 			strscpy(msg.target_name, se->target_name,

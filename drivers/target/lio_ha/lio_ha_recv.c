@@ -587,7 +587,7 @@ static void ha_recv_tmr_forward_handler(const void *buf, size_t len)
 int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 			       const char *target_name, u16 tpg_tag,
 			       u16 port_tag, const char *initiator_sid,
-			       const char *fabric_name)
+			       const char *fabric_name, u32 max_data_sg_nents)
 {
 	struct ha_recv_sess_entry *e, *existing;
 	struct se_portal_group *real_tpg;
@@ -688,6 +688,11 @@ int lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 		se_sess->sess_port_tag  = port_tag;
 		se_sess->sess_port_rtpi = port_rtpi;
 		se_sess->sess_port_set  = true;
+		/*
+		 * The STANDBY port's HBA moves the data: Block Limits and the
+		 * transfer cut use its fabric's limit, not ha_recv's (none).
+		 */
+		se_sess->sess_max_data_sg_nents = max_data_sg_nents;
 		transport_register_session(&ha_recv_tpg.se_tpg, real_nacl,
 					   se_sess, e);
 	} else {
@@ -767,7 +772,8 @@ static void ha_recv_session_connect_handler(const void *buf, size_t len)
 	mutex_lock(&ha_recv_sess_mutex);
 	lio_ha_recv_session_create(initiator_name, session_id,
 				   target_name, tpg_tag, port_tag,
-				   initiator_sid, fabric_name);
+				   initiator_sid, fabric_name,
+				   be32_to_cpu(msg->max_data_sg_nents));
 	mutex_unlock(&ha_recv_sess_mutex);
 }
 

@@ -174,7 +174,9 @@ struct lio_ha_msg_session_connect {
 	struct lio_ha_msg_hdr hdr;          /* type = LIO_HA_MSG_SESSION_CONNECT */
 	__be64                session_id;   /* STANDBY's se_sess pointer; opaque */
 	__be16                tpg_tag;      /* sender's tpg_get_tag(): the physical port */
-	u8                    pad[6];       /* reserved, must be zero */
+	u8                    pad[2];       /* reserved, must be zero */
+	/* Sender's fabric's max_data_sg_nents (qla2xxx: 1200); 0 for none */
+	__be32                max_data_sg_nents;
 	char initiator_name[LIO_HA_INITIATOR_NAME_LEN]; /* IQN or WWPN, NUL-terminated */
 	char target_name[LIO_HA_INITIATOR_NAME_LEN];    /* IQN or WWPN of target */
 	/* Fabric-provided nexus discriminator (iSCSI/iSER ISID); empty if none */

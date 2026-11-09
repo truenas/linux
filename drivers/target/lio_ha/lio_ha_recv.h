@@ -62,6 +62,8 @@ void lio_ha_recv_exit(void);
  * @initiator_sid:  fabric-provided nexus discriminator from SESSION_CONNECT
  *                  (iSCSI/iSER ISID); empty if the fabric has none
  * @fabric_name:    fabric driver name (e.g. "iscsi", "qla2xxx")
+ * @max_data_sg_nents: the STANDBY port's fabric's limit on scatterlist
+ *                  entries per command (qla2xxx: 1200); 0 for none
  *
  * Looks up the real target TPG and node_acl so the synthetic session gets
  * correct LUN mappings and PR I_T nexus attribution.  If no matching TPG
@@ -74,7 +76,7 @@ void lio_ha_recv_exit(void);
 int  lio_ha_recv_session_create(const char *initiator_name, u64 session_id,
 				const char *target_name, u16 tpg_tag,
 				u16 port_tag, const char *initiator_sid,
-				const char *fabric_name);
+				const char *fabric_name, u32 max_data_sg_nents);
 
 /**
  * lio_ha_recv_session_destroy - tear down the synthetic se_session
