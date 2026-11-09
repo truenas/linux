@@ -119,6 +119,27 @@ static bool fd_configure_unmap(struct se_device *dev)
 	return true;
 }
 
+#ifdef CONFIG_TRUENAS
+/*
+ * A FILE extent is grown by extending its file.  A regular file's capacity
+ * is fd_dev_size, not the file's length, so take the length when it is
+ * larger.  Never shrink: a LUN must not get smaller under an initiator, and
+ * a file shorter than fd_dev_size is valid (writes extend it).  A block
+ * device's size is read live by fd_get_blocks().
+ */
+static void fd_grow_dev_size(struct fd_dev *fd_dev)
+{
+	struct file *f = fd_dev->fd_file;
+	loff_t size;
+
+	if (!f || S_ISBLK(file_inode(f)->i_mode))
+		return;
+	size = i_size_read(file_inode(f));
+	if (size > 0 && (unsigned long long)size > fd_dev->fd_dev_size)
+		WRITE_ONCE(fd_dev->fd_dev_size, size);
+}
+#endif /* CONFIG_TRUENAS */
+
 static int fd_configure_device(struct se_device *dev)
 {
 	struct fd_dev *fd_dev = FD_DEV(dev);
@@ -209,6 +230,13 @@ static int fd_configure_device(struct se_device *dev)
 		}
 
 		fd_dev->fd_block_size = FD_BLOCKSIZE;
+#ifdef CONFIG_TRUENAS
+		/*
+		 * The file may have grown while this device was closed: on
+		 * STANDBY, which opens it only at failover.
+		 */
+		fd_grow_dev_size(fd_dev);
+#endif
 
 		/*
 		 * Limit WRITE_SAME w/ UNMAP=0 emulation to 8k Number of LBAs (NoLB)
@@ -820,16 +848,14 @@ static ssize_t fd_set_configfs_dev_params(struct se_device *dev,
 				goto out;
 			}
 			/*
-			 * Nothing to refresh here -- just tell every
+			 * Take a regular file's new length, then tell every
 			 * attached I_T nexus to re-check capacity on its
-			 * next command.  fd_get_blocks() reads a
-			 * block-backed file's size live, but a regular
-			 * file's from fd_dev_size: the caller must resize
-			 * the backing store, and for a regular file set
-			 * fd_dev_size (earlier in the same write, or
-			 * before it), before rescan=1, or initiators
-			 * re-read the old capacity.
+			 * next command.  The caller must extend the file
+			 * (or resize the block device) before rescan=1, or
+			 * initiators re-read the old capacity.  A closed
+			 * file (STANDBY) takes its length when opened.
 			 */
+			fd_grow_dev_size(fd_dev);
 			target_dev_ua_allocate(dev, 0x2A,
 					       ASCQ_2AH_CAPACITY_DATA_HAS_CHANGED);
 			break;
