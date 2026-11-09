@@ -566,7 +566,10 @@ storage object's "opened" attribute (iblock or fileio) reads 0.  Its
 PR state was restored all the same.  Once the storage is unlocked,
 writing 1 to "opened" opens it through target_ha_reopen_backend(),
 which also sets block_size and the other attributes left 0 on STANDBY;
-writing 1 to an open backend does nothing.
+writing 1 to an open backend does nothing.  On STANDBY, while forwarding
+is active, the write fails with EPERM: only failover opens backends
+there.  Writes to "opened" and failover's own opens are serialised, so a
+write racing failover cannot open a backend twice.
 
 
 MODULE PARAMETERS
