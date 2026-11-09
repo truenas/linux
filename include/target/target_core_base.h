@@ -319,7 +319,6 @@ struct t10_alua_tg_pt_gp {
 	struct config_group tg_pt_gp_group;
 	struct list_head tg_pt_gp_list;
 	struct list_head tg_pt_gp_lun_list;
-	struct se_session *tg_pt_gp_alua_sess;
 };
 
 struct t10_vpd {

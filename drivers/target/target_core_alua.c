@@ -907,7 +907,8 @@ static int core_alua_update_tpg_primary_metadata(
 	return rc;
 }
 
-static void core_alua_queue_state_change_ua(struct t10_alua_tg_pt_gp *tg_pt_gp)
+static void core_alua_queue_state_change_ua(struct t10_alua_tg_pt_gp *tg_pt_gp,
+					    struct se_session *issuing_sess)
 {
 	struct se_dev_entry *se_deve;
 	struct se_lun *lun;
@@ -943,13 +944,13 @@ static void core_alua_queue_state_change_ua(struct t10_alua_tg_pt_gp *tg_pt_gp)
 			 * code set to ASYMMETRIC ACCESS STATE CHANGED for
 			 * the initiator port associated with every I_T nexus
 			 * other than the I_T nexus on which the SET TARGET
-			 * PORT GROUPS command was received. tg_pt_gp_alua_sess
-			 * is that nexus for an explicit transition, and NULL
-			 * for an implicit one.
+			 * PORT GROUPS command was received. issuing_sess is
+			 * that nexus for an explicit transition, and NULL for
+			 * an implicit one.
 			 */
 			core_scsi3_ua_allocate_all(se_deve, 0x2A,
 						   ASCQ_2AH_ASYMMETRIC_ACCESS_STATE_CHANGED,
-						   tg_pt_gp->tg_pt_gp_alua_sess);
+						   issuing_sess);
 		}
 		spin_unlock(&lun->lun_deve_lock);
 
@@ -961,6 +962,7 @@ static void core_alua_queue_state_change_ua(struct t10_alua_tg_pt_gp *tg_pt_gp)
 
 static int core_alua_do_transition_tg_pt(
 	struct t10_alua_tg_pt_gp *tg_pt_gp,
+	struct se_session *issuing_sess,
 	int new_state,
 	int explicit)
 {
@@ -988,7 +990,7 @@ static int core_alua_do_transition_tg_pt(
 				ALUA_STATUS_ALTERED_BY_EXPLICIT_STPG :
 				ALUA_STATUS_ALTERED_BY_IMPLICIT_ALUA;
 
-	core_alua_queue_state_change_ua(tg_pt_gp);
+	core_alua_queue_state_change_ua(tg_pt_gp, issuing_sess);
 
 	if (new_state == ALUA_ACCESS_STATE_TRANSITION) {
 		mutex_unlock(&tg_pt_gp->tg_pt_gp_transition_mutex);
@@ -1029,7 +1031,7 @@ static int core_alua_do_transition_tg_pt(
 		core_alua_dump_state(prev_state),
 		core_alua_dump_state(new_state));
 
-	core_alua_queue_state_change_ua(tg_pt_gp);
+	core_alua_queue_state_change_ua(tg_pt_gp, issuing_sess);
 
 	mutex_unlock(&tg_pt_gp->tg_pt_gp_transition_mutex);
 	return 0;
@@ -1071,8 +1073,7 @@ int core_alua_do_port_transition(
 		 * core_alua_do_transition_tg_pt() will always return
 		 * success.
 		 */
-		l_tg_pt_gp->tg_pt_gp_alua_sess = l_sess;
-		rc = core_alua_do_transition_tg_pt(l_tg_pt_gp,
+		rc = core_alua_do_transition_tg_pt(l_tg_pt_gp, l_sess,
 						   new_state, explicit);
 		atomic_dec_mb(&lu_gp->lu_gp_ref_cnt);
 		return rc;
@@ -1108,8 +1109,6 @@ int core_alua_do_port_transition(
 			if (l_tg_pt_gp->tg_pt_gp_id != tg_pt_gp->tg_pt_gp_id)
 				continue;
 
-			tg_pt_gp->tg_pt_gp_alua_sess =
-				(l_tg_pt_gp == tg_pt_gp) ? l_sess : NULL;
 			atomic_inc_mb(&tg_pt_gp->tg_pt_gp_ref_cnt);
 			spin_unlock(&dev->t10_alua.tg_pt_gps_lock);
 			/*
@@ -1117,6 +1116,7 @@ int core_alua_do_port_transition(
 			 * success.
 			 */
 			rc = core_alua_do_transition_tg_pt(tg_pt_gp,
+					(l_tg_pt_gp == tg_pt_gp) ? l_sess : NULL,
 					new_state, explicit);
 
 			spin_lock(&dev->t10_alua.tg_pt_gps_lock);
