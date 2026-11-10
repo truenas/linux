@@ -234,6 +234,7 @@ bool core_scsi3_ua_for_check_condition(struct se_cmd *cmd, u8 *key, u8 *asc,
 		if (!dev_ua_intlck_clear) {
 			*asc = ua->ua_asc;
 			*ascq = ua->ua_ascq;
+			head = 0;
 			break;
 		}
 		/*
