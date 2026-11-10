@@ -216,6 +216,16 @@ void lio_ha_forward_cmd(struct se_cmd *cmd)
 					       TCM_INVALID_CDB_FIELD);
 		return;
 	}
+	/*
+	 * A session message for this session is still unsent, and the
+	 * command must not overtake it (see lio_ha_sess_msg_pending()).
+	 * BUSY: the initiator retries, by then normally after it has gone.
+	 */
+	if (cmd->se_sess && lio_ha_sess_msg_pending((u64)cmd->se_sess)) {
+		lio_ha_dbg(2, "forward cmd: session message unsent; BUSY\n");
+		target_complete_cmd(cmd, SAM_STAT_BUSY);
+		return;
+	}
 
 	e = ha_fwd_entry_alloc(cookie, cmd);
 	if (!e) {
@@ -354,6 +364,14 @@ void lio_ha_forward_tmr(struct se_cmd *cmd)
 	bool still_in_hash;
 	u64 gen;
 	int ret;
+
+	/* As in lio_ha_forward_cmd(). */
+	if (cmd->se_sess && lio_ha_sess_msg_pending((u64)cmd->se_sess)) {
+		lio_ha_dbg(2, "forward tmr: session message unsent; rejected\n");
+		cmd->se_tmr_req->response = TMR_FUNCTION_REJECTED;
+		target_complete_tmr(cmd);
+		return;
+	}
 
 	e = ha_fwd_tmr_entry_alloc(cookie, cmd);
 	if (!e) {

@@ -150,12 +150,30 @@ static DEFINE_MUTEX(ha_main_pr_sync_mutex);
 /* Shadow session table (STANDBY side)                                  */
 /*                                                                     */
 /* Tracks every live initiator session so SESSION_CONNECT can be       */
-/* replayed on TCP link recovery.  Only entries with forward_active=1  */
-/* are added.  The mutex protects the list and is held across the     */
-/* SESSION_CONNECT and SESSION_DISCONNECT sends, so the peer receives  */
-/* them in the order sessions come and go: a replayed SESSION_CONNECT  */
-/* can never follow the SESSION_DISCONNECT of the same session, whose  */
-/* id (a pointer) may then belong to a new session.                    */
+/* replayed on TCP link recovery, and queues the session messages for  */
+/* ha_main_sess_work, the only sender of them.  The session hooks and  */
+/* the failover store therefore never wait on the HA link.             */
+/*                                                                     */
+/* ha_main_sess_list holds the live sessions, in login order.          */
+/* ha_main_sess_pending is a FIFO of the messages still to be sent: an */
+/* entry is on it as SESSION_CONNECT (also on the live list) or, once  */
+/* its session is gone, as SESSION_DISCONNECT (on no other list).  The */
+/* FIFO is the order the peer sees them in, so a replayed              */
+/* SESSION_CONNECT can never follow the SESSION_DISCONNECT of the same */
+/* session, whose id (a pointer) may then belong to a new session.     */
+/*                                                                     */
+/* Commands share the link with these messages, and must not overtake  */
+/* one for their own session id: not their session's SESSION_CONNECT,  */
+/* which the peer needs first, nor the SESSION_DISCONNECT of an        */
+/* earlier session at the same address, or the peer would run them as  */
+/* that session.  The forward paths ask lio_ha_sess_msg_pending() and  */
+/* complete such a command locally.  ha_main_sess_unsent counts the    */
+/* messages queued or being sent, so that with none, the normal case,  */
+/* the check is one atomic read.                                       */
+/*                                                                     */
+/* ha_main_sess_lock protects both lists, the entries' flags,          */
+/* ha_main_sess_inflight and every change to ha_main_sess_unsent.      */
+/* Only entries added while forward_active=1 are tracked.              */
 /* ------------------------------------------------------------------ */
 
 struct ha_main_sess_entry {
@@ -166,20 +184,162 @@ struct ha_main_sess_entry {
 	char target_name[LIO_HA_INITIATOR_NAME_LEN];
 	char initiator_sid[LIO_HA_ISID_LEN];
 	char fabric_name[LIO_HA_FABRIC_NAME_LEN];
-	struct list_head list;
+	struct list_head list;		/* on ha_main_sess_list while live */
+	struct list_head pending;	/* on ha_main_sess_pending while unsent */
+	bool disconnect;		/* queued as SESSION_DISCONNECT */
+	bool sent;			/* a SESSION_CONNECT went to a send */
 };
 
 static LIST_HEAD(ha_main_sess_list);
-static DEFINE_MUTEX(ha_main_sess_mutex);
+static LIST_HEAD(ha_main_sess_pending);
+static DEFINE_SPINLOCK(ha_main_sess_lock);
+/* Session id of the message ha_main_sess_work is sending, or 0. */
+static u64 ha_main_sess_inflight;
+/* Entries on ha_main_sess_pending, plus one while one is in flight. */
+static atomic_t ha_main_sess_unsent = ATOMIC_INIT(0);
 
+static void ha_main_sess_work_fn(struct work_struct *work);
+static DECLARE_WORK(ha_main_sess_work, ha_main_sess_work_fn);
+
+/*
+ * Queue @se's next message.  Caller holds ha_main_sess_lock and has seen
+ * forward_active set under it, and kicks ha_main_sess_work before dropping
+ * it: the failover store clears forward_active and then takes the lock to
+ * flush, so all queueing is over by the time the flush returns, and the
+ * work item cannot be queued after module exit has cancelled it.
+ */
+static void ha_main_sess_queue(struct ha_main_sess_entry *se)
+{
+	lockdep_assert_held(&ha_main_sess_lock);
+	list_add_tail(&se->pending, &ha_main_sess_pending);
+	atomic_inc(&ha_main_sess_unsent);
+}
+
+static void ha_main_sess_fill_connect(struct lio_ha_msg_session_connect *msg,
+				      const struct ha_main_sess_entry *se)
+{
+	msg->hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_CONNECT);
+	msg->session_id = cpu_to_be64(se->session_id);
+	msg->tpg_tag    = cpu_to_be16(se->tpg_tag);
+	/* pad[2] is zero from the caller's initialiser */
+	msg->max_data_sg_nents = cpu_to_be32(se->max_data_sg_nents);
+	strscpy(msg->initiator_name, se->initiator_name,
+		LIO_HA_INITIATOR_NAME_LEN);
+	strscpy(msg->target_name, se->target_name, LIO_HA_INITIATOR_NAME_LEN);
+	strscpy(msg->initiator_sid, se->initiator_sid, LIO_HA_ISID_LEN);
+	strscpy(msg->fabric_name, se->fabric_name, LIO_HA_FABRIC_NAME_LEN);
+}
+
+/*
+ * Send the queued session messages in FIFO order.  No pointer to a
+ * SESSION_CONNECT entry is kept across a send: the message is copied under
+ * the lock, so the destroy hook and the failover flush may free the entry
+ * meanwhile.  A SESSION_DISCONNECT entry is off every list once taken, and
+ * this is its only owner.
+ *
+ * A failed send needs no handling here.  The live entry of a failed
+ * SESSION_CONNECT is replayed on the next connect, and a failed send closes
+ * the connection (__ha_tcp_send()), which makes the peer drop all of this
+ * node's sessions.
+ */
+static void ha_main_sess_work_fn(struct work_struct *work)
+{
+	struct ha_main_sess_entry *se;
+
+	spin_lock(&ha_main_sess_lock);
+	while (!list_empty(&ha_main_sess_pending) &&
+	       atomic_read(&lio_ha_forward_active)) {
+		se = list_first_entry(&ha_main_sess_pending,
+				      struct ha_main_sess_entry, pending);
+		list_del_init(&se->pending);
+		/* Still counted in ha_main_sess_unsent until sent. */
+		ha_main_sess_inflight = se->session_id;
+		if (se->disconnect) {
+			struct lio_ha_msg_session_disconnect msg = {
+				.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_DISCONNECT),
+				.session_id = cpu_to_be64(se->session_id),
+			};
+
+			spin_unlock(&ha_main_sess_lock);
+			if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
+				pr_debug("lio_ha: SESSION_DISCONNECT send failed\n");
+			kfree(se);
+		} else {
+			struct lio_ha_msg_session_connect msg = {};
+
+			ha_main_sess_fill_connect(&msg, se);
+			se->sent = true;
+			spin_unlock(&ha_main_sess_lock);
+			if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
+				pr_debug("lio_ha: SESSION_CONNECT send failed for %s\n",
+					 msg.initiator_name);
+		}
+		/*
+		 * The message is in the socket, or the link is closed: a
+		 * command sent from now on cannot overtake it.
+		 */
+		spin_lock(&ha_main_sess_lock);
+		ha_main_sess_inflight = 0;
+		atomic_dec(&ha_main_sess_unsent);
+	}
+	spin_unlock(&ha_main_sess_lock);
+}
+
+/*
+ * Return true if a session message for @session_id is queued or being sent,
+ * in which case a command for that session must not be forwarded yet.
+ *
+ * Every message is counted in ha_main_sess_unsent from before the hook that
+ * queues it returns until its send has returned.  The create hook runs
+ * before the session's first command can arrive (for iSCSI, before the
+ * connection's rx thread is released), and the destroy hook before the
+ * session is freed, so before a new session can have its address.  A count
+ * of 0 therefore means nothing a command could overtake.
+ */
+bool lio_ha_sess_msg_pending(u64 session_id)
+{
+	struct ha_main_sess_entry *se;
+	bool pending = false;
+
+	if (!atomic_read(&ha_main_sess_unsent))
+		return false;
+
+	spin_lock(&ha_main_sess_lock);
+	if (ha_main_sess_inflight == session_id) {
+		pending = true;
+	} else {
+		list_for_each_entry(se, &ha_main_sess_pending, pending) {
+			if (se->session_id == session_id) {
+				pending = true;
+				break;
+			}
+		}
+	}
+	spin_unlock(&ha_main_sess_lock);
+
+	return pending;
+}
+
+/*
+ * Free every tracked session and drop every unsent message.  Called once
+ * forward_active is 0, when nothing is queued any more and the work item
+ * sends nothing further; a send already in progress finishes on its own.
+ */
 static void ha_main_sess_list_flush(void)
 {
 	struct ha_main_sess_entry *se, *tmp;
 	LIST_HEAD(free_list);
 
-	mutex_lock(&ha_main_sess_mutex);
+	spin_lock(&ha_main_sess_lock);
+	list_for_each_entry_safe(se, tmp, &ha_main_sess_pending, pending) {
+		list_del_init(&se->pending);
+		atomic_dec(&ha_main_sess_unsent);
+		/* A SESSION_DISCONNECT entry is on no other list. */
+		if (se->disconnect)
+			list_add_tail(&se->list, &free_list);
+	}
 	list_splice_init(&ha_main_sess_list, &free_list);
-	mutex_unlock(&ha_main_sess_mutex);
+	spin_unlock(&ha_main_sess_lock);
 
 	list_for_each_entry_safe(se, tmp, &free_list, list) {
 		list_del(&se->list);
@@ -432,9 +592,10 @@ nomem:
 /*                                                                     */
 /* Called from target_setup_session() / target_remove_session() for   */
 /* every real initiator session on this node.  When forward_active=1  */
-/* (STANDBY mode), send SESSION_CONNECT / SESSION_DISCONNECT to     */
+/* (STANDBY mode), queue SESSION_CONNECT / SESSION_DISCONNECT for     */
 /* ACTIVE so ACTIVE creates / destroys the matching synthetic        */
-/* se_session with correct LUN mappings.                              */
+/* se_session with correct LUN mappings.  ha_main_sess_work sends    */
+/* them; the hooks never wait on the HA link.                         */
 /*                                                                     */
 /* SESSION_CONNECT carries STANDBY's own TPG tag, the physical port   */
 /* the initiator is logged in to.  ACTIVE records it on the session,  */
@@ -449,7 +610,6 @@ static void ha_main_session_create(struct se_session *sess)
 {
 	struct se_portal_group *tpg = sess->se_tpg;
 	struct ha_main_sess_entry *se;
-	struct lio_ha_msg_session_connect msg = {};
 	char isid_buf[LIO_HA_ISID_LEN] = "";
 	const char *wwn;
 
@@ -470,94 +630,108 @@ static void ha_main_session_create(struct se_session *sess)
 							LIO_HA_ISID_LEN);
 
 	/*
-	 * Track this session so SESSION_CONNECT can be replayed on TCP link
-	 * recovery.  Added before the send so that if the send fails (TCP
-	 * not yet connected), ha_main_on_connect() will replay it when the
-	 * link comes up.
+	 * The entry is the SESSION_CONNECT: without it ACTIVE never learns of
+	 * the session, and answers its commands BUSY until it logs out.  The
+	 * hook cannot refuse the session (an iSCSI login response is already
+	 * out), and a small GFP_KERNEL allocation fails in practice only for
+	 * an OOM-kill victim.
 	 */
 	se = kzalloc(sizeof(*se), GFP_KERNEL);
-	if (se) {
-		se->session_id = (u64)(uintptr_t)sess;
-		se->tpg_tag    = tpg->se_tpg_tfo->tpg_get_tag(tpg);
-		se->max_data_sg_nents = tpg->se_tpg_tfo->max_data_sg_nents;
-		strscpy(se->initiator_name, sess->se_node_acl->initiatorname,
-			LIO_HA_INITIATOR_NAME_LEN);
-		strscpy(se->initiator_sid, isid_buf, LIO_HA_ISID_LEN);
-		strscpy(se->target_name, wwn, LIO_HA_INITIATOR_NAME_LEN);
-		strscpy(se->fabric_name, tpg->se_tpg_tfo->fabric_name,
-			LIO_HA_FABRIC_NAME_LEN);
-	} else {
-		pr_warn_ratelimited("lio_ha: session shadow alloc failed for %s; won't replay on link recovery\n",
+	if (!se) {
+		pr_warn_ratelimited("lio_ha: session shadow alloc failed for %s; ACTIVE will not know the session\n",
 				    sess->se_node_acl->initiatorname);
+		return;
 	}
-
-	msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_CONNECT);
-	msg.session_id = cpu_to_be64((u64)(uintptr_t)sess);
-	msg.tpg_tag    = cpu_to_be16(tpg->se_tpg_tfo->tpg_get_tag(tpg));
-	/* pad[2] is zero from the initialiser */
-	msg.max_data_sg_nents = cpu_to_be32(tpg->se_tpg_tfo->max_data_sg_nents);
-	strscpy(msg.initiator_name, sess->se_node_acl->initiatorname,
+	se->session_id = (u64)(uintptr_t)sess;
+	se->tpg_tag    = tpg->se_tpg_tfo->tpg_get_tag(tpg);
+	se->max_data_sg_nents = tpg->se_tpg_tfo->max_data_sg_nents;
+	strscpy(se->initiator_name, sess->se_node_acl->initiatorname,
 		LIO_HA_INITIATOR_NAME_LEN);
-	strscpy(msg.target_name, wwn, LIO_HA_INITIATOR_NAME_LEN);
-	strscpy(msg.initiator_sid, isid_buf, LIO_HA_ISID_LEN);
-	strscpy(msg.fabric_name, tpg->se_tpg_tfo->fabric_name,
+	strscpy(se->initiator_sid, isid_buf, LIO_HA_ISID_LEN);
+	strscpy(se->target_name, wwn, LIO_HA_INITIATOR_NAME_LEN);
+	strscpy(se->fabric_name, tpg->se_tpg_tfo->fabric_name,
 		LIO_HA_FABRIC_NAME_LEN);
+	INIT_LIST_HEAD(&se->pending);
 
 	lio_ha_dbg(1, "session create: initiator=%s target=%s fabric=%s\n",
 		   sess->se_node_acl->initiatorname, wwn,
 		   tpg->se_tpg_tfo->fabric_name);
-	mutex_lock(&ha_main_sess_mutex);
+	spin_lock(&ha_main_sess_lock);
 	/*
 	 * Failover may have cleared forwarding since the check above.  It
-	 * clears the flag before ha_main_sess_list_flush() takes this mutex,
+	 * clears the flag before ha_main_sess_list_flush() takes this lock,
 	 * so once the flush is past, this sees 0: the entry would never be
 	 * removed (the destroy hook returns early without forwarding), and
 	 * the SESSION_CONNECT would go to the old ACTIVE.
 	 */
 	if (!atomic_read(&lio_ha_forward_active)) {
-		mutex_unlock(&ha_main_sess_mutex);
+		spin_unlock(&ha_main_sess_lock);
 		kfree(se);
 		return;
 	}
-	if (se)
-		list_add_tail(&se->list, &ha_main_sess_list);
-	if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
-		pr_debug("lio_ha: SESSION_CONNECT send failed for %s\n",
-			 sess->se_node_acl->initiatorname);
-	mutex_unlock(&ha_main_sess_mutex);
+	list_add_tail(&se->list, &ha_main_sess_list);
+	ha_main_sess_queue(se);
+	queue_work(lio_ha_pr_wq, &ha_main_sess_work);
+	spin_unlock(&ha_main_sess_lock);
 }
 
+/* Caller holds ha_main_sess_lock. */
+static struct ha_main_sess_entry *ha_main_sess_find(u64 session_id)
+{
+	struct ha_main_sess_entry *se;
+
+	list_for_each_entry(se, &ha_main_sess_list, list) {
+		if (se->session_id == session_id)
+			return se;
+	}
+	return NULL;
+}
+
+/*
+ * Runs before the fabric frees @sess, so a SESSION_DISCONNECT is queued, and
+ * counted for lio_ha_sess_msg_pending(), before a new session can be given
+ * the same address.
+ */
 static void ha_main_session_destroy(struct se_session *sess)
 {
 	u64 session_id = (u64)(uintptr_t)sess;
-	struct ha_main_sess_entry *se, *tmp;
-	struct lio_ha_msg_session_disconnect msg = {};
+	struct ha_main_sess_entry *se;
 
 	if (!atomic_read(&lio_ha_forward_active))
 		return;
 
-	msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_DISCONNECT);
-	msg.session_id = cpu_to_be64(session_id);
-
-	/* Remove from replay list regardless of TCP or TPG state. */
-	mutex_lock(&ha_main_sess_mutex);
-	list_for_each_entry_safe(se, tmp, &ha_main_sess_list, list) {
-		if (se->session_id == session_id) {
-			list_del(&se->list);
-			kfree(se);
-			break;
-		}
+	spin_lock(&ha_main_sess_lock);
+	/*
+	 * Found only while the failover flush has not run, so forward_active
+	 * was set at least until just now; the flush drops what is queued.
+	 */
+	se = ha_main_sess_find(session_id);
+	if (!se) {
+		/* Not tracked, or already flushed: nothing to tell ACTIVE. */
+		spin_unlock(&ha_main_sess_lock);
+		return;
 	}
-
-	/* se_tpg may already be NULL if called after partial teardown. */
-	if (sess->se_tpg && sess->se_tpg->se_tpg_wwn) {
-		lio_ha_dbg(1, "session destroy: initiator=%s\n",
-			   sess->se_node_acl ?
-			   sess->se_node_acl->initiatorname : "(null)");
-		if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
-			pr_debug("lio_ha: SESSION_DISCONNECT send failed\n");
+	list_del(&se->list);
+	if (!se->sent) {
+		/* Its SESSION_CONNECT is still queued: ACTIVE never saw it. */
+		list_del(&se->pending);
+		atomic_dec(&ha_main_sess_unsent);
+		spin_unlock(&ha_main_sess_lock);
+		kfree(se);
+		return;
 	}
-	mutex_unlock(&ha_main_sess_mutex);
+	/*
+	 * Queued as SESSION_DISCONNECT.  An entry a replay has re-queued as
+	 * SESSION_CONNECT keeps its place and becomes the SESSION_DISCONNECT:
+	 * everything before it has been sent by the time it is.
+	 */
+	se->disconnect = true;
+	if (list_empty(&se->pending))
+		ha_main_sess_queue(se);
+	queue_work(lio_ha_pr_wq, &ha_main_sess_work);
+	/* Under the lock: once it is dropped, the work item may free se. */
+	lio_ha_dbg(1, "session destroy: initiator=%s\n", se->initiator_name);
+	spin_unlock(&ha_main_sess_lock);
 }
 
 static const struct lio_ha_ops ha_ops = {
@@ -936,49 +1110,36 @@ static void ha_main_pr_dirty_flush(void)
  * send, ACTIVE advances ha_state to SYNCED; STANDBY advances to SYNCED on
  * receipt of LUN_SYNC_DONE.
  *
- * STANDBY (forward_active == 1): replays SESSION_CONNECT for every live
- * initiator session tracked in ha_main_sess_list.  ACTIVE dropped all of
- * this node's sessions when the previous connection went away.  A session
- * created once the link is up sends its own SESSION_CONNECT and may be
- * replayed as well; ACTIVE's lio_ha_recv_session_create() ignores the
- * duplicate.
+ * STANDBY (forward_active == 1): queues a SESSION_CONNECT replay for every
+ * live initiator session tracked in ha_main_sess_list, which
+ * ha_main_sess_work sends.  ACTIVE dropped all of this node's sessions when
+ * the previous connection went away.  A session whose SESSION_CONNECT is
+ * still queued is not queued twice, but one may have gone out on this
+ * connection already and be replayed as well; ACTIVE's
+ * lio_ha_recv_session_create() ignores the duplicate.  The queue is only
+ * touched while forward_active is 1, checked under ha_main_sess_lock, which
+ * matters at module exit, where this can still run after the workqueue is
+ * gone.
  */
 static void ha_main_on_connect(void)
 {
 	if (atomic_read(&lio_ha_forward_active)) {
 		struct ha_main_sess_entry *se;
-		struct lio_ha_msg_session_connect msg = {};
 		int count = 0;
 
-		/*
-		 * Send under ha_main_sess_mutex, which session_create and
-		 * session_destroy hold across their own sends, so that no
-		 * session's SESSION_DISCONNECT can be sent between reading it
-		 * here and replaying its SESSION_CONNECT.
-		 */
-		mutex_lock(&ha_main_sess_mutex);
-		list_for_each_entry(se, &ha_main_sess_list, list) {
-			msg.hdr.type   = cpu_to_be32(LIO_HA_MSG_SESSION_CONNECT);
-			msg.session_id = cpu_to_be64(se->session_id);
-			msg.tpg_tag    = cpu_to_be16(se->tpg_tag);
-			msg.max_data_sg_nents =
-				cpu_to_be32(se->max_data_sg_nents);
-			strscpy(msg.initiator_name, se->initiator_name,
-				LIO_HA_INITIATOR_NAME_LEN);
-			strscpy(msg.target_name, se->target_name,
-				LIO_HA_INITIATOR_NAME_LEN);
-			strscpy(msg.initiator_sid, se->initiator_sid,
-				LIO_HA_ISID_LEN);
-			strscpy(msg.fabric_name, se->fabric_name,
-				LIO_HA_FABRIC_NAME_LEN);
-			if (lio_ha_tcp_send(LIO_HA_CHAN_CTL, &msg, sizeof(msg)))
-				pr_warn_ratelimited("lio_ha: SESSION_CONNECT replay failed for %s\n",
-						    se->initiator_name);
-			count++;
+		spin_lock(&ha_main_sess_lock);
+		if (atomic_read(&lio_ha_forward_active)) {
+			list_for_each_entry(se, &ha_main_sess_list, list) {
+				if (list_empty(&se->pending)) {
+					ha_main_sess_queue(se);
+					count++;
+				}
+			}
+			queue_work(lio_ha_pr_wq, &ha_main_sess_work);
 		}
-		mutex_unlock(&ha_main_sess_mutex);
+		spin_unlock(&ha_main_sess_lock);
 
-		lio_ha_dbg(1, "TCP connected (STANDBY): replayed %d SESSION_CONNECT(s)\n",
+		lio_ha_dbg(1, "TCP connected (STANDBY): queued %d SESSION_CONNECT replay(s)\n",
 			   count);
 		return;
 	}
@@ -1514,8 +1675,11 @@ static ssize_t lio_ha_forward_active_store(struct config_item *item,
 		/*
 		 * Shadow list is no longer needed: forward_active=0 means we
 		 * are becoming ACTIVE and will never replay SESSION_CONNECTs.
-		 * Both session_create and session_destroy check forward_active
-		 * first, so no new entries will be added after this point.
+		 * The session hooks and the connect handler queue only after
+		 * seeing forward_active set under ha_main_sess_lock, which the
+		 * flush takes, so nothing is queued after this point, and the
+		 * work item sends nothing more.  A send it has in progress
+		 * finishes on its own; nothing here waits for it.
 		 */
 		ha_main_sess_list_flush();
 		target_for_each_device(ha_main_failover_device, NULL);
@@ -1651,6 +1815,13 @@ out_ops:
 	lio_ha_unregister_pr_notifier();
 	/* A connection made before the failure may have queued it. */
 	cancel_delayed_work_sync(&ha_main_pr_sync_work);
+	/*
+	 * Sessions logged in while forward_active was set at load.  forward_active
+	 * is 0 here; the flush takes ha_main_sess_lock, so a hook that saw it
+	 * set has queued the session work by then, and the cancel catches it.
+	 */
+	ha_main_sess_list_flush();
+	cancel_work_sync(&ha_main_sess_work);
 	destroy_workqueue(lio_ha_pr_wq);
 	lio_ha_pr_wq = NULL;
 	lio_ha_unregister_ops();
@@ -1668,6 +1839,8 @@ static void __exit lio_ha_exit(void)
 	 * handler can still ask for until TCP exits: no queueing after
 	 * ha_main_pr_stopping is set, and the work, pending, delayed or
 	 * running, is cancelled or waited for before the workqueue goes.
+	 * The session work is queued only while forward_active is 1, so
+	 * cancelling it once is enough.
 	 *
 	 * lio_ha_forward_active is 0 by the time __exit runs (the module
 	 * self-reference taken when forward_active is set to 1 prevents
@@ -1679,6 +1852,7 @@ static void __exit lio_ha_exit(void)
 	ha_main_pr_stopping = true;
 	spin_unlock(&ha_main_pr_dirty_lock);
 	cancel_delayed_work_sync(&ha_main_pr_sync_work);
+	cancel_work_sync(&ha_main_sess_work);
 	destroy_workqueue(lio_ha_pr_wq);
 	lio_ha_pr_wq = NULL;
 	ha_main_pr_dirty_flush();

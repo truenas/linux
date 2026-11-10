@@ -93,4 +93,18 @@ extern struct lio_ha_cfg lio_ha_cfg;
 void lio_ha_pr_replace_device(const char *dev_name, const char *text,
 			      size_t len);
 
+/**
+ * lio_ha_sess_msg_pending - is a session message for this session unsent?
+ * @session_id: the session's id on the wire (its se_session pointer)
+ *
+ * True while a SESSION_CONNECT or SESSION_DISCONNECT for @session_id is
+ * queued or being sent on STANDBY.  A command or TMR for that session must
+ * not be forwarded until it has gone out: before its own SESSION_CONNECT,
+ * ACTIVE does not know the session, and before the SESSION_DISCONNECT of an
+ * earlier session at the same address, ACTIVE would run it as that session.
+ * One atomic read when no session message is unsent.  Defined in
+ * lio_ha_main.c.
+ */
+bool lio_ha_sess_msg_pending(u64 session_id);
+
 #endif /* _LIO_HA_H */

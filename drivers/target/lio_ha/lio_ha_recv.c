@@ -37,7 +37,10 @@
  *
  * Sessions are tracked in a spinlock-protected hash table keyed by
  * u64 session_id (the STANDBY's se_sess pointer, which is unique for
- * the lifetime of the session).
+ * the lifetime of the session).  STANDBY forwards nothing for an id while
+ * the SESSION_DISCONNECT of an earlier session with that id is still
+ * unsent (lio_ha_sess_msg_pending()), so a command never reaches the
+ * departed session's entry here.
  *
  * This file: session management, WRITE-data buffering, command submission,
  * and response send callbacks.
@@ -956,8 +959,13 @@ void lio_ha_recv_session_destroy(u64 session_id)
 	}
 	spin_unlock(&ha_recv_sess_lock);
 
-	pr_warn("ha_recv: session_destroy: unknown session_id %llu\n",
-		(unsigned long long)session_id);
+	/*
+	 * Expected after a link bounce: STANDBY sends SESSION_DISCONNECT for
+	 * a session whose SESSION_CONNECT went to a send, even one that failed
+	 * or that this node dropped with the old connection.
+	 */
+	lio_ha_dbg(1, "session_destroy: unknown session_id %llu\n",
+		   (unsigned long long)session_id);
 }
 
 void lio_ha_recv_data_rx(u64 cookie, void *data, u32 len)

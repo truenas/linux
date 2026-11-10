@@ -259,21 +259,34 @@ SESSION_CONNECT (S->A)
   restored with its own tag, its node_acl taken from whichever of that
   TPG and the paired one has it.
 
-  SESSION_CONNECT replay on link recovery: STANDBY maintains a
-  shadow session list (ha_main_sess_list, protected by
-  ha_main_sess_mutex) that tracks every live initiator session.
-  An entry is added in ha_main_session_create() before the TCP send,
-  and removed in ha_main_session_destroy().  The mutex is held across
-  the SESSION_CONNECT and SESSION_DISCONNECT sends and across the
-  replay, so ACTIVE receives them in the order sessions come and go.
-  This handles the window where an initiator logs in while the TCP
-  link is down: the send fails, but when the link recovers
-  ha_main_on_connect() replays SESSION_CONNECT for every tracked
-  session.  ACTIVE's lio_ha_recv_session_create() is idempotent -- a
-  duplicate session_id is silently ignored -- so replaying a
-  SESSION_CONNECT that already succeeded is harmless.  The shadow
-  list is flushed when forward_active transitions 1->0 (failover),
-  since STANDBY is becoming ACTIVE and replay is no longer needed.
+  Session messages and replay on link recovery: STANDBY maintains a
+  shadow session list (ha_main_sess_list) of every live initiator
+  session, and a FIFO (ha_main_sess_pending) of the session messages
+  still to be sent, both protected by ha_main_sess_lock.  The session
+  hooks never send: ha_main_session_create() adds the entry to both,
+  and ha_main_session_destroy() takes it off the live list and queues
+  it as SESSION_DISCONNECT, or, if its SESSION_CONNECT has not gone to
+  a send yet, drops it.  One work item, ha_main_sess_work, sends the
+  FIFO in order, so ACTIVE receives the messages in the order sessions
+  come and go, and a login, logout or failover never waits on a stalled
+  HA link.  When the link recovers, ha_main_on_connect() queues a
+  SESSION_CONNECT replay for every tracked session not already queued.
+  ACTIVE's lio_ha_recv_session_create() is idempotent -- a duplicate
+  session_id is silently ignored -- so replaying a SESSION_CONNECT
+  that already succeeded is harmless, and a SESSION_DISCONNECT for an
+  id ACTIVE no longer knows is expected after a link bounce.
+
+  Commands share the link with the session messages, and must not
+  overtake one for their own session id: ACTIVE needs the session's
+  SESSION_CONNECT first, and a SESSION_DISCONNECT still queued for an
+  earlier session at the same address would otherwise let ACTIVE run
+  the command as that session.  lio_ha_forward_cmd() and
+  lio_ha_forward_tmr() therefore ask lio_ha_sess_msg_pending() and,
+  while such a message is unsent, complete the command BUSY or reject
+  the TMR locally.  A count of unsent messages makes that one atomic
+  read in the normal case.  The shadow list and the FIFO are flushed
+  when forward_active transitions 1->0 (failover), since STANDBY is
+  becoming ACTIVE and replay is no longer needed.
 
   Link loss: ACTIVE removes every synthetic session when the link
   drops, after waiting for their commands, and discards buffered WRITE
@@ -655,9 +668,10 @@ FILE MAP
                    (lio_ha_pr_table, protected by lio_ha_pr_lock) and
                    lio_ha_pr_replace_device(), which applies a
                    LUN_SYNC.  The PR notifier and the LUN_SYNC sender.
-                   Shadow session list (ha_main_sess_list, protected by
-                   ha_main_sess_mutex) for SESSION_CONNECT replay on TCP
-                   link recovery (see SESSION_CONNECT above).
+                   Shadow session list and session message FIFO
+                   (ha_main_sess_list, ha_main_sess_pending, protected
+                   by ha_main_sess_lock), sent by ha_main_sess_work
+                   (see "Session messages" above).
                    ha_main_failover_device() and the forward_active
                    write handler that drives the failover sequence.
 
