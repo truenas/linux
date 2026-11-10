@@ -348,16 +348,74 @@ target_scsi3_ua_check(struct se_cmd *cmd)
 }
 
 /*
- * Queue @ua on sess_deve->ua_list. Caller must hold sess_deve->ua_lock.
- * Returns -EEXIST if the same ASC/ASCQ is already at the head of the queue,
- * or -ENODEV if teardown has marked @sess_deve dead, without freeing @ua
- * (caller's responsibility); otherwise queues it and returns 0.
+ * Unit attention condition precedence levels from SAM-5 5.14.1, Table 53.
+ * A lower value is a higher precedence.
+ */
+#define TARGET_UA_PRECEDENCE_LOWEST	6
+
+static int target_ua_precedence(u8 asc, u8 ascq)
+{
+	switch ((asc << 8) | ascq) {
+	case 0x2900:	/* POWER ON, RESET, OR BUS DEVICE RESET OCCURRED */
+		return 0;
+	case 0x2901:	/* POWER ON OCCURRED */
+	case 0x2904:	/* DEVICE INTERNAL RESET */
+		return 1;
+	case 0x2902:	/* SCSI BUS RESET OCCURRED */
+	case 0x3f01:	/* MICROCODE HAS BEEN CHANGED */
+		/*
+		 * Table 53 also puts protocol-specific conditions at this
+		 * level. No fabric driver here raises one.
+		 */
+		return 2;
+	case 0x2903:	/* BUS DEVICE RESET FUNCTION OCCURRED */
+		return 3;
+	case 0x2907:	/* I_T NEXUS LOSS OCCURRED */
+		return 4;
+	case 0x2f01:	/* COMMANDS CLEARED BY POWER LOSS NOTIFICATION */
+		return 5;
+	default:
+		return TARGET_UA_PRECEDENCE_LOWEST;
+	}
+}
+
+/*
+ * Return true if @a is to be reported before @b.
+ *
+ * Higher precedence first. Within the lowest level, SAM-5 5.14.1 ranks a
+ * condition with ASCQ 00h above the others with the same ASC (e.g.
+ * PARAMETERS CHANGED above MODE PARAMETERS CHANGED), and conditions with
+ * different ASCs equally. Order the same ASC by ascending ASCQ, which puts
+ * 00h first, and leave everything else equal so that it is reported in the
+ * order it was established.
+ */
+static bool target_ua_reported_before(const struct se_ua *a,
+				      const struct se_ua *b)
+{
+	int prec_a = target_ua_precedence(a->ua_asc, a->ua_ascq);
+	int prec_b = target_ua_precedence(b->ua_asc, b->ua_ascq);
+
+	if (prec_a != prec_b)
+		return prec_a < prec_b;
+
+	return prec_a == TARGET_UA_PRECEDENCE_LOWEST &&
+	       a->ua_asc == b->ua_asc && a->ua_ascq < b->ua_ascq;
+}
+
+/*
+ * Queue @ua on sess_deve->ua_list, which is kept in reporting order: the
+ * head is the next unit attention to report. @ua goes after every queued
+ * unit attention that is not reported after it, so equals keep the order
+ * in which they were established. Caller must hold sess_deve->ua_lock.
+ * Returns -EEXIST if the same ASC/ASCQ is already queued, or -ENODEV if
+ * teardown has marked @sess_deve dead, without freeing @ua (caller's
+ * responsibility); otherwise queues it and returns 0.
  *
  * Every UA is queued through here, so this is the one place that has to
  * refuse a dead entry: its queue has been drained for the last time.
  */
-static int __core_scsi3_ua_insert(struct se_session_deve *sess_deve,
-				  struct se_ua *ua)
+static int __core_scsi3_ua_insert_sorted(struct se_session_deve *sess_deve,
+					 struct se_ua *ua)
 {
 	struct se_ua *ua_p;
 
@@ -365,55 +423,17 @@ static int __core_scsi3_ua_insert(struct se_session_deve *sess_deve,
 		return -ENODEV;
 
 	list_for_each_entry(ua_p, &sess_deve->ua_list, ua_nacl_list) {
-		/*
-		 * Do not report the same UNIT ATTENTION twice..
-		 */
-		if ((ua_p->ua_asc == ua->ua_asc) &&
-		    (ua_p->ua_ascq == ua->ua_ascq))
+		if (ua_p->ua_asc == ua->ua_asc && ua_p->ua_ascq == ua->ua_ascq)
 			return -EEXIST;
-		/*
-		 * Attach the highest priority Unit Attention to
-		 * the head of the list following sam4r14,
-		 * Section 5.14 Unit Attention Condition:
-		 *
-		 * POWER ON, RESET, OR BUS DEVICE RESET OCCURRED highest
-		 * POWER ON OCCURRED or
-		 * DEVICE INTERNAL RESET
-		 * SCSI BUS RESET OCCURRED or
-		 * MICROCODE HAS BEEN CHANGED or
-		 * protocol specific
-		 * BUS DEVICE RESET FUNCTION OCCURRED
-		 * I_T NEXUS LOSS OCCURRED
-		 * COMMANDS CLEARED BY POWER LOSS NOTIFICATION
-		 * all others                                    Lowest
-		 *
-		 * Each of the ASCQ codes listed above are defined in
-		 * the 29h ASC family, see spc4r17 Table D.1
-		 */
-		if (ua_p->ua_asc == 0x29) {
-			if ((ua->ua_asc == 0x29) && (ua->ua_ascq > ua_p->ua_ascq))
-				list_add(&ua->ua_nacl_list,
-						&sess_deve->ua_list);
-			else
-				list_add_tail(&ua->ua_nacl_list,
-						&sess_deve->ua_list);
-		} else if (ua_p->ua_asc == 0x2a) {
-			/*
-			 * Incoming Family 29h ASCQ codes will override
-			 * Family 2AHh ASCQ codes for Unit Attention condition.
-			 */
-			if ((ua->ua_asc == 0x29) || (ua->ua_ascq > ua_p->ua_asc))
-				list_add(&ua->ua_nacl_list,
-					&sess_deve->ua_list);
-			else
-				list_add_tail(&ua->ua_nacl_list,
-						&sess_deve->ua_list);
-		} else
-			list_add_tail(&ua->ua_nacl_list,
-				&sess_deve->ua_list);
-
-		return 0;
 	}
+
+	list_for_each_entry(ua_p, &sess_deve->ua_list, ua_nacl_list) {
+		if (target_ua_reported_before(ua, ua_p)) {
+			list_add_tail(&ua->ua_nacl_list, &ua_p->ua_nacl_list);
+			return 0;
+		}
+	}
+
 	list_add_tail(&ua->ua_nacl_list, &sess_deve->ua_list);
 	return 0;
 }
@@ -451,7 +471,7 @@ int core_scsi3_ua_allocate_all(struct se_dev_entry *deve, u8 asc, u8 ascq,
 		ua->ua_ascq = ascq;
 
 		spin_lock(&sess_deve->ua_lock);
-		if (__core_scsi3_ua_insert(sess_deve, ua) < 0)
+		if (__core_scsi3_ua_insert_sorted(sess_deve, ua) < 0)
 			kmem_cache_free(se_ua_cache, ua);
 		spin_unlock(&sess_deve->ua_lock);
 	}
