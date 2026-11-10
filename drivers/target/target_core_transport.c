@@ -662,8 +662,8 @@ target_setup_session(struct se_portal_group *tpg,
 #ifdef CONFIG_TRUENAS
 	/*
 	 * Notify lio_ha.ko that a new initiator session has been registered.
-	 * On STANDBY (lio_ha_forward_active=1), lio_ha.ko sends a
-	 * SESSION_CONNECT message to ACTIVE so ACTIVE can create a matching
+	 * On STANDBY (lio_ha_forward_active=1), lio_ha.ko queues a
+	 * SESSION_CONNECT message for ACTIVE so ACTIVE can create a matching
 	 * synthetic se_session with the correct LUN mappings.  The hook is a
 	 * no-op when forward_active=0 or when called for internal TPGs (e.g.
 	 * ha_recv itself, which has se_tpg_wwn=NULL).

@@ -176,16 +176,18 @@ struct se_session;
  *               this call.
  * @forward_tmr: same ownership and completion contract as @forward_cmd.
  * @session_create: called from target_setup_session() after the session is
- *                  registered.  On STANDBY, sends SESSION_CONNECT to ACTIVE
+ *                  registered.  On STANDBY, queues SESSION_CONNECT for ACTIVE
  *                  so ACTIVE creates a synthetic se_session with the correct
- *                  LUN mappings.  Skips ha_recv's own sessions (tpg_wwn=NULL)
- *                  and sessions created when forward_active=0.  Called in process
- *                  context; may sleep (sends on the HA link).
+ *                  LUN mappings; it does not wait on the HA link.  Skips
+ *                  ha_recv's own sessions (tpg_wwn=NULL) and sessions created
+ *                  when forward_active=0.  Called in process context, before
+ *                  the session's first command where the fabric allows it;
+ *                  may sleep (allocates).
  * @session_destroy: called from target_remove_session() before the session is
- *                   deregistered.  On STANDBY, sends SESSION_DISCONNECT so
+ *                   deregistered.  On STANDBY, queues SESSION_DISCONNECT so
  *                   ACTIVE tears down the synthetic se_session.  Same filters
- *                   as @session_create.  Called in process context;
- *                   may sleep.
+ *                   as @session_create.  Called in process context, before
+ *                   the session is freed.
  * @nacl_release: called from core_tpg_del_initiator_node_acl() once @nacl
  *                is off its TPG's ACL list and its fabric sessions are shut
  *                down, before LIO core waits for the last reference to it.
@@ -368,9 +370,10 @@ void target_ha_foreach_nacl_dev(const char *fabric_name, const char *initiator_n
  * and transport_deregister_session directly).  These wrappers hide the static
  * ha_ops pointer from code outside target_core_transport.c.
  *
- * Must be called from process context (may sleep via lio_ha_tcp_send).
+ * Must be called from process context (the hooks may sleep to allocate).
  * session_create: call after the session is fully registered and any
- *   per-fabric spinlocks protecting the session list are released.
+ *   per-fabric spinlocks protecting the session list are released, and
+ *   before the session can deliver its first command.
  * session_destroy: call before transport_deregister_session() while
  *   se_tpg and se_node_acl are still valid.
  */

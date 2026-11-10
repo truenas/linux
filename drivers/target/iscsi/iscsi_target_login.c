@@ -762,8 +762,10 @@ void iscsi_post_login_handler(
 	 * Notify lio_ha.ko that a new iSCSI initiator session is registered.
 	 * iSCSI bypasses target_setup_session() (which normally fires this
 	 * hook) and calls __transport_register_session() directly under the
-	 * session spinlock.  The hook requires process context (it may call
-	 * lio_ha_tcp_send), so it is called here after the lock is released.
+	 * session spinlock.  The hook requires process context (it allocates),
+	 * so it is called here after the lock is released, and before the rx
+	 * thread is released below, so that its SESSION_CONNECT is queued
+	 * before the session's first command can be forwarded.
 	 * The hook is a no-op when lio_ha_forward_active == 0 or when called
 	 * for internal TPGs (se_tpg_wwn == NULL, e.g. discovery sessions).
 	 */
