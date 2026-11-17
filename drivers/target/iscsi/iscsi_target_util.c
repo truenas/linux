@@ -730,6 +730,17 @@ void iscsit_wait_for_session_usage(struct iscsit_session *sess)
 	spin_unlock_bh(&sess->session_usage_lock);
 }
 
+bool iscsit_session_in_use(struct iscsit_session *sess)
+{
+	bool in_use;
+
+	spin_lock_bh(&sess->session_usage_lock);
+	in_use = sess->session_usage_count != 0;
+	spin_unlock_bh(&sess->session_usage_lock);
+
+	return in_use;
+}
+
 void iscsit_dec_session_usage_count(struct iscsit_session *sess)
 {
 	spin_lock_bh(&sess->session_usage_lock);

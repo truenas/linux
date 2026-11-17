@@ -40,6 +40,7 @@ extern void iscsit_free_cmd(struct iscsit_cmd *, bool);
 extern void iscsit_wait_for_session_usage(struct iscsit_session *sess);
 extern void iscsit_dec_session_usage_count(struct iscsit_session *);
 extern void iscsit_inc_session_usage_count(struct iscsit_session *);
+extern bool iscsit_session_in_use(struct iscsit_session *sess);
 extern struct iscsit_conn *iscsit_get_conn_from_cid(struct iscsit_session *, u16);
 extern struct iscsit_conn *iscsit_get_conn_from_cid_rcfr(struct iscsit_session *, u16);
 extern void iscsit_check_conn_usage_count(struct iscsit_conn *);

@@ -152,6 +152,12 @@ int iscsi_check_for_session_reinstatement(struct iscsit_conn *conn)
 	if (sess->session_state == TARG_SESS_STATE_FAILED) {
 		spin_unlock_bh(&sess->conn_lock);
 		iscsit_dec_session_usage_count(sess);
+		/*
+		 * No connection is left to close the session, and logins on
+		 * a TPG are serialised by np_login_sem, so nothing else can
+		 * be using it.
+		 */
+		iscsit_close_session(sess);
 		return 0;
 	}
 	spin_unlock_bh(&sess->conn_lock);

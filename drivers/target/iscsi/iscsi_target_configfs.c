@@ -1492,13 +1492,16 @@ static int lio_tpg_check_prot_fabric_only(
 }
 
 /*
- * This function calls iscsit_inc_session_usage_count() on the
- * struct iscsit_session in question.
+ * Shut down the session.  One that still has a connection or a user gets a
+ * usage reference and is stopped; the last connection's close then closes
+ * it.  One in Time2Retain that nothing is using is closed here, since no
+ * connection is left to do it.
  */
 static void lio_tpg_close_session(struct se_session *se_sess)
 {
 	struct iscsit_session *sess = se_sess->fabric_sess_ptr;
 	struct se_portal_group *se_tpg = &sess->tpg->tpg_se_tpg;
+	bool idle;
 
 	spin_lock_bh(&se_tpg->session_lock);
 	spin_lock(&sess->conn_lock);
@@ -1510,7 +1513,15 @@ static void lio_tpg_close_session(struct se_session *se_sess)
 		spin_unlock_bh(&se_tpg->session_lock);
 		return;
 	}
-	iscsit_inc_session_usage_count(sess);
+	/*
+	 * Joining logins take their usage reference under session_lock, which
+	 * is held here, and skip a session once the flags below are set.  A
+	 * session with no connection and no reference is in Time2Retain with
+	 * nothing left that can close it or join it.
+	 */
+	idle = !atomic_read(&sess->nconn) && !iscsit_session_in_use(sess);
+	if (!idle)
+		iscsit_inc_session_usage_count(sess);
 	atomic_set(&sess->session_reinstatement, 1);
 	atomic_set(&sess->session_fall_back_to_erl0, 1);
 	atomic_set(&sess->session_close, 1);
@@ -1519,6 +1530,10 @@ static void lio_tpg_close_session(struct se_session *se_sess)
 	iscsit_stop_time2retain_timer(sess);
 	spin_unlock_bh(&se_tpg->session_lock);
 
+	if (idle) {
+		iscsit_close_session(sess);
+		return;
+	}
 	iscsit_stop_session(sess, 1, 1);
 	iscsit_dec_session_usage_count(sess);
 }
