@@ -3558,6 +3558,26 @@ after_iport_check:
 		dest_pr_reg = __core_scsi3_locate_pr_reg(dev, dest_node_acl,
 						iport_ptr);
 		new_reg = 1;
+		/*
+		 * The lock was dropped to register the destination. If the
+		 * reservation was released, preempted or changed meanwhile, or
+		 * the new registration was removed again, the calling I_T
+		 * nexus no longer holds what it is trying to move.
+		 */
+		if (dev->dev_pr_res_holder != pr_reg ||
+		    pr_reg->pr_res_type != type ||
+		    pr_reg->pr_res_scope != scope || !dest_pr_reg) {
+			spin_unlock(&dev->dev_reservation_lock);
+			pr_warn("SPC-3 PR REGISTER_AND_MOVE: Reservation changed while registering destination\n");
+			if (dest_pr_reg) {
+				spin_lock(&pr_tmpl->registration_lock);
+				__core_scsi3_free_registration(dev, dest_pr_reg,
+							       NULL, 1);
+				spin_unlock(&pr_tmpl->registration_lock);
+			}
+			ret = TCM_RESERVATION_CONFLICT;
+			goto out;
+		}
 	} else {
 		/*
 		 * e) Retain the reservation key specified in the SERVICE ACTION
