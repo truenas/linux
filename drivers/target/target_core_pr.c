@@ -1161,6 +1161,7 @@ static struct t10_pr_registration *__core_scsi3_locate_pr_reg(
 {
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
 	struct t10_pr_registration *pr_reg, *pr_reg_tmp;
+	u64 bin_isid = isid ? target_isid_to_bin(isid) : 0;
 
 	spin_lock(&pr_tmpl->registration_lock);
 	list_for_each_entry_safe(pr_reg, pr_reg_tmp,
@@ -1187,7 +1188,7 @@ static struct t10_pr_registration *__core_scsi3_locate_pr_reg(
 		 */
 		if (!isid)
 			continue;
-		if (strcmp(isid, pr_reg->pr_reg_isid))
+		if (bin_isid != pr_reg->pr_reg_bin_isid)
 			continue;
 
 		atomic_inc_mb(&pr_reg->pr_res_holders);
@@ -3402,7 +3403,7 @@ core_scsi3_emulate_pro_register_and_move(struct se_cmd *cmd, u64 res_key,
 		ret = TCM_INVALID_PARAMETER_LIST;
 		goto out;
 	}
-	if (!strcmp(iport_ptr, pr_reg->pr_reg_isid)) {
+	if (target_isid_to_bin(iport_ptr) == pr_reg->pr_reg_bin_isid) {
 		pr_err("SPC-3 PR REGISTER_AND_MOVE: TransportID: %s %s"
 			" matches: %s %s on received I_T Nexus\n",
 			initiator_str, iport_ptr, pr_reg_nacl->initiatorname,
