@@ -95,6 +95,7 @@ int iscsi_check_for_session_reinstatement(struct iscsit_conn *conn)
 	struct iscsit_session *sess = NULL, *sess_p = NULL;
 	struct se_portal_group *se_tpg = &tpg->tpg_se_tpg;
 	struct se_session *se_sess, *se_sess_tmp;
+	bool idle = false;
 
 	initiatorname_param = iscsi_find_param_from_key(
 			INITIATORNAME, conn->param_list);
@@ -128,8 +129,16 @@ int iscsi_check_for_session_reinstatement(struct iscsit_conn *conn)
 			atomic_set(&sess_p->session_reinstatement, 1);
 			atomic_set(&sess_p->session_fall_back_to_erl0, 1);
 			atomic_set(&sess_p->session_close, 1);
+			/*
+			 * A session with no connection is in Time2Retain and
+			 * no connection's close will close it.  Joining logins
+			 * are excluded by np_login_sem, so nothing but this
+			 * login can.
+			 */
+			idle = !atomic_read(&sess_p->nconn);
 			spin_unlock(&sess_p->conn_lock);
-			iscsit_inc_session_usage_count(sess_p);
+			if (!idle)
+				iscsit_inc_session_usage_count(sess_p);
 			iscsit_stop_time2retain_timer(sess_p);
 			sess = sess_p;
 			break;
@@ -147,6 +156,11 @@ int iscsi_check_for_session_reinstatement(struct iscsit_conn *conn)
 		" performing session reinstatement.\n", (sessiontype) ?
 		"Discovery" : "Normal", sess->sid,
 		sess->sess_ops->InitiatorName);
+
+	if (idle) {
+		iscsit_close_session(sess);
+		return 0;
+	}
 
 	spin_lock_bh(&sess->conn_lock);
 	if (sess->session_state == TARG_SESS_STATE_FAILED) {

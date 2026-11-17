@@ -4724,7 +4724,9 @@ int iscsit_release_sessions_for_tpg(struct iscsi_portal_group *tpg, int force)
 	struct se_portal_group *se_tpg = &tpg->tpg_se_tpg;
 	struct se_session *se_sess, *se_sess_tmp;
 	LIST_HEAD(free_list);
+	LIST_HEAD(close_list);
 	int session_count = 0;
+	bool idle;
 
 	spin_lock_bh(&se_tpg->session_lock);
 	if (tpg->nsessions && !force) {
@@ -4744,13 +4746,24 @@ int iscsit_release_sessions_for_tpg(struct iscsi_portal_group *tpg, int force)
 			spin_unlock(&sess->conn_lock);
 			continue;
 		}
-		iscsit_inc_session_usage_count(sess);
+		/*
+		 * Joining logins take their usage reference under
+		 * session_lock, which is held here, and skip a session once
+		 * the flags below are set.  A session with no connection and
+		 * no reference is in Time2Retain with nothing left that can
+		 * close it or join it: close it here.
+		 */
+		idle = !atomic_read(&sess->nconn) &&
+		       !iscsit_session_in_use(sess);
+		if (!idle)
+			iscsit_inc_session_usage_count(sess);
 		atomic_set(&sess->session_reinstatement, 1);
 		atomic_set(&sess->session_fall_back_to_erl0, 1);
 		atomic_set(&sess->session_close, 1);
 		spin_unlock(&sess->conn_lock);
 
-		list_move_tail(&se_sess->sess_list, &free_list);
+		list_move_tail(&se_sess->sess_list,
+			       idle ? &close_list : &free_list);
 	}
 	spin_unlock_bh(&se_tpg->session_lock);
 
@@ -4760,6 +4773,13 @@ int iscsit_release_sessions_for_tpg(struct iscsi_portal_group *tpg, int force)
 		list_del_init(&se_sess->sess_list);
 		iscsit_stop_session(sess, 1, 1);
 		iscsit_dec_session_usage_count(sess);
+		session_count++;
+	}
+	list_for_each_entry_safe(se_sess, se_sess_tmp, &close_list, sess_list) {
+		sess = (struct iscsit_session *)se_sess->fabric_sess_ptr;
+
+		list_del_init(&se_sess->sess_list);
+		iscsit_close_session(sess);
 		session_count++;
 	}
 	/*
