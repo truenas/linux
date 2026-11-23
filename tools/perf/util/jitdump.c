@@ -31,6 +31,7 @@
 #include "thread.h"
 
 #include <linux/ctype.h>
+#include <linux/string.h>
 #include <linux/zalloc.h>
 
 struct jit_buf_desc {
